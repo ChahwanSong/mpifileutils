@@ -7,6 +7,7 @@ LIST(APPEND man_pages
   dbz2.1
   dfilemaker.1
   dfind.1
+  dhotcold.1
   dreln.1
   drm.1
   dstripe.1

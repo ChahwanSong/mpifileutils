@@ -1,0 +1,75 @@
+.TH "DHOTCOLD" "1" "Feb 28, 2026" "0.12" "mpiFileUtils"
+.SH NAME
+dhotcold \- distributed hot/cold capacity analyzer by depth-1 topdirs
+.SH SYNOPSIS
+.B dhotcold
+[\fIOPTION\fR] \fIPATH\fR
+.SH DESCRIPTION
+.sp
+\fBdhotcold\fR analyzes hot/cold capacity under each depth-1 directory of
+\fIPATH\fR. It processes depth-1 directories sequentially, and each directory
+is scanned recursively in parallel with MPI.
+.sp
+By default, dhotcold uses a streaming aggregation path that updates counters
+without retaining per-entry metadata in memory. With \fB--unique-inode\fR,
+it uses a file-list + global dedup path.
+.sp
+Symlinks are never followed. Capacity totals are computed from regular files.
+By default, files older than \fB--days\fR based on \fB--time-field\fR are
+classified as cold.
+.sp
+Output is written as CSV with a header row:
+.sp
+directory_path,total_capacity(<unit>),cold_capacity(<unit>),cold_ratio,error_count,histogram_capacity_0(<unit>),...,histogram_capacity_4(<unit>)
+.SH OPTIONS
+.TP
+.B \-o, \-\-output FILE
+Write analysis output to FILE. Existing FILE is overwritten.
+.TP
+.B \-d, \-\-days N
+Cold threshold in days. Default is 30.
+.TP
+.B \-u, \-\-unit B|KB|MB|GB|TB|PB
+Output capacity unit. Default is B.
+.TP
+.B \-e, \-\-exclude REGEX
+Exclude depth-1 directories matching REGEX. Applied only at depth-1.
+.TP
+.B \-t, \-\-time-field atime|mtime|ctime|btime
+Timestamp field used for cold classification. Default is atime.
+.TP
+.B \-\-progress N
+Print walk progress approximately every N seconds.
+.TP
+.B \-\-strict
+Stop after first topdir with analysis errors.
+.TP
+.B \-\-xdev
+Only count files on the same filesystem as each topdir (default).
+.TP
+.B \-\-follow-mounts
+Disable \-\-xdev behavior.
+.TP
+.B \-\-unique-inode
+Deduplicate hardlinks by (st_dev, st_ino) using global gather/sort (higher memory cost).
+.TP
+.B \-\-print
+Print results as an aligned table to stdout on rank 0.
+.TP
+.B \-v, \-\-verbose
+Enable verbose output.
+.TP
+.B \-q, \-\-quiet
+Suppress verbose output.
+.TP
+.B \-h, \-\-help
+Print usage information.
+.SH NOTES
+.sp
+\fBdhotcold\fR requires root privileges on all ranks.
+.sp
+The output file is opened by rank 0 with truncate semantics and each topdir result is
+written by rank 0 after MPI reductions.
+.SH EXAMPLE
+.sp
+\fBmpirun \-np 32 dhotcold --output result.txt --days 30 --time-field atime /data/lake\fR

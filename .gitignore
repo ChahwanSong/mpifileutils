@@ -77,3 +77,7 @@ spack.lock
 
 # source indexing/tagging
 tags
+
+# build
+build
+build-dhotcold-verify
