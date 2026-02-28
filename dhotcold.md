@@ -35,7 +35,7 @@
 출력 파일은 CSV 형식이며, 첫 줄에 컬럼명이 기록된다.
 
 ```csv
-directory_path,total_capacity(<unit>),cold_capacity(<unit>),cold_ratio,error_count,histogram_capacity_0(<unit>),histogram_capacity_1(<unit>),histogram_capacity_2(<unit>),histogram_capacity_3(<unit>),histogram_capacity_4(<unit>)
+directory_path,total_capacity(<unit>),cold_capacity(<unit>),cold_ratio,error_count,current-day1(<unit>),current-day30(<unit>),current-day90(<unit>),current-day180(<unit>),current-day365(<unit>)
 ```
 
 필드 설명:
@@ -45,14 +45,19 @@ directory_path,total_capacity(<unit>),cold_capacity(<unit>),cold_ratio,error_cou
 - `cold_capacity`: cold regular file 총 용량
 - `cold_ratio`: `cold_capacity / total_capacity` (0~1)
 - `error_count`: 해당 topdir 분석 중 누적 오류 수
-- `hist0..hist4`: cold 파일 용량 히스토그램(5개 구간)
+- `current-day1/30/90/180/365`: 현재 시점 기준 누적 용량 히스토그램(5개 구간)
 
 히스토그램 규칙:
 
-- cold 파일(`age_days >= days`)만 누적
-- `delta = age_days - days`
-- `bucket_width = ceil(days / 5)` (`days=0`이면 1)
-- `bin = min(delta / bucket_width, 4)`
+- 히스토그램은 `--days` 값과 무관하게 고정 구간을 사용
+- 구간 임계: `1, 30, 90, 180, 365`일
+- 각 구간은 누적(cumulative)으로 계산
+  - `current-day1`: age_days <= 1 인 파일 용량 합
+  - `current-day30`: age_days <= 30 인 파일 용량 합
+  - `current-day90`: age_days <= 90 인 파일 용량 합
+  - `current-day180`: age_days <= 180 인 파일 용량 합
+  - `current-day365`: age_days <= 365 인 파일 용량 합
+- 따라서 각 값은 `current-day1 <= current-day30 <= ... <= current-day365` 관계를 가진다
 
 ## 옵션
 

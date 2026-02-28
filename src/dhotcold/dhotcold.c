@@ -29,6 +29,7 @@
 #define DHOTCOLD_HIST_BINS (5)
 #define DHOTCOLD_PRINT_MAX_PATH_WIDTH (80)
 #define DHOTCOLD_PRINT_COLS (5 + DHOTCOLD_HIST_BINS)
+static const uint64_t DHOTCOLD_HIST_DAY_LIMITS[DHOTCOLD_HIST_BINS] = {1ULL, 30ULL, 90ULL, 180ULL, 365ULL};
 
 typedef enum {
     TIME_FIELD_ATIME = 0,
@@ -111,7 +112,7 @@ static void print_usage(void)
     printf("  -h, --help                - print usage\n");
     printf("\n");
     printf("Output file format (CSV):\n");
-    printf("directory_path,total_capacity(<unit>),cold_capacity(<unit>),cold_ratio,error_count,histogram_capacity_0(<unit>),...,histogram_capacity_4(<unit>)\n");
+    printf("directory_path,total_capacity(<unit>),cold_capacity(<unit>),cold_ratio,error_count,current-day1(<unit>),current-day30(<unit>),current-day90(<unit>),current-day180(<unit>),current-day365(<unit>)\n");
     printf("\n");
     fflush(stdout);
 }
@@ -119,6 +120,12 @@ static void print_usage(void)
 static void stats_init(dhotcold_stats_t* stats)
 {
     memset(stats, 0, sizeof(*stats));
+}
+
+static void histogram_column_name(int bin, char* out, size_t out_size)
+{
+    uint64_t day = DHOTCOLD_HIST_DAY_LIMITS[bin];
+    snprintf(out, out_size, "current-day%" PRIu64, day);
 }
 
 static bool is_dot_or_dotdot(const char* name)
@@ -335,7 +342,9 @@ static int write_csv_header(FILE* fp, dhotcold_output_unit_t unit)
 
     int b;
     for (b = 0; b < DHOTCOLD_HIST_BINS; b++) {
-        if (fprintf(fp, ",histogram_capacity_%d(%s)", b, u) < 0) {
+        char name[64];
+        histogram_column_name(b, name, sizeof(name));
+        if (fprintf(fp, ",%s(%s)", name, u) < 0) {
             return -1;
         }
     }
@@ -437,13 +446,15 @@ static void print_results_table(const dhotcold_result_vec_t* rows, dhotcold_outp
 
     char header_total[32];
     char header_cold[32];
-    char header_hist[DHOTCOLD_HIST_BINS][48];
+    char header_hist[DHOTCOLD_HIST_BINS][96];
     snprintf(header_total, sizeof(header_total), "Total(%s)", u);
     snprintf(header_cold, sizeof(header_cold), "Cold(%s)", u);
 
     int b;
     for (b = 0; b < DHOTCOLD_HIST_BINS; b++) {
-        snprintf(header_hist[b], sizeof(header_hist[b]), "Hist%d(%s)", b, u);
+        char name[32];
+        histogram_column_name(b, name, sizeof(name));
+        snprintf(header_hist[b], sizeof(header_hist[b]), "%s(%s)", name, u);
     }
 
     const char* headers[DHOTCOLD_PRINT_COLS];
@@ -638,20 +649,13 @@ static void stats_add_record(dhotcold_stats_t* stats, uint64_t size, uint64_t ag
 
     if (age_days >= cold_days) {
         stats->cold_bytes += size;
+    }
 
-        uint64_t span_days = (cold_days == 0) ? 1 : cold_days;
-        uint64_t bucket_width = (span_days + (uint64_t)DHOTCOLD_HIST_BINS - 1) / (uint64_t)DHOTCOLD_HIST_BINS;
-        if (bucket_width == 0) {
-            bucket_width = 1;
+    int b;
+    for (b = 0; b < DHOTCOLD_HIST_BINS; b++) {
+        if (age_days <= DHOTCOLD_HIST_DAY_LIMITS[b]) {
+            stats->hist_bytes[b] += size;
         }
-
-        uint64_t delta = age_days - cold_days;
-        uint64_t bucket = delta / bucket_width;
-        if (bucket >= (uint64_t)DHOTCOLD_HIST_BINS) {
-            bucket = (uint64_t)DHOTCOLD_HIST_BINS - 1;
-        }
-
-        stats->hist_bytes[bucket] += size;
     }
 }
 
