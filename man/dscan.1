@@ -1,0 +1,52 @@
+.TH "DSCAN" "1" "Mar 1, 2026" "0.12" "mpiFileUtils"
+.SH NAME
+dscan \- distributed directory scanner with histogram and oldest-entry reporting
+.SH SYNOPSIS
+.B dscan
+[\fIOPTION\fR]
+.SH DESCRIPTION
+.sp
+\fBdscan\fR walks a directory tree in parallel using MPI and generates a JSON
+report containing:
+.sp
+- file size histogram
+- atime/mtime/ctime histograms for files and directories
+- oldest top-K items for atime/mtime/ctime, including path, timestamps, and size
+- broken-path list
+.sp
+Directory size in top-K output is computed as the sum of all regular-file sizes
+under that directory subtree.
+.SH OPTIONS
+.TP
+.B \-d, \-\-directory PATH
+Directory tree to scan. Required.
+.TP
+.B \-o, \-\-output FILE
+Write JSON output to FILE. Required.
+.TP
+.B \-p, \-\-print
+Print a human-readable summary to stdout on rank 0.
+.TP
+.B \-k, \-\-top-k N
+Number of oldest entries to report for each timestamp field.
+Default is 10.
+.TP
+.B \-v, \-\-verbose
+Enable verbose logging.
+.TP
+.B \-q, \-\-quiet
+Suppress verbose logging.
+.TP
+.B \-h, \-\-help
+Print usage.
+.SH BROKEN-PATH RULES
+.sp
+An item is marked broken when one or more conditions hold:
+.sp
+- abnormal_size: regular file size is larger than 1 PiB
+- missing: path does not exist
+- abnormal_time: atime/mtime/ctime older than 10 years or in the future
+- unreadable: file or directory cannot be opened/read
+.SH EXAMPLE
+.sp
+\fBmpirun -np 8 dscan --directory /data --output report.json --top-k 25 --print\fR
