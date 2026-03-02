@@ -7,9 +7,11 @@ It recursively walks a target directory, computes analytics, and writes a JSON r
 
 - File size histogram (regular files)
 - atime/mtime/ctime histograms (regular files + directories)
-- Oldest top-K by atime/mtime/ctime
+- Oldest top-K directories by atime/mtime/ctime
   - Each entry includes path, type, timestamps, and size
-  - Directory size is computed as the sum of regular-file sizes under that subtree
+  - Directory size is computed recursively as:
+    - sum of immediate child regular-file sizes
+    - plus summed sizes of all descendant subdirectories
 - Broken path detection list
   - abnormal size
   - missing path
@@ -32,7 +34,7 @@ Required options:
 Optional options:
 
 - `--print` (`-p`): print human-readable summary on stdout (rank 0)
-- `--top-k <number>` (`-k`): top-K oldest entries per timestamp field (default: `10`)
+- `--top-k <number>` (`-k`): top-K oldest directories per timestamp field (default: `10`)
 - `--verbose` (`-v`): verbose logging
 - `--quiet` (`-q`): quiet logging
 - `--help` (`-h`): usage message
@@ -62,7 +64,7 @@ Top-level keys:
 - `summary`: total entry counters
 - `file_size_histogram`: file-size bucket counts
 - `time_histograms`: atime/mtime/ctime bucket counts
-- `oldest`: top-K arrays for `atime`, `mtime`, `ctime`
+- `oldest`: top-K directory arrays for `atime`, `mtime`, `ctime`
 - `broken_paths`: array of broken entries with reason labels
 
 ### Example JSON (abridged)
@@ -107,8 +109,8 @@ Top-level keys:
   "oldest": {
     "atime": [
       {
-        "path": "/data/project/old/file.bin",
-        "type": "file",
+        "path": "/data/project/archive",
+        "type": "directory",
         "size_bytes": 4294967296,
         "atime": 1600000000,
         "mtime": 1600000000,
@@ -152,9 +154,11 @@ Top-level keys:
 ### 3) Rank-0 analytics phase
 
 - Rebuild full item list
-- Compute directory aggregate sizes from file paths
+- Compute directory aggregate sizes (bottom-up)
+  - add each file size to its nearest existing parent directory
+  - propagate child directory aggregates to parent directories
 - Compute histograms
-- Compute oldest top-K lists for each timestamp field
+- Compute oldest top-K lists for each timestamp field (directories only)
 - Build broken-path index
 
 ### 4) Output phase

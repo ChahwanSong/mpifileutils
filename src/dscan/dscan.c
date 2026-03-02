@@ -87,6 +87,7 @@ typedef struct {
 
 static const dscan_item_t* g_sort_items = NULL;
 static dscan_top_field_t g_sort_field = DSCAN_TOP_ATIME;
+static const dscan_dir_agg_t* g_sort_dirs = NULL;
 
 static void print_usage(void)
 {
@@ -99,7 +100,7 @@ static void print_usage(void)
     printf("\n");
     printf("Optional:\n");
     printf("  -p, --print              - print pretty summary on stdout (rank 0)\n");
-    printf("  -k, --top-k <N>          - oldest top-K per time field (default 10)\n");
+    printf("  -k, --top-k <N>          - oldest top-K directories per time field (default 10)\n");
     printf("  -v, --verbose            - verbose output\n");
     printf("  -q, --quiet              - quiet output\n");
     printf("  -h, --help               - print usage\n");
@@ -175,6 +176,23 @@ static int cmp_dir_agg_by_path(const void* a, const void* b)
     return strcmp(da->path, db->path);
 }
 
+static int cmp_dir_index_by_path_len_desc(const void* a, const void* b)
+{
+    uint64_t ia = *(const uint64_t*) a;
+    uint64_t ib = *(const uint64_t*) b;
+
+    size_t la = strlen(g_sort_dirs[ia].path);
+    size_t lb = strlen(g_sort_dirs[ib].path);
+
+    if (la > lb) {
+        return -1;
+    }
+    if (la < lb) {
+        return 1;
+    }
+    return strcmp(g_sort_dirs[ia].path, g_sort_dirs[ib].path);
+}
+
 static int find_dir_index(const dscan_dir_agg_t* dirs, uint64_t count, const char* path)
 {
     uint64_t low = 0;
@@ -194,6 +212,37 @@ static int find_dir_index(const dscan_dir_agg_t* dirs, uint64_t count, const cha
     }
 
     return -1;
+}
+
+static char* get_parent_path_dup(const char* path)
+{
+    if (path == NULL || path[0] == '\0') {
+        return NULL;
+    }
+
+    size_t end = strlen(path);
+    while (end > 1 && path[end - 1] == '/') {
+        end--;
+    }
+
+    if (end == 1 && path[0] == '/') {
+        return NULL;
+    }
+
+    size_t pos = end;
+    while (pos > 0 && path[pos - 1] != '/') {
+        pos--;
+    }
+
+    if (pos == 0) {
+        return NULL;
+    }
+
+    size_t len = (pos == 1) ? 1 : (pos - 1);
+    char* parent = (char*) MFU_MALLOC(len + 1);
+    memcpy(parent, path, len);
+    parent[len] = '\0';
+    return parent;
 }
 
 static uint64_t size_hist_bin(uint64_t size)
@@ -570,7 +619,7 @@ static void print_pretty_report(
     }
     printf("\n");
 
-    printf("oldest by atime\n");
+    printf("oldest directories by atime\n");
     if (top_atime_count == 0) {
         printf("  (none)\n");
     }
@@ -600,7 +649,7 @@ static void print_pretty_report(
     }
     printf("\n");
 
-    printf("oldest by mtime\n");
+    printf("oldest directories by mtime\n");
     if (top_mtime_count == 0) {
         printf("  (none)\n");
     }
@@ -630,7 +679,7 @@ static void print_pretty_report(
     }
     printf("\n");
 
-    printf("oldest by ctime\n");
+    printf("oldest directories by ctime\n");
     if (top_ctime_count == 0) {
         printf("  (none)\n");
     }
@@ -1223,8 +1272,12 @@ int main(int argc, char** argv)
             }
 
             dscan_dir_agg_t* dir_aggs = NULL;
+            int* dir_parents = NULL;
+            uint64_t* dir_order = NULL;
             if (dir_count > 0) {
                 dir_aggs = (dscan_dir_agg_t*) MFU_MALLOC((size_t)dir_count * sizeof(dscan_dir_agg_t));
+                dir_parents = (int*) MFU_MALLOC((size_t)dir_count * sizeof(int));
+                dir_order = (uint64_t*) MFU_MALLOC((size_t)dir_count * sizeof(uint64_t));
 
                 uint64_t d = 0;
                 for (uint64_t i = 0; i < total_items; i++) {
@@ -1238,40 +1291,62 @@ int main(int argc, char** argv)
 
                 qsort(dir_aggs, (size_t)dir_count, sizeof(dscan_dir_agg_t), cmp_dir_agg_by_path);
 
+                for (uint64_t i = 0; i < dir_count; i++) {
+                    dir_order[i] = i;
+                    dir_parents[i] = -1;
+
+                    char* parent = get_parent_path_dup(dir_aggs[i].path);
+                    while (parent != NULL) {
+                        int parent_idx = find_dir_index(dir_aggs, dir_count, parent);
+                        if (parent_idx >= 0 && parent_idx != (int)i) {
+                            dir_parents[i] = parent_idx;
+                            break;
+                        }
+
+                        char* next_parent = get_parent_path_dup(parent);
+                        mfu_free(&parent);
+                        parent = next_parent;
+                    }
+                    mfu_free(&parent);
+                }
+
                 for (uint64_t i = 0; i < total_items; i++) {
                     if (items[i].type != MFU_TYPE_FILE) {
                         continue;
                     }
 
-                    char* parent = MFU_STRDUP(items[i].path);
-                    while (1) {
-                        char* slash = strrchr(parent, '/');
-                        if (slash == NULL) {
-                            break;
-                        }
-
-                        if (slash == parent) {
-                            parent[1] = '\0';
-                        } else {
-                            *slash = '\0';
-                        }
-
+                    char* parent = get_parent_path_dup(items[i].path);
+                    while (parent != NULL) {
                         int idx = find_dir_index(dir_aggs, dir_count, parent);
                         if (idx >= 0) {
                             dir_aggs[idx].size += items[i].size;
-                        }
-
-                        if (slash == parent) {
                             break;
                         }
+
+                        char* next_parent = get_parent_path_dup(parent);
+                        mfu_free(&parent);
+                        parent = next_parent;
                     }
                     mfu_free(&parent);
+                }
+
+                g_sort_dirs = dir_aggs;
+                qsort(dir_order, (size_t)dir_count, sizeof(uint64_t), cmp_dir_index_by_path_len_desc);
+
+                for (uint64_t i = 0; i < dir_count; i++) {
+                    uint64_t child_idx = dir_order[i];
+                    int parent_idx = dir_parents[child_idx];
+                    if (parent_idx >= 0) {
+                        dir_aggs[parent_idx].size += dir_aggs[child_idx].size;
+                    }
                 }
 
                 for (uint64_t i = 0; i < dir_count; i++) {
                     effective_sizes[dir_aggs[i].item_index] = dir_aggs[i].size;
                 }
 
+                mfu_free(&dir_order);
+                mfu_free(&dir_parents);
                 mfu_free(&dir_aggs);
             }
 
@@ -1292,6 +1367,9 @@ int main(int argc, char** argv)
                     atime_hist[time_hist_bin(now, items[i].atime)]++;
                     mtime_hist[time_hist_bin(now, items[i].mtime)]++;
                     ctime_hist[time_hist_bin(now, items[i].ctime)]++;
+                }
+
+                if (items[i].type == MFU_TYPE_DIR) {
                     candidate_count++;
                 }
 
@@ -1306,7 +1384,7 @@ int main(int argc, char** argv)
             uint64_t cidx = 0;
             uint64_t bidx = 0;
             for (uint64_t i = 0; i < total_items; i++) {
-                if (items[i].type == MFU_TYPE_FILE || items[i].type == MFU_TYPE_DIR) {
+                if (items[i].type == MFU_TYPE_DIR) {
                     candidate_indices[cidx++] = i;
                 }
                 if (items[i].broken_flags != 0) {
