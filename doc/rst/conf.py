@@ -165,6 +165,7 @@ man_pages = [
     ('drm.1', 'drm', u'distributed remove',[author], 1),
     ('dstripe.1', 'dstripe', u'restripe files on underlying storage',[author], 1),
     ('dsync.1', 'dsync', u'synchronize directory trees',[author], 1),
+    ('nsync.1', 'nsync', u'synchronize split-mount source and destination trees',[author], 1),
     ('dtar.1', 'dtar', u'create and extract a tar archive',[author], 1),
     ('dwalk.1', 'dwalk', u'distributed walk and list',[author], 1)
 ]

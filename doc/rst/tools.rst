@@ -19,6 +19,7 @@ invocation of the tool has sufficient time to complete before it is killed.
 - :doc:`drm <drm.1>` - Remove files.
 - :doc:`dstripe <dstripe.1>` - Restripe files (Lustre).
 - :doc:`dsync <dsync.1>` - Synchronize source and destination directories or files.
+- :doc:`nsync <nsync.1>` - Synchronize source and destination across split mounts.
 - :doc:`dtar <dtar.1>` - Create and extract tape archive files.
 - :doc:`dwalk <dwalk.1>` - List, sort, and profile files.
 
@@ -127,4 +128,3 @@ which deletes any file that has not been accessed in the past 180 days.::
 
   # delete all files in the purge list
   drm --input purgelist.mfu
-

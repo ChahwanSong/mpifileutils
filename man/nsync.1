@@ -1,0 +1,85 @@
+.TH "NSYNC" "1" "Mar 06, 2026" "0.12" "mpiFileUtils"
+.SH NAME
+nsync \- synchronize source and destination in split-mount MPI topologies
+.SH SYNOPSIS
+.B nsync [OPTION] SRC DEST
+.SH DESCRIPTION
+Parallel MPI application to synchronize SRC to DEST when source and
+destination paths are mounted on different node sets.
+
+Unlike dsync, nsync does not require each rank to access both SRC and DEST.
+Ranks are assigned as source-side or destination-side workers and data is
+transferred over MPI from source owners to destination owners.
+.SH OPTIONS
+.TP
+.B \-\-dryrun
+Show planned differences and actions without modifying destination.
+.TP
+.B \-b, \-\-batch\-files N
+Process approximately N entries per batch to bound planner memory.
+Enables batch checkpoint/resume using \fB.nsync.batch.state\fP.
+.TP
+.B \-D, \-\-delete
+Delete extraneous files from destination.
+.TP
+.B \-c, \-\-contents
+Compare regular files by SHA256 digest (instead of size+mtime checks).
+.TP
+.B \-\-bufsize SIZE
+Set I/O and digest buffer size in bytes.
+.TP
+.B \-\-chunksize SIZE
+Set minimum work chunk size in bytes.
+.TP
+.B \-\-progress N
+Print progress every N seconds.
+.TP
+.B \-\-role\-mode MODE
+Role assignment mode: \fBauto\fP or \fBmap\fP.
+.TP
+.B \-\-role\-map SPEC
+Explicit role map used with \fB\-\-role\-mode map\fP.
+Example: \fB0\-1:src,2\-3:dst\fP.
+.TP
+.B \-\-trace
+Print per-rank stage traces for debugging collectives and pipeline stages.
+.TP
+.B \-v, \-\-verbose
+Verbose output.
+.TP
+.B \-q, \-\-quiet
+Quiet output.
+.TP
+.B \-h, \-\-help
+Print help.
+.SH ROLE MODEL
+Each rank is assigned one of:
+
+- \fBsrc\fP: can access source path and serves metadata/data from SRC
+
+- \fBdst\fP: can access destination path and applies actions under DEST
+
+In \fBauto\fP mode, nsync probes source readability and destination writability.
+In \fBmap\fP mode, roles are assigned directly by world rank.
+.SH BATCH CHECKPOINT
+When \fB\-\-batch\-files\fP is enabled, nsync writes progress to:
+
+\fBDEST/.nsync.batch.state\fP
+
+On restart with matching source/destination/options, nsync resumes from the
+last completed batch. Mismatched checkpoint state is ignored safely.
+.SH EXAMPLES
+.TP
+Synchronize split mounts with automatic role detection:
+.B mpirun \-np 2 nsync /src /dst
+
+.TP
+Force roles in a shared-mount local test:
+.B mpirun \-np 2 nsync \-\-role\-mode map \-\-role\-map 0:src,1:dst /tmp/src /tmp/dst
+
+.TP
+Memory-bounded sync with delete and content compare:
+.B mpirun \-np 8 nsync \-\-batch\-files 200000 \-\-delete \-\-contents /src /dst
+.SH SEE ALSO
+dsync(1), dcp(1), dwalk(1), mpifileutils(1)
+
