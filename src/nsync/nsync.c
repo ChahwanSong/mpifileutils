@@ -139,6 +139,15 @@ typedef struct {
 } nsync_action_counts_t;
 
 typedef struct {
+    uint64_t chown_ignored;
+    uint64_t chmod_ignored;
+    uint64_t utime_ignored;
+    uint64_t chown_failed;
+    uint64_t chmod_failed;
+    uint64_t utime_failed;
+} nsync_meta_apply_stats_t;
+
+typedef struct {
     int enabled;
     uint64_t batch_count;
     uint64_t batch_id;
@@ -317,6 +326,51 @@ static int nsync_sync_error_point(
     }
 
     return global_error;
+}
+
+static void nsync_batch_monitor_skew(
+    const nsync_options_t* opts,
+    uint64_t batch_id,
+    uint64_t batch_count,
+    const char* metric_name,
+    uint64_t local_count)
+{
+    if (opts == NULL || opts->batch_files == 0 || batch_count <= 1 || metric_name == NULL) {
+        return;
+    }
+
+    uint64_t global_sum = 0;
+    uint64_t global_max = 0;
+    MPI_Allreduce(&local_count, &global_sum, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&local_count, &global_max, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+
+    int rank;
+    int ranks;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+
+    if (rank != 0 || ranks <= 0 || global_sum == 0) {
+        return;
+    }
+
+    double avg = (double)global_sum / (double)ranks;
+    if (avg <= 0.0) {
+        return;
+    }
+
+    double ratio = (double)global_max / avg;
+    if (ratio >= 4.0 && global_max >= 1024) {
+        MFU_LOG(MFU_LOG_WARN,
+            "Batch skew detected for %s at batch %" PRIu64 "/%" PRIu64
+            " (sum=%" PRIu64 " max=%" PRIu64 " avg=%.2f ratio=%.2f). "
+            "Consider increasing --batch-files or adding secondary hash split.",
+            metric_name, batch_id + 1, batch_count, global_sum, global_max, avg, ratio);
+    } else if (opts->verbose && ratio >= 2.0 && global_max >= 256) {
+        MFU_LOG(MFU_LOG_INFO,
+            "Batch imbalance observed for %s at batch %" PRIu64 "/%" PRIu64
+            " (sum=%" PRIu64 " max=%" PRIu64 " avg=%.2f ratio=%.2f)",
+            metric_name, batch_id + 1, batch_count, global_sum, global_max, avg, ratio);
+    }
 }
 
 static void nsync_batch_state_init(nsync_batch_state_t* state)
@@ -2780,7 +2834,8 @@ static void nsync_apply_metadata(
     const nsync_action_record_t* action,
     int nofollow,
     const nsync_options_t* opts,
-    int* local_errors)
+    int* local_errors,
+    nsync_meta_apply_stats_t* meta_stats)
 {
     if (path == NULL || action == NULL || local_errors == NULL) {
         return;
@@ -2789,14 +2844,46 @@ static void nsync_apply_metadata(
     uid_t uid = (uid_t)action->uid;
     gid_t gid = (gid_t)action->gid;
     int chown_rc = nofollow ? lchown(path, uid, gid) : chown(path, uid, gid);
-    if (chown_rc != 0 && !nsync_metadata_errno_ignorable(errno)) {
-        (*local_errors)++;
+    if (chown_rc != 0) {
+        int chown_err = errno;
+        if (nsync_metadata_errno_ignorable(chown_err)) {
+            if (meta_stats != NULL) {
+                meta_stats->chown_ignored++;
+            }
+            if (opts->verbose) {
+                MFU_LOG(MFU_LOG_WARN, "Skipping owner update for `%s`: %s", path, strerror(chown_err));
+            }
+        } else {
+            if (meta_stats != NULL) {
+                meta_stats->chown_failed++;
+            }
+            (*local_errors)++;
+            if (opts->verbose) {
+                MFU_LOG(MFU_LOG_WARN, "Failed owner update for `%s`: %s", path, strerror(chown_err));
+            }
+        }
     }
 
     if (!nofollow) {
         mode_t perms = (mode_t)(action->mode & 07777u);
-        if (chmod(path, perms) != 0 && !nsync_metadata_errno_ignorable(errno)) {
-            (*local_errors)++;
+        if (chmod(path, perms) != 0) {
+            int chmod_err = errno;
+            if (nsync_metadata_errno_ignorable(chmod_err)) {
+                if (meta_stats != NULL) {
+                    meta_stats->chmod_ignored++;
+                }
+                if (opts->verbose) {
+                    MFU_LOG(MFU_LOG_WARN, "Skipping mode update for `%s`: %s", path, strerror(chmod_err));
+                }
+            } else {
+                if (meta_stats != NULL) {
+                    meta_stats->chmod_failed++;
+                }
+                (*local_errors)++;
+                if (opts->verbose) {
+                    MFU_LOG(MFU_LOG_WARN, "Failed mode update for `%s`: %s", path, strerror(chmod_err));
+                }
+            }
         }
     }
 
@@ -2810,10 +2897,22 @@ static void nsync_apply_metadata(
 
     int flags = nofollow ? AT_SYMLINK_NOFOLLOW : 0;
     if (utimensat(AT_FDCWD, path, times, flags) != 0) {
-        if (!nsync_metadata_errno_ignorable(errno)) {
+        int utime_err = errno;
+        if (!nsync_metadata_errno_ignorable(utime_err)) {
+            if (meta_stats != NULL) {
+                meta_stats->utime_failed++;
+            }
             (*local_errors)++;
-        } else if (opts->verbose) {
-            MFU_LOG(MFU_LOG_WARN, "Skipping metadata timestamp update for `%s`: %s", path, strerror(errno));
+            if (opts->verbose) {
+                MFU_LOG(MFU_LOG_WARN, "Failed metadata timestamp update for `%s`: %s", path, strerror(utime_err));
+            }
+        } else {
+            if (meta_stats != NULL) {
+                meta_stats->utime_ignored++;
+            }
+            if (opts->verbose) {
+                MFU_LOG(MFU_LOG_WARN, "Skipping metadata timestamp update for `%s`: %s", path, strerror(utime_err));
+            }
         }
     }
 }
@@ -3027,7 +3126,8 @@ static int nsync_destination_receive_copy_file(
     const char* dst_root,
     const nsync_action_record_t* action,
     const nsync_options_t* opts,
-    int* local_errors)
+    int* local_errors,
+    nsync_meta_apply_stats_t* meta_stats)
 {
     if (action->src_owner_world < 0) {
         (*local_errors)++;
@@ -3104,7 +3204,7 @@ static int nsync_destination_receive_copy_file(
     }
 
     if (fd >= 0 && !io_error) {
-        nsync_apply_metadata(dst_fullpath, action, 0, opts, local_errors);
+        nsync_apply_metadata(dst_fullpath, action, 0, opts, local_errors, meta_stats);
     }
 
     mfu_free(&buf);
@@ -3178,7 +3278,8 @@ static void nsync_destination_execute_actions(
     const nsync_options_t* opts,
     nsync_action_vec_t* deferred_dir_removes,
     nsync_action_vec_t* deferred_dir_meta_updates,
-    int* local_errors)
+    int* local_errors,
+    nsync_meta_apply_stats_t* meta_stats)
 {
     if (dst_actions->size == 0) {
         return;
@@ -3228,18 +3329,18 @@ static void nsync_destination_execute_actions(
             if (action->link_target == NULL || symlink(action->link_target, dst_fullpath) != 0) {
                 (*local_errors)++;
             } else {
-                nsync_apply_metadata(dst_fullpath, action, 1, opts, local_errors);
+                nsync_apply_metadata(dst_fullpath, action, 1, opts, local_errors, meta_stats);
             }
             break;
         case NSYNC_ACTION_COPY:
-            nsync_destination_receive_copy_file(dst_root, action, opts, local_errors);
+            nsync_destination_receive_copy_file(dst_root, action, opts, local_errors, meta_stats);
             break;
         case NSYNC_ACTION_META_UPDATE:
             if (S_ISDIR((mode_t)action->mode)) {
                 nsync_deferred_dir_meta_add(deferred_dir_meta_updates, action, local_errors);
             } else {
                 int nofollow = S_ISLNK((mode_t)action->mode) ? 1 : 0;
-                nsync_apply_metadata(dst_fullpath, action, nofollow, opts, local_errors);
+                nsync_apply_metadata(dst_fullpath, action, nofollow, opts, local_errors, meta_stats);
             }
             break;
         default:
@@ -3259,7 +3360,8 @@ static void nsync_execute_actions_phase4(
     nsync_action_vec_t* dst_exec_actions,
     nsync_action_vec_t* deferred_dir_removes,
     nsync_action_vec_t* deferred_dir_meta_updates,
-    int* local_errors)
+    int* local_errors,
+    nsync_meta_apply_stats_t* meta_stats)
 {
     if (role_info->role == NSYNC_ROLE_SRC) {
         nsync_trace_local(opts, "phase4-src-service", src_exec_actions->size, 0);
@@ -3267,7 +3369,7 @@ static void nsync_execute_actions_phase4(
     } else if (role_info->role == NSYNC_ROLE_DST) {
         nsync_trace_local(opts, "phase4-dst-exec", dst_exec_actions->size, 0);
         nsync_destination_execute_actions(
-            dst_root, dst_exec_actions, opts, deferred_dir_removes, deferred_dir_meta_updates, local_errors);
+            dst_root, dst_exec_actions, opts, deferred_dir_removes, deferred_dir_meta_updates, local_errors, meta_stats);
     }
 }
 
@@ -3311,7 +3413,8 @@ static void nsync_finalize_deferred_dir_meta_updates(
     const char* dst_root,
     const nsync_options_t* opts,
     nsync_action_vec_t* deferred_dir_meta_updates,
-    int* local_errors)
+    int* local_errors,
+    nsync_meta_apply_stats_t* meta_stats)
 {
     if (deferred_dir_meta_updates == NULL || deferred_dir_meta_updates->size == 0) {
         return;
@@ -3332,7 +3435,7 @@ static void nsync_finalize_deferred_dir_meta_updates(
         last = action->relpath;
 
         char* dst_fullpath = nsync_build_full_path(dst_root, action->relpath);
-        nsync_apply_metadata(dst_fullpath, action, 0, opts, local_errors);
+        nsync_apply_metadata(dst_fullpath, action, 0, opts, local_errors, meta_stats);
         mfu_free(&dst_fullpath);
     }
 }
@@ -3345,7 +3448,8 @@ static int nsync_reconcile_directory_metadata_after_resume(
     nsync_action_vec_t* deferred_dir_removes,
     nsync_action_vec_t* deferred_dir_meta_updates,
     int* local_scan_errors_total,
-    uint64_t* local_exec_errors_total)
+    uint64_t* local_exec_errors_total,
+    nsync_meta_apply_stats_t* meta_stats)
 {
     nsync_meta_vec_t local_meta;
     nsync_meta_vec_t planner_meta;
@@ -3441,7 +3545,8 @@ static int nsync_reconcile_directory_metadata_after_resume(
             &dst_exec_actions,
             deferred_dir_removes,
             deferred_dir_meta_updates,
-            &local_exec_errors);
+            &local_exec_errors,
+            meta_stats);
         *local_exec_errors_total += (uint64_t)local_exec_errors;
     }
 
@@ -3462,7 +3567,8 @@ static int nsync_restore_destination_root_metadata(
     const nsync_role_info_t* role_info,
     const char* src_root,
     const char* dst_root,
-    uint64_t* local_exec_errors_total)
+    uint64_t* local_exec_errors_total,
+    nsync_meta_apply_stats_t* meta_stats)
 {
     if (opts->dryrun || local_exec_errors_total == NULL) {
         return 0;
@@ -3512,7 +3618,7 @@ static int nsync_restore_destination_root_metadata(
         action.mtime_nsec = root_meta[4];
 
         int local_errors = 0;
-        nsync_apply_metadata(dst_root, &action, 0, opts, &local_errors);
+        nsync_apply_metadata(dst_root, &action, 0, opts, &local_errors, meta_stats);
         *local_exec_errors_total += (uint64_t)local_errors;
     }
 
@@ -3601,6 +3707,31 @@ static void nsync_action_counts_add(nsync_action_counts_t* dst, const nsync_acti
     dst->symlink_update += src->symlink_update;
     dst->meta_update += src->meta_update;
     dst->skipped_only_dst += src->skipped_only_dst;
+}
+
+static void nsync_meta_apply_stats_init(nsync_meta_apply_stats_t* stats)
+{
+    memset(stats, 0, sizeof(*stats));
+}
+
+static void nsync_meta_apply_stats_to_array(const nsync_meta_apply_stats_t* stats, uint64_t out[6])
+{
+    out[0] = stats->chown_ignored;
+    out[1] = stats->chmod_ignored;
+    out[2] = stats->utime_ignored;
+    out[3] = stats->chown_failed;
+    out[4] = stats->chmod_failed;
+    out[5] = stats->utime_failed;
+}
+
+static void nsync_meta_apply_stats_from_array(const uint64_t in[6], nsync_meta_apply_stats_t* stats)
+{
+    stats->chown_ignored = in[0];
+    stats->chmod_ignored = in[1];
+    stats->utime_ignored = in[2];
+    stats->chown_failed = in[3];
+    stats->chmod_failed = in[4];
+    stats->utime_failed = in[5];
 }
 
 static int nsync_owner_from_group(const int* world_ranks, int count, const char* relpath)
@@ -4239,10 +4370,14 @@ int main(int argc, char** argv)
     nsync_compare_counts_t global_counts;
     nsync_action_counts_t local_action_counts_total;
     nsync_action_counts_t global_action_counts;
+    nsync_meta_apply_stats_t local_meta_apply_stats;
+    nsync_meta_apply_stats_t global_meta_apply_stats;
     nsync_action_vec_t deferred_dir_removes;
     nsync_action_vec_t deferred_dir_meta_updates;
     nsync_compare_counts_init(&local_counts_total);
     nsync_action_counts_init(&local_action_counts_total);
+    nsync_meta_apply_stats_init(&local_meta_apply_stats);
+    nsync_meta_apply_stats_init(&global_meta_apply_stats);
     nsync_action_vec_init(&deferred_dir_removes);
     nsync_action_vec_init(&deferred_dir_meta_updates);
 
@@ -4338,6 +4473,7 @@ int main(int argc, char** argv)
             goto cleanup;
         }
         nsync_trace_local(&opts, "main-post-redistribute", planner_meta.size, batch_id);
+        nsync_batch_monitor_skew(&opts, batch_id, batch_count, "planner-meta", planner_meta.size);
 
         nsync_compare_counts_t batch_counts;
         nsync_action_counts_t batch_action_counts;
@@ -4349,6 +4485,7 @@ int main(int argc, char** argv)
             local_plan_error = 1;
         }
         nsync_trace_local(&opts, "main-post-plan-local", planned_actions.size, (uint64_t)local_plan_error);
+        nsync_batch_monitor_skew(&opts, batch_id, batch_count, "planned-actions", planned_actions.size);
 
         int global_plan_error = 0;
         MPI_Allreduce(&local_plan_error, &global_plan_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
@@ -4408,7 +4545,8 @@ int main(int argc, char** argv)
                 &dst_exec_actions,
                 &deferred_dir_removes,
                 &deferred_dir_meta_updates,
-                &local_exec_errors_batch);
+                &local_exec_errors_batch,
+                &local_meta_apply_stats);
             nsync_trace_local(&opts, "main-post-phase4-exec", (uint64_t)local_exec_errors_batch, batch_id);
 
             local_exec_errors_total += (uint64_t)local_exec_errors_batch;
@@ -4445,7 +4583,7 @@ int main(int argc, char** argv)
         if (nsync_reconcile_directory_metadata_after_resume(
                 &opts, &role_info, src_path, dst_path,
                 &deferred_dir_removes, &deferred_dir_meta_updates,
-                &local_scan_errors_total, &local_exec_errors_total) != 0)
+                &local_scan_errors_total, &local_exec_errors_total, &local_meta_apply_stats) != 0)
         {
             nsync_role_info_free(&role_info);
             nsync_action_vec_free(&deferred_dir_removes);
@@ -4464,7 +4602,7 @@ int main(int argc, char** argv)
     if (!opts.dryrun && role_info.role == NSYNC_ROLE_DST) {
         int local_finalize_errors = 0;
         nsync_finalize_deferred_dir_meta_updates(
-            dst_path, &opts, &deferred_dir_meta_updates, &local_finalize_errors);
+            dst_path, &opts, &deferred_dir_meta_updates, &local_finalize_errors, &local_meta_apply_stats);
         local_exec_errors_total += (uint64_t)local_finalize_errors;
     }
 
@@ -4504,12 +4642,18 @@ int main(int argc, char** argv)
         }
 
         (void)nsync_restore_destination_root_metadata(
-            &opts, &role_info, src_path, dst_path, &local_exec_errors_total);
+            &opts, &role_info, src_path, dst_path, &local_exec_errors_total, &local_meta_apply_stats);
     }
 
     uint64_t global_exec_errors = 0;
     MPI_Allreduce(
         &local_exec_errors_total, &global_exec_errors, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+
+    uint64_t local_meta_apply_arr[6];
+    uint64_t global_meta_apply_arr[6];
+    nsync_meta_apply_stats_to_array(&local_meta_apply_stats, local_meta_apply_arr);
+    MPI_Allreduce(local_meta_apply_arr, global_meta_apply_arr, 6, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    nsync_meta_apply_stats_from_array(global_meta_apply_arr, &global_meta_apply_stats);
 
     if (rank == 0) {
         const char* role_mode = opts.role_mode == NSYNC_ROLE_MODE_AUTO ? "auto" : "map";
@@ -4544,6 +4688,33 @@ int main(int argc, char** argv)
             global_action_counts.meta_update,
             global_action_counts.remove,
             global_action_counts.skipped_only_dst);
+
+        uint64_t metadata_ignored =
+            global_meta_apply_stats.chown_ignored +
+            global_meta_apply_stats.chmod_ignored +
+            global_meta_apply_stats.utime_ignored;
+        uint64_t metadata_failed =
+            global_meta_apply_stats.chown_failed +
+            global_meta_apply_stats.chmod_failed +
+            global_meta_apply_stats.utime_failed;
+        if (metadata_ignored > 0) {
+            MFU_LOG(MFU_LOG_WARN,
+                "Metadata best-effort applied with %" PRIu64 " ignored operation(s): "
+                "chown=%" PRIu64 " chmod=%" PRIu64 " utime=%" PRIu64,
+                metadata_ignored,
+                global_meta_apply_stats.chown_ignored,
+                global_meta_apply_stats.chmod_ignored,
+                global_meta_apply_stats.utime_ignored);
+        }
+        if (metadata_failed > 0) {
+            MFU_LOG(MFU_LOG_ERR,
+                "Metadata apply had %" PRIu64 " hard failure(s): "
+                "chown=%" PRIu64 " chmod=%" PRIu64 " utime=%" PRIu64,
+                metadata_failed,
+                global_meta_apply_stats.chown_failed,
+                global_meta_apply_stats.chmod_failed,
+                global_meta_apply_stats.utime_failed);
+        }
 
         if (global_scan_errors > 0) {
             MFU_LOG(MFU_LOG_ERR, "Encountered %d scan error(s)", global_scan_errors);
