@@ -176,6 +176,17 @@ typedef struct {
     uint64_t bytes_written;
 } nsync_batch_spool_t;
 
+typedef struct {
+    double start_time;
+    double last_print_time;
+    uint64_t total_actions;
+    uint64_t total_copy_files;
+    uint64_t total_copy_bytes;
+    uint64_t last_actions;
+    uint64_t last_copy_files;
+    uint64_t last_copy_bytes;
+} nsync_progress_state_t;
+
 enum {
     NSYNC_BATCH_STATE_MATCH = 0,
     NSYNC_BATCH_STATE_MISMATCH_MALFORMED,
@@ -215,7 +226,7 @@ static void nsync_usage(void)
     printf("  -c, --contents             - compare file contents instead of size+mtime\n");
     printf("      --bufsize <SIZE>       - I/O buffer size in bytes (default " MFU_BUFFER_SIZE_STR ")\n");
     printf("      --chunksize <SIZE>     - minimum work size per task in bytes (default " MFU_CHUNK_SIZE_STR ")\n");
-    printf("      --progress <N>         - print progress every N seconds\n");
+    printf("      --progress <N>         - print rank 0 progress/throughput every N seconds (0 disables)\n");
     printf("      --role-mode <MODE>     - role assignment mode: auto or map\n");
     printf("      --role-map <SPEC>      - explicit role map (used with --role-mode map)\n");
     printf("      --trace                - print detailed per-rank stage traces (debug)\n");
@@ -3127,7 +3138,9 @@ static int nsync_destination_receive_copy_file(
     const nsync_action_record_t* action,
     const nsync_options_t* opts,
     int* local_errors,
-    nsync_meta_apply_stats_t* meta_stats)
+    nsync_meta_apply_stats_t* meta_stats,
+    uint64_t* copied_files,
+    uint64_t* copied_bytes)
 {
     if (action->src_owner_world < 0) {
         (*local_errors)++;
@@ -3167,6 +3180,7 @@ static int nsync_destination_receive_copy_file(
     char* buf = (char*)MFU_MALLOC(buf_cap);
 
     int io_error = 0;
+    uint64_t file_bytes_written = 0;
     while (1) {
         uint32_t chunk = 0;
         MPI_Recv(&chunk, 1, MPI_UINT32_T, action->src_owner_world, NSYNC_MSG_COPY_DATA_LEN,
@@ -3193,6 +3207,8 @@ static int nsync_destination_receive_copy_file(
             io_error = 1;
             (*local_errors)++;
             open_error = 1;
+        } else if (!open_error) {
+            file_bytes_written += (uint64_t)chunk;
         }
     }
 
@@ -3207,9 +3223,19 @@ static int nsync_destination_receive_copy_file(
         nsync_apply_metadata(dst_fullpath, action, 0, opts, local_errors, meta_stats);
     }
 
+    int copy_ok = (fd >= 0 && !io_error);
+    if (copy_ok) {
+        if (copied_files != NULL) {
+            (*copied_files)++;
+        }
+        if (copied_bytes != NULL) {
+            (*copied_bytes) += file_bytes_written;
+        }
+    }
+
     mfu_free(&buf);
     mfu_free(&dst_fullpath);
-    return io_error ? -1 : 0;
+    return copy_ok ? 0 : -1;
 }
 
 static void nsync_deferred_dir_remove_add(
@@ -3279,13 +3305,20 @@ static void nsync_destination_execute_actions(
     nsync_action_vec_t* deferred_dir_removes,
     nsync_action_vec_t* deferred_dir_meta_updates,
     int* local_errors,
-    nsync_meta_apply_stats_t* meta_stats)
+    nsync_meta_apply_stats_t* meta_stats,
+    uint64_t* done_actions,
+    uint64_t* done_copy_files,
+    uint64_t* done_copy_bytes)
 {
     if (dst_actions->size == 0) {
         return;
     }
 
     qsort(dst_actions->records, (size_t)dst_actions->size, sizeof(nsync_action_record_t), nsync_action_exec_sort);
+
+    uint64_t local_done_actions = 0;
+    uint64_t local_done_copy_files = 0;
+    uint64_t local_done_copy_bytes = 0;
 
     for (uint64_t i = 0; i < dst_actions->size; i++) {
         const nsync_action_record_t* action = &dst_actions->records[i];
@@ -3295,6 +3328,7 @@ static void nsync_destination_execute_actions(
             continue;
         }
 
+        int action_completed = 0;
         char* dst_fullpath = nsync_build_full_path(dst_root, action->relpath);
         switch (action->type) {
         case NSYNC_ACTION_REMOVE:
@@ -3305,6 +3339,8 @@ static void nsync_destination_execute_actions(
                 } else {
                     (*local_errors)++;
                 }
+            } else {
+                action_completed = 1;
             }
             break;
         case NSYNC_ACTION_MKDIR: {
@@ -3316,10 +3352,12 @@ static void nsync_destination_execute_actions(
                 (*local_errors)++;
             } else {
                 nsync_deferred_dir_meta_add(deferred_dir_meta_updates, action, local_errors);
+                action_completed = 1;
             }
             break;
         }
-        case NSYNC_ACTION_SYMLINK_UPDATE:
+        case NSYNC_ACTION_SYMLINK_UPDATE: {
+            int errors_before = *local_errors;
             if (nsync_ensure_parent_dirs(dst_fullpath) != 0) {
                 (*local_errors)++;
             }
@@ -3331,23 +3369,54 @@ static void nsync_destination_execute_actions(
             } else {
                 nsync_apply_metadata(dst_fullpath, action, 1, opts, local_errors, meta_stats);
             }
+            if (*local_errors == errors_before) {
+                action_completed = 1;
+            }
             break;
-        case NSYNC_ACTION_COPY:
-            nsync_destination_receive_copy_file(dst_root, action, opts, local_errors, meta_stats);
+        }
+        case NSYNC_ACTION_COPY: {
+            uint64_t copied_files = 0;
+            uint64_t copied_bytes = 0;
+            if (nsync_destination_receive_copy_file(
+                    dst_root, action, opts, local_errors, meta_stats,
+                    &copied_files, &copied_bytes) == 0)
+            {
+                action_completed = 1;
+                local_done_copy_files += copied_files;
+                local_done_copy_bytes += copied_bytes;
+            }
             break;
+        }
         case NSYNC_ACTION_META_UPDATE:
             if (S_ISDIR((mode_t)action->mode)) {
                 nsync_deferred_dir_meta_add(deferred_dir_meta_updates, action, local_errors);
             } else {
+                int errors_before = *local_errors;
                 int nofollow = S_ISLNK((mode_t)action->mode) ? 1 : 0;
                 nsync_apply_metadata(dst_fullpath, action, nofollow, opts, local_errors, meta_stats);
+                if (*local_errors == errors_before) {
+                    action_completed = 1;
+                }
             }
             break;
         default:
             break;
         }
 
+        if (action_completed) {
+            local_done_actions++;
+        }
         mfu_free(&dst_fullpath);
+    }
+
+    if (done_actions != NULL) {
+        (*done_actions) += local_done_actions;
+    }
+    if (done_copy_files != NULL) {
+        (*done_copy_files) += local_done_copy_files;
+    }
+    if (done_copy_bytes != NULL) {
+        (*done_copy_bytes) += local_done_copy_bytes;
     }
 }
 
@@ -3361,15 +3430,29 @@ static void nsync_execute_actions_phase4(
     nsync_action_vec_t* deferred_dir_removes,
     nsync_action_vec_t* deferred_dir_meta_updates,
     int* local_errors,
-    nsync_meta_apply_stats_t* meta_stats)
+    nsync_meta_apply_stats_t* meta_stats,
+    uint64_t* completed_actions,
+    uint64_t* completed_copy_files,
+    uint64_t* completed_copy_bytes)
 {
+    if (completed_actions != NULL) {
+        *completed_actions = 0;
+    }
+    if (completed_copy_files != NULL) {
+        *completed_copy_files = 0;
+    }
+    if (completed_copy_bytes != NULL) {
+        *completed_copy_bytes = 0;
+    }
+
     if (role_info->role == NSYNC_ROLE_SRC) {
         nsync_trace_local(opts, "phase4-src-service", src_exec_actions->size, 0);
         nsync_source_copy_service(src_root, src_exec_actions, opts, local_errors);
     } else if (role_info->role == NSYNC_ROLE_DST) {
         nsync_trace_local(opts, "phase4-dst-exec", dst_exec_actions->size, 0);
         nsync_destination_execute_actions(
-            dst_root, dst_exec_actions, opts, deferred_dir_removes, deferred_dir_meta_updates, local_errors, meta_stats);
+            dst_root, dst_exec_actions, opts, deferred_dir_removes, deferred_dir_meta_updates, local_errors, meta_stats,
+            completed_actions, completed_copy_files, completed_copy_bytes);
     }
 }
 
@@ -3546,7 +3629,10 @@ static int nsync_reconcile_directory_metadata_after_resume(
             deferred_dir_removes,
             deferred_dir_meta_updates,
             &local_exec_errors,
-            meta_stats);
+            meta_stats,
+            NULL,
+            NULL,
+            NULL);
         *local_exec_errors_total += (uint64_t)local_exec_errors;
     }
 
@@ -3707,6 +3793,155 @@ static void nsync_action_counts_add(nsync_action_counts_t* dst, const nsync_acti
     dst->symlink_update += src->symlink_update;
     dst->meta_update += src->meta_update;
     dst->skipped_only_dst += src->skipped_only_dst;
+}
+
+static uint64_t nsync_action_counts_total_actions(const nsync_action_counts_t* counts)
+{
+    return counts->copy + counts->remove + counts->mkdir + counts->symlink_update + counts->meta_update;
+}
+
+static uint64_t nsync_action_vec_copy_bytes(const nsync_action_vec_t* actions)
+{
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < actions->size; i++) {
+        const nsync_action_record_t* action = &actions->records[i];
+        if (action->type == NSYNC_ACTION_COPY) {
+            total += action->size;
+        }
+    }
+    return total;
+}
+
+static void nsync_progress_state_init(nsync_progress_state_t* state)
+{
+    memset(state, 0, sizeof(*state));
+    double now = MPI_Wtime();
+    state->start_time = now;
+    state->last_print_time = now;
+}
+
+static void nsync_progress_log_rank0(
+    const nsync_options_t* opts,
+    uint64_t batch_id,
+    uint64_t batch_count,
+    uint64_t total_actions,
+    uint64_t total_copy_files,
+    uint64_t total_copy_bytes,
+    uint64_t recent_actions,
+    uint64_t recent_copy_files,
+    uint64_t recent_copy_bytes,
+    double elapsed_secs,
+    double recent_secs)
+{
+    double percent = 100.0;
+    if (batch_count > 0) {
+        percent = 100.0 * (double)(batch_id + 1) / (double)batch_count;
+    }
+
+    double total_copy_val = 0.0;
+    const char* total_copy_units = "B";
+    mfu_format_bytes(total_copy_bytes, &total_copy_val, &total_copy_units);
+
+    double recent_copy_val = 0.0;
+    const char* recent_copy_units = "B";
+    mfu_format_bytes(recent_copy_bytes, &recent_copy_val, &recent_copy_units);
+
+    if (opts->dryrun) {
+        MFU_LOG(MFU_LOG_INFO,
+            "Progress %.1f%% batch %" PRIu64 "/%" PRIu64
+            " planned-actions=%" PRIu64 " planned-copy-files=%" PRIu64 " planned-volume=%.3lf %s",
+            percent, batch_id + 1, batch_count,
+            total_actions, total_copy_files, total_copy_val, total_copy_units);
+        return;
+    }
+
+    double recent_file_rate = 0.0;
+    double recent_bw = 0.0;
+    double avg_file_rate = 0.0;
+    double avg_bw = 0.0;
+    if (recent_secs > 0.0) {
+        recent_file_rate = (double)recent_copy_files / recent_secs;
+        recent_bw = (double)recent_copy_bytes / recent_secs;
+    }
+    if (elapsed_secs > 0.0) {
+        avg_file_rate = (double)total_copy_files / elapsed_secs;
+        avg_bw = (double)total_copy_bytes / elapsed_secs;
+    }
+
+    double recent_bw_val = 0.0;
+    const char* recent_bw_units = "B/s";
+    mfu_format_bw(recent_bw, &recent_bw_val, &recent_bw_units);
+
+    double avg_bw_val = 0.0;
+    const char* avg_bw_units = "B/s";
+    mfu_format_bw(avg_bw, &avg_bw_val, &avg_bw_units);
+
+    MFU_LOG(MFU_LOG_INFO,
+        "Progress %.1f%% batch %" PRIu64 "/%" PRIu64
+        " actions=%" PRIu64 " copied-files=%" PRIu64 " copied-volume=%.3lf %s"
+        " recent(actions=%" PRIu64 " files=%" PRIu64 " volume=%.3lf %s, %.2lf files/s, %.3lf %s over %.3lf s)"
+        " avg(%.2lf files/s, %.3lf %s)",
+        percent, batch_id + 1, batch_count,
+        total_actions, total_copy_files, total_copy_val, total_copy_units,
+        recent_actions, recent_copy_files, recent_copy_val, recent_copy_units,
+        recent_file_rate, recent_bw_val, recent_bw_units, recent_secs,
+        avg_file_rate, avg_bw_val, avg_bw_units);
+}
+
+static void nsync_progress_batch_update(
+    const nsync_options_t* opts,
+    nsync_progress_state_t* progress_state,
+    uint64_t batch_id,
+    uint64_t batch_count,
+    uint64_t global_actions,
+    uint64_t global_copy_files,
+    uint64_t global_copy_bytes)
+{
+    if (opts->progress_secs <= 0 || opts->quiet) {
+        return;
+    }
+
+    progress_state->total_actions += global_actions;
+    progress_state->total_copy_files += global_copy_files;
+    progress_state->total_copy_bytes += global_copy_bytes;
+
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank != 0) {
+        return;
+    }
+
+    double now = MPI_Wtime();
+    int final_batch = ((batch_id + 1) >= batch_count);
+    if (!final_batch && (now - progress_state->last_print_time) < (double)opts->progress_secs) {
+        return;
+    }
+
+    uint64_t recent_actions = progress_state->total_actions - progress_state->last_actions;
+    uint64_t recent_copy_files = progress_state->total_copy_files - progress_state->last_copy_files;
+    uint64_t recent_copy_bytes = progress_state->total_copy_bytes - progress_state->last_copy_bytes;
+
+    double elapsed_secs = now - progress_state->start_time;
+    double recent_secs = now - progress_state->last_print_time;
+    if (recent_secs < 0.0) {
+        recent_secs = 0.0;
+    }
+
+    nsync_progress_log_rank0(
+        opts, batch_id, batch_count,
+        progress_state->total_actions,
+        progress_state->total_copy_files,
+        progress_state->total_copy_bytes,
+        recent_actions,
+        recent_copy_files,
+        recent_copy_bytes,
+        elapsed_secs,
+        recent_secs);
+
+    progress_state->last_print_time = now;
+    progress_state->last_actions = progress_state->total_actions;
+    progress_state->last_copy_files = progress_state->total_copy_files;
+    progress_state->last_copy_bytes = progress_state->total_copy_bytes;
 }
 
 static void nsync_meta_apply_stats_init(nsync_meta_apply_stats_t* stats)
@@ -4382,6 +4617,11 @@ int main(int argc, char** argv)
     nsync_action_vec_init(&deferred_dir_meta_updates);
 
     uint64_t local_exec_errors_total = 0;
+    nsync_progress_state_t progress_state;
+    nsync_progress_state_init(&progress_state);
+    if (rank == 0 && !opts.quiet && opts.progress_secs > 0) {
+        MFU_LOG(MFU_LOG_INFO, "Progress logging enabled on rank 0 every %d second(s)", opts.progress_secs);
+    }
 
     for (uint64_t batch_id = start_batch; batch_id < batch_count; batch_id++) {
         nsync_meta_vec_t local_meta;
@@ -4397,6 +4637,13 @@ int main(int argc, char** argv)
 
         int batch_scan_errors = 0;
         int local_exec_errors_batch = 0;
+        int stop_after_batch_error = 0;
+        uint64_t local_batch_actions = 0;
+        uint64_t local_batch_copy_files = 0;
+        uint64_t local_batch_copy_bytes = 0;
+        uint64_t local_batch_exec_actions = 0;
+        uint64_t local_batch_exec_copy_files = 0;
+        uint64_t local_batch_exec_copy_bytes = 0;
         int global_has_meta = 0;
         if (use_batch_spool) {
             int local_has_meta = batch_spool.batch_has_data[(size_t)batch_id] ? 1 : 0;
@@ -4442,18 +4689,37 @@ int main(int argc, char** argv)
         nsync_trace_local(&opts, "main-post-scan", local_meta.size, (uint64_t)batch_scan_errors);
         if (!global_has_meta) {
             uint64_t local_batch_errors = (uint64_t)batch_scan_errors;
-            uint64_t global_batch_errors = 0;
-            MPI_Allreduce(&local_batch_errors, &global_batch_errors, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+            uint64_t local_batch_summary[4] = {
+                local_batch_errors, local_batch_actions, local_batch_copy_files, local_batch_copy_bytes
+            };
+            uint64_t global_batch_summary[4] = {0, 0, 0, 0};
+            MPI_Allreduce(local_batch_summary, global_batch_summary, 4, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+            uint64_t global_batch_errors = global_batch_summary[0];
             if (!opts.dryrun && opts.batch_files > 0 && global_batch_errors == 0) {
                 (void)nsync_checkpoint_mark_batch_complete(
                     &opts, &role_info, src_path, dst_path,
                     checkpoint_option_hash, batch_count, batch_id);
             }
+            if (!opts.dryrun && global_batch_errors > 0) {
+                stop_after_batch_error = 1;
+            }
+            nsync_progress_batch_update(
+                &opts, &progress_state, batch_id, batch_count,
+                global_batch_summary[1], global_batch_summary[2], global_batch_summary[3]);
             nsync_action_vec_free(&dst_exec_actions);
             nsync_action_vec_free(&src_exec_actions);
             nsync_action_vec_free(&planned_actions);
             nsync_meta_vec_free(&planner_meta);
             nsync_meta_vec_free(&local_meta);
+            if (stop_after_batch_error) {
+                if (rank == 0) {
+                    MFU_LOG(MFU_LOG_WARN,
+                        "Stopping after batch %" PRIu64 "/%" PRIu64
+                        " due to errors to preserve checkpoint resume state",
+                        batch_id + 1, batch_count);
+                }
+                break;
+            }
             continue;
         }
 
@@ -4486,6 +4752,9 @@ int main(int argc, char** argv)
         }
         nsync_trace_local(&opts, "main-post-plan-local", planned_actions.size, (uint64_t)local_plan_error);
         nsync_batch_monitor_skew(&opts, batch_id, batch_count, "planned-actions", planned_actions.size);
+        local_batch_actions = nsync_action_counts_total_actions(&batch_action_counts);
+        local_batch_copy_files = batch_action_counts.copy;
+        local_batch_copy_bytes = nsync_action_vec_copy_bytes(&planned_actions);
 
         int global_plan_error = 0;
         MPI_Allreduce(&local_plan_error, &global_plan_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
@@ -4546,32 +4815,58 @@ int main(int argc, char** argv)
                 &deferred_dir_removes,
                 &deferred_dir_meta_updates,
                 &local_exec_errors_batch,
-                &local_meta_apply_stats);
+                &local_meta_apply_stats,
+                &local_batch_exec_actions,
+                &local_batch_exec_copy_files,
+                &local_batch_exec_copy_bytes);
             nsync_trace_local(&opts, "main-post-phase4-exec", (uint64_t)local_exec_errors_batch, batch_id);
 
             local_exec_errors_total += (uint64_t)local_exec_errors_batch;
         }
 
+        uint64_t local_progress_actions = local_batch_actions;
+        uint64_t local_progress_copy_files = local_batch_copy_files;
+        uint64_t local_progress_copy_bytes = local_batch_copy_bytes;
+        if (!opts.dryrun) {
+            local_progress_actions = local_batch_exec_actions;
+            local_progress_copy_files = local_batch_exec_copy_files;
+            local_progress_copy_bytes = local_batch_exec_copy_bytes;
+        }
+
         uint64_t local_batch_errors = (uint64_t)batch_scan_errors + (uint64_t)local_exec_errors_batch;
-        uint64_t global_batch_errors = 0;
-        MPI_Allreduce(&local_batch_errors, &global_batch_errors, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+        uint64_t local_batch_summary[4] = {
+            local_batch_errors, local_progress_actions, local_progress_copy_files, local_progress_copy_bytes
+        };
+        uint64_t global_batch_summary[4] = {0, 0, 0, 0};
+        MPI_Allreduce(local_batch_summary, global_batch_summary, 4, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+        uint64_t global_batch_errors = global_batch_summary[0];
         if (!opts.dryrun && opts.batch_files > 0 && global_batch_errors == 0) {
             (void)nsync_checkpoint_mark_batch_complete(
                 &opts, &role_info, src_path, dst_path,
                 checkpoint_option_hash, batch_count, batch_id);
         }
-
-        if (rank == 0 && batch_count > 1 && !opts.quiet) {
-            MFU_LOG(MFU_LOG_INFO,
-                "Completed batch %" PRIu64 "/%" PRIu64 " (local-meta=%" PRIu64 " local-actions=%" PRIu64 ")",
-                batch_id + 1, batch_count, local_meta.size, planned_actions.size);
+        if (!opts.dryrun && global_batch_errors > 0) {
+            stop_after_batch_error = 1;
         }
+
+        nsync_progress_batch_update(
+            &opts, &progress_state, batch_id, batch_count,
+            global_batch_summary[1], global_batch_summary[2], global_batch_summary[3]);
 
         nsync_action_vec_free(&dst_exec_actions);
         nsync_action_vec_free(&src_exec_actions);
         nsync_action_vec_free(&planned_actions);
         nsync_meta_vec_free(&planner_meta);
         nsync_meta_vec_free(&local_meta);
+        if (stop_after_batch_error) {
+            if (rank == 0) {
+                MFU_LOG(MFU_LOG_WARN,
+                    "Stopping after batch %" PRIu64 "/%" PRIu64
+                    " due to errors to preserve checkpoint resume state",
+                    batch_id + 1, batch_count);
+            }
+            break;
+        }
     }
 
     if (use_batch_spool) {
@@ -4725,8 +5020,10 @@ int main(int argc, char** argv)
         }
 
         if (!opts.dryrun) {
-            if (global_exec_errors > 0) {
-                MFU_LOG(MFU_LOG_ERR, "Execution completed with %" PRIu64 " error(s)", global_exec_errors);
+            if (global_scan_errors > 0 || global_exec_errors > 0) {
+                MFU_LOG(MFU_LOG_ERR,
+                    "Execution completed with errors: scan=%d exec=%" PRIu64,
+                    global_scan_errors, global_exec_errors);
             } else {
                 MFU_LOG(MFU_LOG_INFO, "Execution completed successfully");
             }

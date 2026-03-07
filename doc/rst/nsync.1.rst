@@ -47,7 +47,9 @@ OPTIONS
 
 .. option:: --progress N
 
-   Print progress every N seconds.
+   Print rank 0 progress every N seconds.
+   Progress output includes recent copy throughput (volume/files).
+   A value of 0 disables progress messages.
 
 .. option:: --role-mode MODE
 
@@ -117,4 +119,3 @@ SEE ALSO
 
 The mpiFileUtils source code and all documentation may be downloaded
 from <https://github.com/hpc/mpifileutils>
-

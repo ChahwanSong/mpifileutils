@@ -32,7 +32,9 @@ Set I/O and digest buffer size in bytes.
 Set minimum work chunk size in bytes.
 .TP
 .B \-\-progress N
-Print progress every N seconds.
+Print rank 0 progress every N seconds.
+Progress output includes recent copy throughput (volume/files).
+A value of 0 disables progress messages.
 .TP
 .B \-\-role\-mode MODE
 Role assignment mode: \fBauto\fP or \fBmap\fP.
@@ -82,4 +84,3 @@ Memory-bounded sync with delete and content compare:
 .B mpirun \-np 8 nsync \-\-batch\-files 200000 \-\-delete \-\-contents /src /dst
 .SH SEE ALSO
 dsync(1), dcp(1), dwalk(1), mpifileutils(1)
-

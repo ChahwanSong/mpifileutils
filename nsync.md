@@ -140,7 +140,7 @@
 | `-c, --contents` | 파일 내용 비교 | SHA256 digest 계산/비교 |
 | `--bufsize SIZE` | I/O 버퍼 크기 | copy/digest read chunk 크기 |
 | `--chunksize SIZE` | 최소 작업 크기 | 내부 chunk 정책 기준값 |
-| `--progress N` | 진행 로그 주기(초) | mfu progress timeout |
+| `--progress N` | 진행 로그 주기(초) | rank 0에서 배치 진행률 + 최근 throughput(볼륨/파일 수) 출력, `0`이면 비활성화 |
 | `--role-mode auto|map` | 역할 결정 방식 | 자동 탐지 또는 명시 맵 |
 | `--role-map SPEC` | 역할 맵 | 예: `0-1:src,2-3:dst` |
 | `--trace` | 디버그 trace | stage별 per-rank trace 출력 |
