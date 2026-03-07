@@ -19,12 +19,15 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -59,6 +62,7 @@ typedef struct {
     int trace;
     int verbose;
     int quiet;
+    int log_rank;
 } nsync_options_t;
 
 typedef struct {
@@ -226,7 +230,7 @@ static void nsync_usage(void)
     printf("  -c, --contents             - compare file contents instead of size+mtime\n");
     printf("      --bufsize <SIZE>       - I/O buffer size in bytes (default " MFU_BUFFER_SIZE_STR ")\n");
     printf("      --chunksize <SIZE>     - minimum work size per task in bytes (default " MFU_CHUNK_SIZE_STR ")\n");
-    printf("      --progress <N>         - print rank 0 progress/throughput every N seconds (0 disables)\n");
+    printf("      --progress <N>         - print launcher-console progress/throughput every N seconds (0 disables)\n");
     printf("      --role-mode <MODE>     - role assignment mode: auto or map\n");
     printf("      --role-map <SPEC>      - explicit role map (used with --role-mode map)\n");
     printf("      --trace                - print detailed per-rank stage traces (debug)\n");
@@ -291,6 +295,190 @@ static const char* nsync_role_to_string(nsync_role_t role)
     default:
         return "unset";
     }
+}
+
+static int nsync_sockaddr_equal(const struct sockaddr* a, const struct sockaddr* b)
+{
+    if (a == NULL || b == NULL || a->sa_family != b->sa_family) {
+        return 0;
+    }
+
+    if (a->sa_family == AF_INET) {
+        const struct sockaddr_in* ia = (const struct sockaddr_in*)a;
+        const struct sockaddr_in* ib = (const struct sockaddr_in*)b;
+        return memcmp(&ia->sin_addr, &ib->sin_addr, sizeof(struct in_addr)) == 0;
+    }
+
+    if (a->sa_family == AF_INET6) {
+        const struct sockaddr_in6* ia = (const struct sockaddr_in6*)a;
+        const struct sockaddr_in6* ib = (const struct sockaddr_in6*)b;
+        return memcmp(&ia->sin6_addr, &ib->sin6_addr, sizeof(struct in6_addr)) == 0;
+    }
+
+    return 0;
+}
+
+static int nsync_hosts_resolve_match(const char* host_a, const char* host_b)
+{
+    if (host_a == NULL || host_b == NULL || host_a[0] == '\0' || host_b[0] == '\0') {
+        return 0;
+    }
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_ADDRCONFIG;
+
+    struct addrinfo* list_a = NULL;
+    struct addrinfo* list_b = NULL;
+    int rc_a = getaddrinfo(host_a, NULL, &hints, &list_a);
+    if (rc_a != 0) {
+        hints.ai_flags = 0;
+        rc_a = getaddrinfo(host_a, NULL, &hints, &list_a);
+    }
+    if (rc_a != 0 || list_a == NULL) {
+        return 0;
+    }
+
+    int rc_b = getaddrinfo(host_b, NULL, &hints, &list_b);
+    if (rc_b != 0) {
+        hints.ai_flags = 0;
+        rc_b = getaddrinfo(host_b, NULL, &hints, &list_b);
+    }
+    if (rc_b != 0 || list_b == NULL) {
+        freeaddrinfo(list_a);
+        return 0;
+    }
+
+    int matched = 0;
+    for (const struct addrinfo* a = list_a; a != NULL && !matched; a = a->ai_next) {
+        for (const struct addrinfo* b = list_b; b != NULL; b = b->ai_next) {
+            if (nsync_sockaddr_equal(a->ai_addr, b->ai_addr)) {
+                matched = 1;
+                break;
+            }
+        }
+    }
+
+    freeaddrinfo(list_a);
+    freeaddrinfo(list_b);
+    return matched;
+}
+
+static int nsync_extract_uri_host(const char* uri, char* host_out, size_t host_len)
+{
+    if (uri == NULL || host_out == NULL || host_len == 0) {
+        return -1;
+    }
+    host_out[0] = '\0';
+
+    const char* start = strstr(uri, "://");
+    if (start != NULL) {
+        start += 3;
+    } else {
+        start = strchr(uri, ';');
+        if (start != NULL) {
+            start++;
+        } else {
+            start = uri;
+        }
+    }
+
+    while (*start == ' ') {
+        start++;
+    }
+
+    const char* end = start;
+    if (*start == '[') {
+        start++;
+        end = strchr(start, ']');
+        if (end == NULL) {
+            return -1;
+        }
+    } else {
+        while (*end != '\0' && *end != ':' && *end != ',' && *end != ';' && *end != '/') {
+            end++;
+        }
+    }
+
+    size_t len = (size_t)(end - start);
+    if (len == 0 || len >= host_len) {
+        return -1;
+    }
+
+    memcpy(host_out, start, len);
+    host_out[len] = '\0';
+    return 0;
+}
+
+static int nsync_host_matches_local(const char* launcher_host)
+{
+    if (launcher_host == NULL || launcher_host[0] == '\0') {
+        return 0;
+    }
+
+    const char* local_uri = getenv("OMPI_MCA_orte_local_daemon_uri");
+    if (local_uri != NULL && local_uri[0] != '\0') {
+        char local_uri_host[NI_MAXHOST];
+        if (nsync_extract_uri_host(local_uri, local_uri_host, sizeof(local_uri_host)) == 0) {
+            if (strcasecmp(launcher_host, local_uri_host) == 0) {
+                return 1;
+            }
+            if (nsync_hosts_resolve_match(launcher_host, local_uri_host)) {
+                return 1;
+            }
+        }
+    }
+
+    char local_hostname[HOST_NAME_MAX + 1];
+    if (gethostname(local_hostname, sizeof(local_hostname)) == 0) {
+        local_hostname[HOST_NAME_MAX] = '\0';
+        if (strcasecmp(launcher_host, local_hostname) == 0) {
+            return 1;
+        }
+        if (nsync_hosts_resolve_match(launcher_host, local_hostname)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int nsync_select_log_rank(void)
+{
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    MPI_Comm shared_comm = MPI_COMM_NULL;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &shared_comm);
+    int local_rank = -1;
+    if (shared_comm != MPI_COMM_NULL) {
+        MPI_Comm_rank(shared_comm, &local_rank);
+    }
+
+    int candidate = INT_MAX;
+    char launcher_host[NI_MAXHOST];
+    const char* hnp_uri = getenv("OMPI_MCA_orte_hnp_uri");
+    if (nsync_extract_uri_host(hnp_uri, launcher_host, sizeof(launcher_host)) == 0 &&
+        nsync_host_matches_local(launcher_host))
+    {
+        if (local_rank == 0) {
+            candidate = rank;
+        }
+    }
+
+    if (shared_comm != MPI_COMM_NULL) {
+        MPI_Comm_free(&shared_comm);
+    }
+
+    int log_rank = INT_MAX;
+    MPI_Allreduce(&candidate, &log_rank, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (log_rank == INT_MAX) {
+        log_rank = 0;
+    }
+
+    return log_rank;
 }
 
 static void nsync_trace_local(
@@ -360,7 +548,7 @@ static void nsync_batch_monitor_skew(
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
 
-    if (rank != 0 || ranks <= 0 || global_sum == 0) {
+    if (rank != opts->log_rank || ranks <= 0 || global_sum == 0) {
         return;
     }
 
@@ -993,10 +1181,11 @@ static int nsync_assign_roles(
     nsync_role_t* all_roles = (nsync_role_t*)MFU_MALLOC((size_t)ranks * sizeof(nsync_role_t));
     int* auto_caps = NULL;
     int status = 0;
+    int validator_rank = opts->log_rank;
     nsync_trace_local(opts, "assign-start", (uint64_t)opts->role_mode, (uint64_t)ranks);
 
     if (opts->role_mode == NSYNC_ROLE_MODE_MAP) {
-        if (rank == 0) {
+        if (rank == validator_rank) {
             if (nsync_parse_role_map(opts->role_map, ranks, all_roles) != 0) {
                 MFU_LOG(MFU_LOG_ERR, "Failed to parse --role-map: %s", opts->role_map);
                 status = -1;
@@ -1004,9 +1193,9 @@ static int nsync_assign_roles(
         }
 
         nsync_trace_local(opts, "assign-pre-map-bcast-status", (uint64_t)status, 0);
-        MPI_Bcast(&status, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&status, 1, MPI_INT, validator_rank, MPI_COMM_WORLD);
         nsync_trace_local(opts, "assign-post-map-bcast-status", (uint64_t)status, 0);
-        MPI_Bcast(all_roles, ranks, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(all_roles, ranks, MPI_INT, validator_rank, MPI_COMM_WORLD);
         nsync_trace_local(opts, "assign-post-map-bcast-roles", (uint64_t)all_roles[rank], 0);
     } else {
         int can_src = nsync_can_read_source(src_path);
@@ -1032,12 +1221,12 @@ static int nsync_assign_roles(
 
     int src_count = 0;
     int dst_count = 0;
-    if (rank == 0 && status == 0) {
+    if (rank == validator_rank && status == 0) {
         status = nsync_validate_and_count_roles(opts, all_roles, auto_caps, ranks, &src_count, &dst_count);
     }
 
     nsync_trace_local(opts, "assign-pre-status-bcast", (uint64_t)status, 0);
-    MPI_Bcast(&status, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&status, 1, MPI_INT, validator_rank, MPI_COMM_WORLD);
     nsync_trace_local(opts, "assign-post-status-bcast", (uint64_t)status, 0);
     if (status != 0) {
         mfu_free(&all_roles);
@@ -1045,7 +1234,7 @@ static int nsync_assign_roles(
         return -1;
     }
 
-    if (rank == 0) {
+    if (rank == opts->log_rank) {
         const char* mode = (opts->role_mode == NSYNC_ROLE_MODE_AUTO) ? "auto" : "map";
         MFU_LOG(MFU_LOG_INFO, "Role assignment mode=%s src_ranks=%d dst_ranks=%d", mode, src_count, dst_count);
         if (opts->verbose) {
@@ -1251,7 +1440,7 @@ static int nsync_checkpoint_prepare_resume(
     int global_error = 0;
     MPI_Allreduce(&local_error, &global_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     if (global_error != 0) {
-        if (rank == 0) {
+        if (rank == opts->log_rank) {
             MFU_LOG(MFU_LOG_ERR, "Failed to read batch checkpoint state");
         }
         return -1;
@@ -1266,7 +1455,7 @@ static int nsync_checkpoint_prepare_resume(
     *start_batch = local_start;
     *resumed = local_resumed;
 
-    if (rank == 0) {
+    if (rank == opts->log_rank) {
         if (local_found && local_mismatch) {
             MFU_LOG(MFU_LOG_WARN,
                 "Ignoring %s (%s)",
@@ -1325,7 +1514,7 @@ static int nsync_checkpoint_mark_batch_complete(
 
     int global_error = 0;
     MPI_Allreduce(&local_error, &global_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    if (global_error != 0 && rank == 0 && !opts->quiet) {
+    if (global_error != 0 && rank == opts->log_rank && !opts->quiet) {
         MFU_LOG(MFU_LOG_WARN, "Failed to update %s; continuing without checkpoint update", NSYNC_BATCH_STATE_FILE);
     }
     return global_error == 0 ? 0 : -1;
@@ -1369,7 +1558,7 @@ static int nsync_checkpoint_mark_finalized(
 
     int global_error = 0;
     MPI_Allreduce(&local_error, &global_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    if (global_error != 0 && rank == 0 && !opts->quiet) {
+    if (global_error != 0 && rank == opts->log_rank && !opts->quiet) {
         MFU_LOG(MFU_LOG_WARN, "Failed to finalize %s state record", NSYNC_BATCH_STATE_FILE);
     }
     return global_error == 0 ? 0 : -1;
@@ -1427,7 +1616,7 @@ static void nsync_checkpoint_clear(
 
     int global_error = 0;
     MPI_Allreduce(&local_error, &global_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    if (global_error != 0 && rank == 0 && !opts->quiet) {
+    if (global_error != 0 && rank == opts->log_rank && !opts->quiet) {
         MFU_LOG(MFU_LOG_WARN, "Failed to clear %s after successful run", NSYNC_BATCH_STATE_FILE);
     }
 }
@@ -3566,7 +3755,7 @@ static int nsync_reconcile_directory_metadata_after_resume(
     }
 
     if (nsync_metadata_redistribute(&local_meta, &planner_meta, opts) != 0) {
-        if (rank == 0) {
+        if (rank == opts->log_rank) {
             MFU_LOG(MFU_LOG_ERR, "Failed to redistribute directory metadata during resume reconciliation");
         }
         nsync_action_vec_free(&dst_exec_actions);
@@ -3584,7 +3773,7 @@ static int nsync_reconcile_directory_metadata_after_resume(
     int global_plan_error = 0;
     MPI_Allreduce(&local_plan_error, &global_plan_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     if (global_plan_error != 0) {
-        if (rank == 0) {
+        if (rank == opts->log_rank) {
             MFU_LOG(MFU_LOG_ERR, "Failed to plan directory metadata reconciliation actions");
         }
         nsync_action_vec_free(&dst_exec_actions);
@@ -3607,7 +3796,7 @@ static int nsync_reconcile_directory_metadata_after_resume(
         }
 
         if (nsync_sync_error_point(opts, "resume-dir-meta-post-action-redistribute", local_exec_error) != 0) {
-            if (rank == 0) {
+            if (rank == opts->log_rank) {
                 MFU_LOG(MFU_LOG_ERR, "Failed to redistribute directory metadata reconciliation actions");
             }
             nsync_action_vec_free(&dst_exec_actions);
@@ -3636,7 +3825,7 @@ static int nsync_reconcile_directory_metadata_after_resume(
         *local_exec_errors_total += (uint64_t)local_exec_errors;
     }
 
-    if (rank == 0 && !opts->quiet) {
+    if (rank == opts->log_rank && !opts->quiet) {
         MFU_LOG(MFU_LOG_INFO, "Reconciled directory metadata after checkpoint resume");
     }
 
@@ -3683,7 +3872,7 @@ static int nsync_restore_destination_root_metadata(
 
     MPI_Bcast(&have_root_meta, 1, MPI_INT, src_owner, MPI_COMM_WORLD);
     if (!have_root_meta) {
-        if (rank == 0 && !opts->quiet) {
+        if (rank == opts->log_rank && !opts->quiet) {
             MFU_LOG(MFU_LOG_WARN, "Failed to collect source root metadata for post-checkpoint reconcile");
         }
         if (rank == dst_owner) {
@@ -3820,7 +4009,7 @@ static void nsync_progress_state_init(nsync_progress_state_t* state)
     state->last_print_time = now;
 }
 
-static void nsync_progress_log_rank0(
+static void nsync_progress_log_console(
     const nsync_options_t* opts,
     uint64_t batch_id,
     uint64_t batch_count,
@@ -3907,7 +4096,7 @@ static void nsync_progress_batch_update(
 
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    if (rank != 0) {
+    if (rank != opts->log_rank) {
         return;
     }
 
@@ -3927,7 +4116,7 @@ static void nsync_progress_batch_update(
         recent_secs = 0.0;
     }
 
-    nsync_progress_log_rank0(
+    nsync_progress_log_console(
         opts, batch_id, batch_count,
         progress_state->total_actions,
         progress_state->total_copy_files,
@@ -4361,7 +4550,10 @@ int main(int argc, char** argv)
         .trace = 0,
         .verbose = 0,
         .quiet = 0,
+        .log_rank = 0,
     };
+
+    opts.log_rank = nsync_select_log_rank();
 
     nsync_batch_spool_t batch_spool;
     nsync_batch_spool_init(&batch_spool);
@@ -4406,7 +4598,7 @@ int main(int argc, char** argv)
             break;
         case 'b':
             if (mfu_abtoull(optarg, &bytes) != MFU_SUCCESS || bytes == 0) {
-                if (rank == 0) {
+                if (rank == opts.log_rank) {
                     MFU_LOG(MFU_LOG_ERR, "Failed to parse --batch-files: %s", optarg);
                 }
                 usage = 1;
@@ -4416,7 +4608,7 @@ int main(int argc, char** argv)
             break;
         case 'B':
             if (mfu_abtoull(optarg, &bytes) != MFU_SUCCESS || bytes == 0) {
-                if (rank == 0) {
+                if (rank == opts.log_rank) {
                     MFU_LOG(MFU_LOG_ERR, "Failed to parse --bufsize: %s", optarg);
                 }
                 usage = 1;
@@ -4426,7 +4618,7 @@ int main(int argc, char** argv)
             break;
         case 'k':
             if (mfu_abtoull(optarg, &bytes) != MFU_SUCCESS || bytes == 0) {
-                if (rank == 0) {
+                if (rank == opts.log_rank) {
                     MFU_LOG(MFU_LOG_ERR, "Failed to parse --chunksize: %s", optarg);
                 }
                 usage = 1;
@@ -4437,7 +4629,7 @@ int main(int argc, char** argv)
         case 'R':
             opts.progress_secs = atoi(optarg);
             if (opts.progress_secs < 0) {
-                if (rank == 0) {
+                if (rank == opts.log_rank) {
                     MFU_LOG(MFU_LOG_ERR, "Seconds in --progress must be non-negative: %d invalid", opts.progress_secs);
                 }
                 usage = 1;
@@ -4445,7 +4637,7 @@ int main(int argc, char** argv)
             break;
         case 1000:
             if (nsync_parse_role_mode(optarg, &opts.role_mode) != 0) {
-                if (rank == 0) {
+                if (rank == opts.log_rank) {
                     MFU_LOG(MFU_LOG_ERR, "Invalid value for --role-mode: %s (expected auto or map)", optarg);
                 }
                 usage = 1;
@@ -4477,7 +4669,7 @@ int main(int argc, char** argv)
     }
 
     if (opts.role_mode == NSYNC_ROLE_MODE_MAP && opts.role_map == NULL) {
-        if (rank == 0) {
+        if (rank == opts.log_rank) {
             MFU_LOG(MFU_LOG_ERR, "--role-map is required when --role-mode map is selected");
         }
         usage = 1;
@@ -4485,14 +4677,14 @@ int main(int argc, char** argv)
 
     int numargs = argc - optind;
     if (!help && numargs != 2) {
-        if (rank == 0) {
+        if (rank == opts.log_rank) {
             MFU_LOG(MFU_LOG_ERR, "You must specify a source and destination path.");
         }
         usage = 1;
     }
 
     if (usage) {
-        if (rank == 0) {
+        if (rank == opts.log_rank) {
             nsync_usage();
         }
         rc = help ? 0 : 1;
@@ -4529,7 +4721,7 @@ int main(int argc, char** argv)
                 &opts, &role_info, src_path, dst_path,
                 &batch_count, &global_src_items, &global_dst_items, &count_scan_errors) != 0)
         {
-            if (rank == 0) {
+            if (rank == opts.log_rank) {
                 MFU_LOG(MFU_LOG_ERR, "Failed to compute batching parameters");
             }
             nsync_role_info_free(&role_info);
@@ -4549,7 +4741,7 @@ int main(int argc, char** argv)
             goto cleanup;
         }
 
-        if (rank == 0) {
+        if (rank == opts.log_rank) {
             MFU_LOG(MFU_LOG_INFO,
                 "Batch mode enabled: batch-files=%" PRIu64
                 " batch-count=%" PRIu64
@@ -4566,7 +4758,7 @@ int main(int argc, char** argv)
 
         if (batch_count > 1 && start_batch < batch_count) {
             if (nsync_batch_spool_prepare(&batch_spool, batch_count, start_batch, opts.contents ? 1 : 0) != 0) {
-                if (rank == 0) {
+                if (rank == opts.log_rank) {
                     MFU_LOG(MFU_LOG_ERR, "Failed to initialize batch spool state");
                 }
                 nsync_role_info_free(&role_info);
@@ -4578,7 +4770,7 @@ int main(int argc, char** argv)
             if (nsync_batch_spool_build(
                     &opts, &role_info, src_path, dst_path, &batch_spool, &spool_scan_errors) != 0)
             {
-                if (rank == 0) {
+                if (rank == opts.log_rank) {
                     MFU_LOG(MFU_LOG_ERR, "Failed to build metadata spool");
                 }
                 nsync_role_info_free(&role_info);
@@ -4591,7 +4783,7 @@ int main(int argc, char** argv)
             uint64_t global_spool_arr[2] = {0, 0};
             MPI_Allreduce(local_spool_arr, global_spool_arr, 2, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
 
-            if (rank == 0 && !opts.quiet) {
+            if (rank == opts.log_rank && !opts.quiet) {
                 MFU_LOG(MFU_LOG_INFO,
                     "Batch spool prepared: records=%" PRIu64 " bytes=%" PRIu64 " start-batch=%" PRIu64,
                     global_spool_arr[0], global_spool_arr[1], start_batch);
@@ -4619,8 +4811,12 @@ int main(int argc, char** argv)
     uint64_t local_exec_errors_total = 0;
     nsync_progress_state_t progress_state;
     nsync_progress_state_init(&progress_state);
-    if (rank == 0 && !opts.quiet && opts.progress_secs > 0) {
-        MFU_LOG(MFU_LOG_INFO, "Progress logging enabled on rank 0 every %d second(s)", opts.progress_secs);
+    if (rank == opts.log_rank && !opts.quiet && opts.progress_secs > 0) {
+        MFU_LOG(
+            MFU_LOG_INFO,
+            "Progress logging enabled on console log rank %d every %d second(s)",
+            opts.log_rank,
+            opts.progress_secs);
     }
 
     for (uint64_t batch_id = start_batch; batch_id < batch_count; batch_id++) {
@@ -4656,7 +4852,7 @@ int main(int argc, char** argv)
             }
 
             if (nsync_sync_error_point(&opts, "main-post-spool-load", batch_scan_errors) != 0) {
-                if (rank == 0) {
+                if (rank == opts.log_rank) {
                     MFU_LOG(MFU_LOG_ERR, "Failed to load metadata spool for batch %" PRIu64, batch_id);
                 }
                 nsync_action_vec_free(&dst_exec_actions);
@@ -4712,7 +4908,7 @@ int main(int argc, char** argv)
             nsync_meta_vec_free(&planner_meta);
             nsync_meta_vec_free(&local_meta);
             if (stop_after_batch_error) {
-                if (rank == 0) {
+                if (rank == opts.log_rank) {
                     MFU_LOG(MFU_LOG_WARN,
                         "Stopping after batch %" PRIu64 "/%" PRIu64
                         " due to errors to preserve checkpoint resume state",
@@ -4724,7 +4920,7 @@ int main(int argc, char** argv)
         }
 
         if (nsync_metadata_redistribute(&local_meta, &planner_meta, &opts) != 0) {
-            if (rank == 0) {
+            if (rank == opts.log_rank) {
                 MFU_LOG(MFU_LOG_ERR, "Failed to redistribute metadata records in batch %" PRIu64, batch_id);
             }
             nsync_action_vec_free(&dst_exec_actions);
@@ -4759,7 +4955,7 @@ int main(int argc, char** argv)
         int global_plan_error = 0;
         MPI_Allreduce(&local_plan_error, &global_plan_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
         if (global_plan_error != 0) {
-            if (rank == 0) {
+            if (rank == opts.log_rank) {
                 MFU_LOG(MFU_LOG_ERR, "Failed to generate planner actions in batch %" PRIu64, batch_id);
             }
             nsync_action_vec_free(&dst_exec_actions);
@@ -4790,7 +4986,7 @@ int main(int argc, char** argv)
             }
 
             if (nsync_sync_error_point(&opts, "main-post-action-redistribute", local_exec_error) != 0) {
-                if (rank == 0) {
+                if (rank == opts.log_rank) {
                     MFU_LOG(MFU_LOG_ERR, "Failed to redistribute execution actions in batch %" PRIu64, batch_id);
                 }
                 nsync_action_vec_free(&dst_exec_actions);
@@ -4859,7 +5055,7 @@ int main(int argc, char** argv)
         nsync_meta_vec_free(&planner_meta);
         nsync_meta_vec_free(&local_meta);
         if (stop_after_batch_error) {
-            if (rank == 0) {
+            if (rank == opts.log_rank) {
                 MFU_LOG(MFU_LOG_WARN,
                     "Stopping after batch %" PRIu64 "/%" PRIu64
                     " due to errors to preserve checkpoint resume state",
@@ -4950,7 +5146,7 @@ int main(int argc, char** argv)
     MPI_Allreduce(local_meta_apply_arr, global_meta_apply_arr, 6, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
     nsync_meta_apply_stats_from_array(global_meta_apply_arr, &global_meta_apply_stats);
 
-    if (rank == 0) {
+    if (rank == opts.log_rank) {
         const char* role_mode = opts.role_mode == NSYNC_ROLE_MODE_AUTO ? "auto" : "map";
         MFU_LOG(MFU_LOG_INFO, "nsync Phase 5 planner%s complete", opts.dryrun ? " dryrun" : "+execute");
         MFU_LOG(MFU_LOG_INFO, "Requested source: %s", src_path);

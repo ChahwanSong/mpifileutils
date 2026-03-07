@@ -47,7 +47,7 @@ OPTIONS
 
 .. option:: --progress N
 
-   Print rank 0 progress every N seconds.
+   Print progress every N seconds from the launcher-console log rank.
    Progress output includes recent copy throughput (volume/files).
    A value of 0 disables progress messages.
 
