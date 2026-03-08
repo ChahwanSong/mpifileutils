@@ -132,7 +132,7 @@ ln -sfn "wrong_target" "${DST_ROOT}/case1/link_to_file"
 chmod 0600 "${DST_ROOT}/case1/meta.txt" 2>/dev/null || true
 touch -d "2022-01-01 00:00:00" "${DST_ROOT}/case1/meta.txt" 2>/dev/null || true
 
-run_nsync -v "${SRC_ROOT}/case1" "${DST_ROOT}/case1"
+run_nsync "${SRC_ROOT}/case1" "${DST_ROOT}/case1"
 
 assert_file_equals "${SRC_ROOT}/case1/file.txt" "${DST_ROOT}/case1/file.txt"
 assert_file_equals "${SRC_ROOT}/case1/dirA/sub/nested.txt" "${DST_ROOT}/case1/dirA/sub/nested.txt"
@@ -140,10 +140,10 @@ assert_exists "${DST_ROOT}/case1/extra.txt"
 assert_eq "file.txt" "$(readlink "${DST_ROOT}/case1/link_to_file")" "symlink target should match source"
 assert_eq "$(stat -c "%a" "${SRC_ROOT}/case1/meta.txt")" "$(stat -c "%a" "${DST_ROOT}/case1/meta.txt")" "metadata mode should match"
 
-run_nsync -v --delete "${SRC_ROOT}/case1" "${DST_ROOT}/case1"
+run_nsync --delete "${SRC_ROOT}/case1" "${DST_ROOT}/case1"
 assert_not_exists "${DST_ROOT}/case1/extra.txt"
 
-dryrun_out=$(run_nsync -v --dryrun --delete "${SRC_ROOT}/case1" "${DST_ROOT}/case1" 2>&1)
+dryrun_out=$(run_nsync --dryrun --delete "${SRC_ROOT}/case1" "${DST_ROOT}/case1" 2>&1)
 echo "${dryrun_out}" | grep -q "changed=0"
 
 ##############################################################################
@@ -154,13 +154,13 @@ printf "AAAA" > "${SRC_ROOT}/case2/same_size.txt"
 printf "BBBB" > "${DST_ROOT}/case2/same_size.txt"
 touch -d "2024-12-12 12:12:12" "${SRC_ROOT}/case2/same_size.txt" "${DST_ROOT}/case2/same_size.txt"
 
-run_nsync -v "${SRC_ROOT}/case2" "${DST_ROOT}/case2"
+run_nsync "${SRC_ROOT}/case2" "${DST_ROOT}/case2"
 assert_eq "BBBB" "$(cat "${DST_ROOT}/case2/same_size.txt")" "without --contents destination data should remain"
 
-run_nsync -v --contents "${SRC_ROOT}/case2" "${DST_ROOT}/case2"
+run_nsync --contents "${SRC_ROOT}/case2" "${DST_ROOT}/case2"
 assert_eq "AAAA" "$(cat "${DST_ROOT}/case2/same_size.txt")" "with --contents destination data should match source"
 
-dryrun_out=$(run_nsync -v --dryrun --contents "${SRC_ROOT}/case2" "${DST_ROOT}/case2" 2>&1)
+dryrun_out=$(run_nsync --dryrun --contents "${SRC_ROOT}/case2" "${DST_ROOT}/case2" 2>&1)
 echo "${dryrun_out}" | grep -q "changed=0"
 
 ##############################################################################
@@ -176,7 +176,7 @@ done
 printf "big\n" > "${SRC_ROOT}/case3/bigfile.txt"
 ln -sfn "d0/f0.txt" "${SRC_ROOT}/case3/symlink_ref"
 
-run_nsync -v --batch-files 200 "${SRC_ROOT}/case3" "${DST_ROOT}/case3"
+run_nsync --batch-files 200 "${SRC_ROOT}/case3" "${DST_ROOT}/case3"
 
 src_file_count=$(find "${SRC_ROOT}/case3" -type f | wc -l)
 dst_file_count=$(find "${DST_ROOT}/case3" -type f | wc -l)
@@ -195,7 +195,7 @@ fi
 rm -f "${src_hashes}" "${dst_hashes}"
 
 assert_not_exists "${DST_ROOT}/case3/.nsync.batch.state"
-dryrun_out=$(run_nsync -v --dryrun --batch-files 200 "${SRC_ROOT}/case3" "${DST_ROOT}/case3" 2>&1)
+dryrun_out=$(run_nsync --dryrun --batch-files 200 "${SRC_ROOT}/case3" "${DST_ROOT}/case3" 2>&1)
 echo "${dryrun_out}" | grep -q "changed=0"
 
 echo "PASS: nsync matrix tests completed"

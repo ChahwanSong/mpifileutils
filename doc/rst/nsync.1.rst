@@ -25,8 +25,7 @@ OPTIONS
 .. option:: -b, --batch-files N
 
    Process entries in deterministic batches of approximately N items to bound
-   planner memory usage. Enables checkpoint/resume using
-   ``.nsync.batch.state`` on destination.
+   planner memory usage.
 
 .. option:: -D, --delete
 
@@ -45,11 +44,10 @@ OPTIONS
 
    Set minimum work chunk size in bytes.
 
-.. option:: --progress N
+.. option:: --imbalance-threshold R
 
-   Print progress every N seconds from the launcher-console log rank.
-   Progress output includes recent copy throughput (volume/files).
-   A value of 0 disables progress messages.
+   Batch imbalance ratio threshold for diagnostic warnings.
+   Defaults to ``3.0``.
 
 .. option:: --role-mode MODE
 
@@ -64,13 +62,11 @@ OPTIONS
 
    Enable detailed per-rank stage tracing for debugging.
 
-.. option:: -v, --verbose
-
-   Verbose output.
-
 .. option:: -q, --quiet
 
    Quiet output.
+   Progress messages are otherwise printed on the launcher-console log rank
+   after each batch completes.
 
 .. option:: -h, --help
 

@@ -72,7 +72,7 @@ for d in $(seq 0 29); do
 done
 
 (
-    run_nsync -v --batch-files 120 "${SRC_ROOT}/case_resume" "${DST_ROOT}/case_resume"
+    run_nsync --batch-files 120 "${SRC_ROOT}/case_resume" "${DST_ROOT}/case_resume"
 ) >"${LOG_FILE}" 2>&1 &
 sync_pid=$!
 
@@ -88,7 +88,7 @@ else
     echo "Checkpoint not found after interruption (run may have completed too quickly)."
 fi
 
-run_nsync -v --batch-files 120 "${SRC_ROOT}/case_resume" "${DST_ROOT}/case_resume"
+run_nsync --batch-files 120 "${SRC_ROOT}/case_resume" "${DST_ROOT}/case_resume"
 
 src_count=$(find "${SRC_ROOT}/case_resume" -type f | wc -l)
 dst_count=$(find "${DST_ROOT}/case_resume" -type f | wc -l)
@@ -109,7 +109,7 @@ if [[ -f "${DST_ROOT}/case_resume/.nsync.batch.state" ]]; then
     exit 1
 fi
 
-dryrun_out=$(run_nsync -v --dryrun --batch-files 120 "${SRC_ROOT}/case_resume" "${DST_ROOT}/case_resume" 2>&1)
+dryrun_out=$(run_nsync --dryrun --batch-files 120 "${SRC_ROOT}/case_resume" "${DST_ROOT}/case_resume" 2>&1)
 echo "${dryrun_out}" | grep -q "changed=0"
 
 echo "PASS: nsync resume test completed"

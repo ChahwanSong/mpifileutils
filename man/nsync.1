@@ -17,7 +17,6 @@ Show planned differences and actions without modifying destination.
 .TP
 .B \-b, \-\-batch\-files N
 Process approximately N entries per batch to bound planner memory.
-Enables batch checkpoint/resume using \fB.nsync.batch.state\fP.
 .TP
 .B \-D, \-\-delete
 Delete extraneous files from destination.
@@ -31,10 +30,9 @@ Set I/O and digest buffer size in bytes.
 .B \-\-chunksize SIZE
 Set minimum work chunk size in bytes.
 .TP
-.B \-\-progress N
-Print progress every N seconds from the launcher-console log rank.
-Progress output includes recent copy throughput (volume/files).
-A value of 0 disables progress messages.
+.B \-\-imbalance\-threshold R
+Batch imbalance ratio threshold for diagnostic warnings.
+Defaults to \fB3.0\fP.
 .TP
 .B \-\-role\-mode MODE
 Role assignment mode: \fBauto\fP or \fBmap\fP.
@@ -46,11 +44,10 @@ Example: \fB0\-1:src,2\-3:dst\fP.
 .B \-\-trace
 Print per-rank stage traces for debugging collectives and pipeline stages.
 .TP
-.B \-v, \-\-verbose
-Verbose output.
-.TP
 .B \-q, \-\-quiet
 Quiet output.
+Otherwise, progress is printed on the launcher-console log rank
+after each batch completes.
 .TP
 .B \-h, \-\-help
 Print help.
@@ -63,13 +60,6 @@ Each rank is assigned one of:
 
 In \fBauto\fP mode, nsync probes source readability and destination writability.
 In \fBmap\fP mode, roles are assigned directly by world rank.
-.SH BATCH CHECKPOINT
-When \fB\-\-batch\-files\fP is enabled, nsync writes progress to:
-
-\fBDEST/.nsync.batch.state\fP
-
-On restart with matching source/destination/options, nsync resumes from the
-last completed batch. Mismatched checkpoint state is ignored safely.
 .SH EXAMPLES
 .TP
 Synchronize split mounts with automatic role detection:

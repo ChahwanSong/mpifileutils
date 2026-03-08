@@ -25,7 +25,6 @@
 - 메타데이터 분산 비교 + 실행 계획 생성
 - 실제 파일 데이터는 `src -> dst`로 MPI 스트리밍 복사
 - 대규모 트리에서 메모리 상한을 두는 배치 모드(`--batch-files`)
-- 중단 후 재시작 가능한 체크포인트(`.nsync.batch.state`)
 
 ## 3) 아키텍처
 
@@ -55,11 +54,10 @@
   - destination 측: 실제 적용 액션
 - copy는 destination이 요청하는 pull 기반 프로토콜
 
-### 3.5 Batch/Checkpoint Plane
+### 3.5 Batch/Spool Plane
 
 - `--batch-files` 모드에서 해시 배치 단위로 순차 처리
-- destination에 `.nsync.batch.state` 기록
-- 옵션/경로/hash가 일치하면 resume, 불일치 시 안전하게 무시
+- spool 기반 1회 스캔 후 batch load 처리로 메모리 피크를 낮춤
 
 ## 4) nsync.c 구현 흐름 (상세 워크플로우)
 
@@ -75,6 +73,7 @@
 2. `auto`면 접근성 검사 결과를 `MPI_Allgather`
 3. `map`이면 launcher-console 로그 rank에서 파싱 후 `MPI_Bcast`
 4. `MPI_Comm_split`으로 `src_comm`, `dst_comm` 생성
+5. 기본 로그에서 rank/role과 함께 hostname을 출력
 
 ### 4.3 스캔/재분배/플래닝
 
@@ -95,13 +94,11 @@
 4. 삭제/디렉토리/링크/메타 업데이트를 타입별 순서로 적용
 5. 배치 모드에서는 디렉토리 remove/meta를 deferred 리스트에 모아 final pass에서 정리
 
-### 4.5 배치/재시작
+### 4.5 배치 처리
 
 1. `--batch-files N`으로 batch count 계산
 2. spool 기반 1회 스캔 후 batch load 처리
-3. 배치 성공 시 checkpoint 업데이트
-4. 재시작 시 checkpoint header 검증
-5. 성공 종료 시 checkpoint finalized 후 파일 제거
+3. 배치별 planner/execute를 순차 처리
 
 ### 4.6 종료/요약
 
@@ -135,18 +132,19 @@
 | 옵션 | 설명 | 구현상 동작 |
 |---|---|---|
 | `--dryrun` | 변경 없이 계획만 출력 | planner까지 수행, execute 스킵 |
-| `-b, --batch-files N` | 배치 단위 처리 | 메모리 상한 제어 + checkpoint/resume |
+| `-b, --batch-files N` | 배치 단위 처리 | 메모리 상한 제어 + spool 기반 배치 로드 |
 | `-D, --delete` | destination 초과 파일 삭제 | `only-dst` 경로에 `REMOVE` 생성 |
 | `-c, --contents` | 파일 내용 비교 | SHA256 digest 계산/비교 |
 | `--bufsize SIZE` | I/O 버퍼 크기 | copy/digest read chunk 크기 |
 | `--chunksize SIZE` | 최소 작업 크기 | 내부 chunk 정책 기준값 |
-| `--progress N` | 진행 로그 주기(초) | launcher-console 로그 rank에서 배치 진행률 + 최근 throughput(볼륨/파일 수) 출력, `0`이면 비활성화 |
+| `--imbalance-threshold R` | batch imbalance ratio 임계값 | 진단 경고 출력 기준, 기본값 `3.0` |
 | `--role-mode auto|map` | 역할 결정 방식 | 자동 탐지 또는 명시 맵 |
 | `--role-map SPEC` | 역할 맵 | 예: `0-1:src,2-3:dst` |
 | `--trace` | 디버그 trace | stage별 per-rank trace 출력 |
-| `-v` | 상세 로그 | 경고/정보 로그 확대 |
 | `-q` | 최소 로그 | 출력 억제 |
 | `-h` | 도움말 | 사용법 출력 |
+
+진행 로그는 launcher-console 로그 rank에서 **batch 완료 시마다 항상 출력**됩니다 (`-q` 제외).
 
 ## 7) 실행 예제
 
@@ -202,7 +200,7 @@ mpirun -np 8 nsync \
 ```bash
 mpirun -np 2 nsync \
   --role-mode map --role-map 0:src,1:dst \
-  --trace -v \
+  --trace \
   /src /dst
 ```
 
@@ -224,7 +222,7 @@ mpirun -np 2 nsync \
 
 1. 요약 로그의 `Metadata diff summary`, `Planned actions`, `Execution completed` 확인
 2. `scan error`/`exec error`가 0인지 확인
-3. 배치 실행 성공 시 `.nsync.batch.state`가 제거되었는지 확인
+3. 필요 시 source/destination 샘플 파일 해시 검증
 
 ## 9) 장애 대응/트러블슈팅
 
@@ -243,10 +241,10 @@ mpirun -np 2 nsync \
 - split-mount 환경에서 source pod에 `/dst`를 만들거나 반대로 접근하면 에러 가능
 - source는 `/src`, destination은 `/dst`만 보인다는 전제를 지키고 실행
 
-### 9.4 checkpoint 불일치
+### 9.4 배치 처리 주의
 
-- 옵션/경로/hash가 다르면 checkpoint는 자동 무시됨
-- 로그에 mismatch 이유가 출력되며 0번 배치부터 재시작
+- `--batch-files` 값을 너무 작게 잡으면 batch 수가 커지고 메타 오버헤드가 증가
+- imbalance 경고가 많으면 `--batch-files`를 일방적으로 키우기보다 값을 조정해 batch-to-rank 분포를 확인하는 것이 안전
 
 ## 10) 현재 구현 범위와 한계
 
@@ -254,12 +252,11 @@ mpirun -np 2 nsync \
   - split-mount role model
   - 분산 메타 비교 + MPI copy
   - `--dryrun`, `--delete`, `--contents`
-  - `--batch-files` + checkpoint/resume
+  - `--batch-files` + metadata spool
   - deferred directory finalize
 
 - 현재 한계
   - extreme hash skew에 대한 자동 adaptive split(2차 해시 분할)은 미구현
-  - resume 테스트는 실행 시간/환경에 따라 타이밍 민감할 수 있음
 
 ---
 
