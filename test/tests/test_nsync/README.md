@@ -7,6 +7,7 @@ This directory contains shell-based functional tests for `nsync`.
 - `test_matrix.sh`
   - basic copy/delete/symlink/metadata behavior
   - `--contents` behavior for same-size/same-mtime files
+  - sparse regular file preservation
   - `--batch-files` behavior and no-op convergence
 - `test_batch_distribution.sh`
   - verifies large `--batch-files` runs stay distributed across 4 ranks without false imbalance warnings

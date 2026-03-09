@@ -40,10 +40,6 @@ OPTIONS
 
    Set I/O and digest buffer size in bytes.
 
-.. option:: --chunksize SIZE
-
-   Set minimum work chunk size in bytes.
-
 .. option:: --imbalance-threshold R
 
    Batch imbalance ratio threshold for diagnostic warnings.

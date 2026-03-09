@@ -164,29 +164,60 @@ dryrun_out=$(run_nsync --dryrun --contents "${SRC_ROOT}/case2" "${DST_ROOT}/case
 echo "${dryrun_out}" | grep -q "changed=0"
 
 ##############################################################################
-# Case 3: --batch-files convergence and no-op
+# Case 3: sparse file preservation
 ##############################################################################
 mkdir -p "${SRC_ROOT}/case3" "${DST_ROOT}/case3"
+truncate -s $((64 * 1024 * 1024)) "${SRC_ROOT}/case3/sparse.bin"
+printf "HEAD" | dd of="${SRC_ROOT}/case3/sparse.bin" bs=1 conv=notrunc status=none
+printf "MID" | dd of="${SRC_ROOT}/case3/sparse.bin" bs=1 seek=$((32 * 1024 * 1024)) conv=notrunc status=none
+printf "TAIL" | dd of="${SRC_ROOT}/case3/sparse.bin" bs=1 seek=$((64 * 1024 * 1024 - 4)) conv=notrunc status=none
+
+run_nsync "${SRC_ROOT}/case3" "${DST_ROOT}/case3"
+
+assert_file_equals "${SRC_ROOT}/case3/sparse.bin" "${DST_ROOT}/case3/sparse.bin"
+src_sparse_size=$(stat -c "%s" "${SRC_ROOT}/case3/sparse.bin")
+dst_sparse_size=$(stat -c "%s" "${DST_ROOT}/case3/sparse.bin")
+assert_eq "${src_sparse_size}" "${dst_sparse_size}" "sparse file size should match"
+
+src_sparse_blocks=$(stat -c "%b" "${SRC_ROOT}/case3/sparse.bin")
+dst_sparse_blocks=$(stat -c "%b" "${DST_ROOT}/case3/sparse.bin")
+logical_blocks=$(( (dst_sparse_size + 511) / 512 ))
+if [[ "${dst_sparse_blocks}" -ge "${logical_blocks}" ]]; then
+    echo "ASSERT FAILED: destination sparse file was materialized: blocks=${dst_sparse_blocks} logical=${logical_blocks}"
+    exit 1
+fi
+if [[ "${dst_sparse_blocks}" -gt $((src_sparse_blocks + 16)) ]]; then
+    echo "ASSERT FAILED: destination sparse file block usage regressed: src=${src_sparse_blocks} dst=${dst_sparse_blocks}"
+    exit 1
+fi
+
+dryrun_out=$(run_nsync --dryrun "${SRC_ROOT}/case3" "${DST_ROOT}/case3" 2>&1)
+echo "${dryrun_out}" | grep -q "changed=0"
+
+##############################################################################
+# Case 4: --batch-files convergence and no-op
+##############################################################################
+mkdir -p "${SRC_ROOT}/case4" "${DST_ROOT}/case4"
 for d in $(seq 0 19); do
-    mkdir -p "${SRC_ROOT}/case3/d${d}"
+    mkdir -p "${SRC_ROOT}/case4/d${d}"
     for f in $(seq 0 99); do
-        printf "d%02d-f%03d\n" "${d}" "${f}" > "${SRC_ROOT}/case3/d${d}/f${f}.txt"
+        printf "d%02d-f%03d\n" "${d}" "${f}" > "${SRC_ROOT}/case4/d${d}/f${f}.txt"
     done
 done
-printf "big\n" > "${SRC_ROOT}/case3/bigfile.txt"
-ln -sfn "d0/f0.txt" "${SRC_ROOT}/case3/symlink_ref"
+printf "big\n" > "${SRC_ROOT}/case4/bigfile.txt"
+ln -sfn "d0/f0.txt" "${SRC_ROOT}/case4/symlink_ref"
 
-run_nsync --batch-files 200 "${SRC_ROOT}/case3" "${DST_ROOT}/case3"
+run_nsync --batch-files 200 "${SRC_ROOT}/case4" "${DST_ROOT}/case4"
 
-src_file_count=$(find "${SRC_ROOT}/case3" -type f | wc -l)
-dst_file_count=$(find "${DST_ROOT}/case3" -type f | wc -l)
+src_file_count=$(find "${SRC_ROOT}/case4" -type f | wc -l)
+dst_file_count=$(find "${DST_ROOT}/case4" -type f | wc -l)
 assert_eq "${src_file_count}" "${dst_file_count}" "batch copy file count"
-assert_eq "$(readlink "${SRC_ROOT}/case3/symlink_ref")" "$(readlink "${DST_ROOT}/case3/symlink_ref")" "batch symlink target"
+assert_eq "$(readlink "${SRC_ROOT}/case4/symlink_ref")" "$(readlink "${DST_ROOT}/case4/symlink_ref")" "batch symlink target"
 
 src_hashes=$(mktemp /tmp/nsync.src.hash.XXXXXX)
 dst_hashes=$(mktemp /tmp/nsync.dst.hash.XXXXXX)
-hash_regular_files "${SRC_ROOT}/case3" | sort > "${src_hashes}"
-hash_regular_files "${DST_ROOT}/case3" | sort > "${dst_hashes}"
+hash_regular_files "${SRC_ROOT}/case4" | sort > "${src_hashes}"
+hash_regular_files "${DST_ROOT}/case4" | sort > "${dst_hashes}"
 if ! diff -u "${src_hashes}" "${dst_hashes}" >/dev/null; then
     echo "ASSERT FAILED: batch regular-file hashes differ"
     rm -f "${src_hashes}" "${dst_hashes}"
@@ -194,8 +225,8 @@ if ! diff -u "${src_hashes}" "${dst_hashes}" >/dev/null; then
 fi
 rm -f "${src_hashes}" "${dst_hashes}"
 
-assert_not_exists "${DST_ROOT}/case3/.nsync.batch.state"
-dryrun_out=$(run_nsync --dryrun --batch-files 200 "${SRC_ROOT}/case3" "${DST_ROOT}/case3" 2>&1)
+assert_not_exists "${DST_ROOT}/case4/.nsync.batch.state"
+dryrun_out=$(run_nsync --dryrun --batch-files 200 "${SRC_ROOT}/case4" "${DST_ROOT}/case4" 2>&1)
 echo "${dryrun_out}" | grep -q "changed=0"
 
 echo "PASS: nsync matrix tests completed"

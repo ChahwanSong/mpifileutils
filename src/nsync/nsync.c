@@ -64,7 +64,6 @@ typedef struct {
     int delete;
     int contents;
     uint64_t bufsize;
-    uint64_t chunksize;
     nsync_role_mode_t role_mode;
     const char* role_map;
     int trace;
@@ -142,6 +141,12 @@ typedef struct {
 } nsync_action_vec_t;
 
 typedef struct {
+    const nsync_action_record_t** records;
+    uint64_t size;
+    uint64_t capacity;
+} nsync_action_ptr_vec_t;
+
+typedef struct {
     uint64_t copy;
     uint64_t remove;
     uint64_t mkdir;
@@ -195,6 +200,81 @@ typedef struct {
     uint64_t last_copy_bytes;
 } nsync_progress_state_t;
 
+enum {
+    NSYNC_COPY_PIPELINE_DEPTH = 2,
+    NSYNC_COPY_FILE_CREDITS = 2,
+};
+
+enum {
+    NSYNC_COPY_FRAME_FLAG_END = 0x1U,
+    NSYNC_COPY_FRAME_FLAG_HOLE = 0x2U,
+    NSYNC_COPY_FRAME_FLAG_ERROR = 0x4U,
+};
+
+typedef struct {
+    uint64_t file_id;
+    uint64_t offset;
+    uint32_t data_length;
+    uint32_t logical_length;
+    uint32_t flags;
+} nsync_copy_frame_header_t;
+
+typedef struct {
+    int busy;
+    char* wire_buf;
+    size_t capacity;
+    size_t bytes;
+    MPI_Request req;
+} nsync_copy_send_slot_t;
+
+typedef struct {
+    int active;
+    uint64_t file_id;
+    int dst_rank;
+    int fd;
+    uint64_t file_size;
+    uint64_t next_offset;
+    uint64_t data_extent_end;
+    int sparse_seek_mode;
+    int zero_hole_fallback;
+    int end_sent;
+    int completed;
+    int failed;
+    nsync_copy_send_slot_t slots[NSYNC_COPY_PIPELINE_DEPTH];
+} nsync_source_transfer_t;
+
+typedef struct {
+    int active;
+    uint64_t file_id;
+    int dst_rank;
+    const nsync_action_record_t* action;
+} nsync_source_request_t;
+
+typedef struct {
+    int busy;
+    char* wire_buf;
+    size_t capacity;
+    size_t bytes;
+    int src_rank;
+    MPI_Request req;
+} nsync_copy_recv_slot_t;
+
+typedef struct {
+    int active;
+    int completed;
+    int response_received;
+    int response_error;
+    int end_received;
+    int transfer_error;
+    int open_error;
+    uint64_t file_id;
+    int src_rank;
+    int fd;
+    uint64_t copied_bytes;
+    char* dst_fullpath;
+    const nsync_action_record_t* action;
+} nsync_destination_transfer_t;
+
 static const unsigned char NSYNC_SHA256_EMPTY[SHA256_DIGEST_LENGTH] = {
     0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
     0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
@@ -216,7 +296,6 @@ static void nsync_usage(void)
     printf("  -D, --delete               - delete extraneous files from target\n");
     printf("  -c, --contents             - compare file contents instead of size+mtime\n");
     printf("      --bufsize <SIZE>       - I/O buffer size in bytes (default " MFU_BUFFER_SIZE_STR ")\n");
-    printf("      --chunksize <SIZE>     - minimum work size per task in bytes (default " MFU_CHUNK_SIZE_STR ")\n");
     printf("      --imbalance-threshold <R>\n");
     printf("                             - batch imbalance ratio threshold (default 3.0)\n");
     printf("      --role-mode <MODE>     - role assignment mode: auto or map\n");
@@ -1455,6 +1534,80 @@ static void nsync_action_vec_free(nsync_action_vec_t* vec)
     vec->records = NULL;
     vec->size = 0;
     vec->capacity = 0;
+}
+
+static void nsync_action_ptr_vec_init(nsync_action_ptr_vec_t* vec)
+{
+    vec->records = NULL;
+    vec->size = 0;
+    vec->capacity = 0;
+}
+
+static int nsync_action_ptr_vec_push(nsync_action_ptr_vec_t* vec, const nsync_action_record_t* rec)
+{
+    if (vec->size == vec->capacity) {
+        uint64_t new_capacity = (vec->capacity > 0) ? (vec->capacity * 2) : 128;
+        size_t alloc_bytes = 0;
+        if (nsync_count_to_bytes_checked(new_capacity, sizeof(*vec->records), &alloc_bytes) != 0) {
+            return -1;
+        }
+
+        const nsync_action_record_t** new_records =
+            (const nsync_action_record_t**)realloc(vec->records, alloc_bytes);
+        if (new_records == NULL) {
+            return -1;
+        }
+        vec->records = new_records;
+        vec->capacity = new_capacity;
+    }
+
+    vec->records[vec->size] = rec;
+    vec->size++;
+    return 0;
+}
+
+static void nsync_action_ptr_vec_free(nsync_action_ptr_vec_t* vec)
+{
+    free(vec->records);
+    vec->records = NULL;
+    vec->size = 0;
+    vec->capacity = 0;
+}
+
+static uint64_t nsync_min_u64(uint64_t a, uint64_t b)
+{
+    return (a < b) ? a : b;
+}
+
+static uint64_t nsync_copy_large_file_threshold(void)
+{
+    const uint64_t default_bytes = 64ULL * 1024ULL * 1024ULL;
+    uint64_t threshold = default_bytes;
+    const char* env = getenv("NSYNC_LARGE_FILE_THRESHOLD");
+    if (env != NULL && *env != '\0') {
+        errno = 0;
+        char* end = NULL;
+        unsigned long long parsed = strtoull(env, &end, 10);
+        if (errno == 0 && end != env && *end == '\0' && parsed > 0) {
+            threshold = (uint64_t)parsed;
+        }
+    }
+    return threshold;
+}
+
+static int nsync_copy_file_credit_limit(void)
+{
+    int credits = NSYNC_COPY_FILE_CREDITS;
+    const char* env = getenv("NSYNC_COPY_FILE_CREDITS");
+    if (env != NULL && *env != '\0') {
+        errno = 0;
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (errno == 0 && end != env && *end == '\0' && parsed > 0 && parsed <= INT_MAX) {
+            credits = (int)parsed;
+        }
+    }
+    return credits;
 }
 
 static char* nsync_build_full_path(const char* root, const char* relpath)
@@ -3769,11 +3922,26 @@ static void nsync_apply_metadata(
     }
 }
 
-static int nsync_write_all(int fd, const char* buf, size_t size)
+static int nsync_u64_to_offt_checked(uint64_t value, off_t* out)
+{
+    if (value > (uint64_t)LLONG_MAX) {
+        return -1;
+    }
+
+    *out = (off_t)value;
+    return 0;
+}
+
+static int nsync_pwrite_all(int fd, const char* buf, size_t size, uint64_t offset)
 {
     size_t written = 0;
     while (written < size) {
-        ssize_t nwritten = write(fd, buf + written, size - written);
+        off_t write_off = 0;
+        if (nsync_u64_to_offt_checked(offset + (uint64_t)written, &write_off) != 0) {
+            return -1;
+        }
+
+        ssize_t nwritten = pwrite(fd, buf + written, size - written, write_off);
         if (nwritten < 0) {
             if (errno == EINTR) {
                 continue;
@@ -3785,10 +3953,30 @@ static int nsync_write_all(int fd, const char* buf, size_t size)
     return 0;
 }
 
+static int nsync_is_all_null(const char* buf, size_t size)
+{
+    for (size_t i = 0; i < size; i++) {
+        if (buf[i] != '\0') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int nsync_action_relpath_sort(const void* a, const void* b)
 {
     const nsync_action_record_t* aa = (const nsync_action_record_t*)a;
     const nsync_action_record_t* bb = (const nsync_action_record_t*)b;
+    return strcmp(aa->relpath, bb->relpath);
+}
+
+static int nsync_action_ptr_copy_size_desc_sort(const void* a, const void* b)
+{
+    const nsync_action_record_t* aa = *(const nsync_action_record_t* const*)a;
+    const nsync_action_record_t* bb = *(const nsync_action_record_t* const*)b;
+    if (aa->size != bb->size) {
+        return (aa->size > bb->size) ? -1 : 1;
+    }
     return strcmp(aa->relpath, bb->relpath);
 }
 
@@ -3820,29 +4008,32 @@ static const nsync_action_record_t* nsync_find_copy_action_sorted(
     return NULL;
 }
 
-static size_t nsync_copy_req_pack_size(const char* relpath)
+static size_t nsync_copy_req_pack_size(uint64_t file_id, const char* relpath)
 {
-    return 4 + strlen(relpath);
+    (void)file_id;
+    return 8 + 4 + strlen(relpath);
 }
 
-static size_t nsync_copy_req_pack(char* buf, const char* relpath)
+static size_t nsync_copy_req_pack(char* buf, uint64_t file_id, const char* relpath)
 {
     uint32_t path_len = (uint32_t)strlen(relpath);
     char* ptr = buf;
+    mfu_pack_uint64(&ptr, file_id);
     mfu_pack_uint32(&ptr, path_len);
     memcpy(ptr, relpath, (size_t)path_len);
     ptr += path_len;
     return (size_t)(ptr - buf);
 }
 
-static int nsync_copy_req_unpack(const char* buf, size_t bytes, char** relpath)
+static int nsync_copy_req_unpack(const char* buf, size_t bytes, uint64_t* file_id, char** relpath)
 {
     const char* ptr = buf;
     const char* end = buf + bytes;
-    if ((size_t)(end - ptr) < 4) {
+    if ((size_t)(end - ptr) < 12) {
         return -1;
     }
 
+    mfu_unpack_uint64(&ptr, file_id);
     uint32_t path_len = 0;
     mfu_unpack_uint32(&ptr, &path_len);
     if ((size_t)(end - ptr) < (size_t)path_len) {
@@ -3855,63 +4046,442 @@ static int nsync_copy_req_unpack(const char* buf, size_t bytes, char** relpath)
     return 0;
 }
 
-static int nsync_source_send_copy_file(
+static size_t nsync_copy_resp_pack_size(void)
+{
+    return 8 + 4;
+}
+
+static size_t nsync_copy_resp_pack(char* buf, uint64_t file_id, int status)
+{
+    char* ptr = buf;
+    mfu_pack_uint64(&ptr, file_id);
+    mfu_pack_uint32(&ptr, (uint32_t)(int32_t)status);
+    return (size_t)(ptr - buf);
+}
+
+static int nsync_copy_resp_unpack(const char* buf, size_t bytes, uint64_t* file_id, int* status)
+{
+    const char* ptr = buf;
+    const char* end = buf + bytes;
+    if ((size_t)(end - ptr) < nsync_copy_resp_pack_size()) {
+        return -1;
+    }
+
+    uint32_t status_u32 = 0;
+    mfu_unpack_uint64(&ptr, file_id);
+    mfu_unpack_uint32(&ptr, &status_u32);
+    *status = (int)(int32_t)status_u32;
+    return 0;
+}
+
+static size_t nsync_copy_frame_header_pack_size(void)
+{
+    return 8 + 8 + 4 + 4 + 4;
+}
+
+static size_t nsync_copy_frame_pack_size(uint32_t data_len)
+{
+    return nsync_copy_frame_header_pack_size() + (size_t)data_len;
+}
+
+static size_t nsync_copy_frame_pack(
+    char* buf,
+    uint64_t file_id,
+    uint64_t offset,
+    uint32_t flags,
+    uint32_t logical_len,
+    const char* data,
+    uint32_t data_len)
+{
+    char* ptr = buf;
+    mfu_pack_uint64(&ptr, file_id);
+    mfu_pack_uint64(&ptr, offset);
+    mfu_pack_uint32(&ptr, data_len);
+    mfu_pack_uint32(&ptr, logical_len);
+    mfu_pack_uint32(&ptr, flags);
+    if (data_len > 0) {
+        memcpy(ptr, data, (size_t)data_len);
+        ptr += data_len;
+    }
+    return (size_t)(ptr - buf);
+}
+
+static int nsync_copy_frame_unpack(
+    const char* buf,
+    size_t bytes,
+    nsync_copy_frame_header_t* header,
+    const char** data_out)
+{
+    const char* ptr = buf;
+    const char* end = buf + bytes;
+    if ((size_t)(end - ptr) < nsync_copy_frame_header_pack_size()) {
+        return -1;
+    }
+
+    mfu_unpack_uint64(&ptr, &header->file_id);
+    mfu_unpack_uint64(&ptr, &header->offset);
+    mfu_unpack_uint32(&ptr, &header->data_length);
+    mfu_unpack_uint32(&ptr, &header->logical_length);
+    mfu_unpack_uint32(&ptr, &header->flags);
+    if ((header->flags & NSYNC_COPY_FRAME_FLAG_HOLE) != 0) {
+        if (header->data_length != 0) {
+            return -1;
+        }
+    } else if ((header->flags & NSYNC_COPY_FRAME_FLAG_END) == 0 &&
+               header->data_length != header->logical_length)
+    {
+        return -1;
+    }
+    if ((header->flags & NSYNC_COPY_FRAME_FLAG_END) != 0 && header->data_length != 0) {
+        return -1;
+    }
+    if ((size_t)(end - ptr) != (size_t)header->data_length) {
+        return -1;
+    }
+
+    *data_out = ptr;
+    return 0;
+}
+
+static int nsync_copy_send_slot_init(nsync_copy_send_slot_t* slot, size_t bufsize)
+{
+    size_t capacity = nsync_copy_frame_pack_size((uint32_t)bufsize);
+    slot->wire_buf = (char*)MFU_MALLOC(capacity);
+    if (slot->wire_buf == NULL) {
+        return -1;
+    }
+    slot->capacity = capacity;
+    slot->bytes = 0;
+    slot->busy = 0;
+    slot->req = MPI_REQUEST_NULL;
+    return 0;
+}
+
+static void nsync_copy_send_slot_free(nsync_copy_send_slot_t* slot)
+{
+    if (slot->busy) {
+        MPI_Wait(&slot->req, MPI_STATUS_IGNORE);
+    }
+    mfu_free(&slot->wire_buf);
+    slot->capacity = 0;
+    slot->bytes = 0;
+    slot->busy = 0;
+    slot->req = MPI_REQUEST_NULL;
+}
+
+static void nsync_source_transfer_mark_failed(
+    nsync_source_transfer_t* transfer,
+    int* local_errors)
+{
+    if (!transfer->failed) {
+        (*local_errors)++;
+    }
+    transfer->failed = 1;
+}
+
+static int nsync_source_transfer_init(
+    nsync_source_transfer_t* transfer,
     const char* src_root,
     const nsync_action_record_t* action,
+    uint64_t file_id,
     int dst_rank,
+    const nsync_options_t* opts)
+{
+    memset(transfer, 0, sizeof(*transfer));
+    transfer->fd = -1;
+    transfer->file_id = file_id;
+    transfer->dst_rank = dst_rank;
+    transfer->file_size = action->size;
+
+    char* src_fullpath = nsync_build_full_path(src_root, action->relpath);
+    transfer->fd = open(src_fullpath, O_RDONLY);
+    mfu_free(&src_fullpath);
+    if (transfer->fd < 0) {
+        return errno;
+    }
+
+    struct stat st;
+    if (fstat(transfer->fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+        uint64_t allocated_bytes = (uint64_t)st.st_blocks * 512ULL;
+        if (allocated_bytes < transfer->file_size) {
+            transfer->zero_hole_fallback = 1;
+        }
+    }
+
+    size_t bufsize = nsync_effective_bufsize(opts->bufsize);
+    for (int i = 0; i < NSYNC_COPY_PIPELINE_DEPTH; i++) {
+        if (nsync_copy_send_slot_init(&transfer->slots[i], bufsize) != 0) {
+            for (int j = 0; j < i; j++) {
+                nsync_copy_send_slot_free(&transfer->slots[j]);
+            }
+            close(transfer->fd);
+            transfer->fd = -1;
+            return ENOMEM;
+        }
+    }
+
+#if defined(SEEK_DATA) && defined(SEEK_HOLE)
+    transfer->sparse_seek_mode = (transfer->file_size > 0) ? 1 : 0;
+#else
+    transfer->sparse_seek_mode = 0;
+#endif
+    transfer->active = 1;
+    return 0;
+}
+
+static void nsync_source_transfer_free(nsync_source_transfer_t* transfer)
+{
+    if (transfer->fd >= 0) {
+        close(transfer->fd);
+        transfer->fd = -1;
+    }
+    for (int i = 0; i < NSYNC_COPY_PIPELINE_DEPTH; i++) {
+        nsync_copy_send_slot_free(&transfer->slots[i]);
+    }
+    transfer->active = 0;
+}
+
+static int nsync_source_transfer_has_busy_slots(const nsync_source_transfer_t* transfer)
+{
+    for (int i = 0; i < NSYNC_COPY_PIPELINE_DEPTH; i++) {
+        if (transfer->slots[i].busy) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int nsync_source_active_transfer_count(
+    const nsync_source_transfer_t* transfers,
+    uint64_t count)
+{
+    int active = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        if (transfers[i].active) {
+            active++;
+        }
+    }
+    return active;
+}
+
+static int nsync_source_has_active_transfer_for_dst(
+    const nsync_source_transfer_t* transfers,
+    uint64_t count,
+    int dst_rank)
+{
+    for (uint64_t i = 0; i < count; i++) {
+        if (transfers[i].active && transfers[i].dst_rank == dst_rank) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int nsync_source_transfer_prepare_next_message(
+    nsync_source_transfer_t* transfer,
+    nsync_copy_send_slot_t* slot,
     const nsync_options_t* opts,
     int* local_errors)
 {
-    if (dst_rank < 0) {
-        (*local_errors)++;
-        return -1;
+    (void)opts;
+
+    if (transfer->end_sent) {
+        return 0;
     }
 
-    int status = 0;
-    char* src_fullpath = nsync_build_full_path(src_root, action->relpath);
-    int fd = open(src_fullpath, O_RDONLY);
-    if (fd < 0) {
-        status = errno;
-        MPI_Send(&status, 1, MPI_INT, dst_rank, NSYNC_MSG_COPY_RESP, MPI_COMM_WORLD);
-        (*local_errors)++;
-        mfu_free(&src_fullpath);
-        return -1;
-    }
-
-    MPI_Send(&status, 1, MPI_INT, dst_rank, NSYNC_MSG_COPY_RESP, MPI_COMM_WORLD);
-
-    size_t bufsize = nsync_effective_bufsize(opts->bufsize);
-    char* buf = (char*)MFU_MALLOC(bufsize);
-
-    int io_error = 0;
+    size_t header_size = nsync_copy_frame_header_pack_size();
+    size_t bufsize = slot->capacity - header_size;
     while (1) {
-        ssize_t nread = read(fd, buf, bufsize);
-        if (nread < 0) {
-            if (errno == EINTR) {
+        if (transfer->failed || transfer->next_offset >= transfer->file_size) {
+            uint32_t flags = NSYNC_COPY_FRAME_FLAG_END;
+            if (transfer->failed) {
+                flags |= NSYNC_COPY_FRAME_FLAG_ERROR;
+            }
+            slot->bytes = nsync_copy_frame_pack(
+                slot->wire_buf,
+                transfer->file_id,
+                transfer->next_offset,
+                flags,
+                0,
+                NULL,
+                0);
+            transfer->end_sent = 1;
+            return 1;
+        }
+
+        if (transfer->data_extent_end > transfer->next_offset) {
+            uint64_t remaining = transfer->data_extent_end - transfer->next_offset;
+            size_t read_size = (size_t)nsync_min_u64(remaining, (uint64_t)bufsize);
+            off_t read_off = 0;
+            if (nsync_u64_to_offt_checked(transfer->next_offset, &read_off) != 0) {
+                nsync_source_transfer_mark_failed(transfer, local_errors);
                 continue;
             }
-            io_error = 1;
-            break;
+
+            ssize_t nread = pread(transfer->fd, slot->wire_buf + header_size, read_size, read_off);
+            if (nread <= 0) {
+                nsync_source_transfer_mark_failed(transfer, local_errors);
+                continue;
+            }
+
+            slot->bytes = nsync_copy_frame_pack(
+                slot->wire_buf,
+                transfer->file_id,
+                transfer->next_offset,
+                0,
+                (uint32_t)nread,
+                slot->wire_buf + header_size,
+                (uint32_t)nread);
+            transfer->next_offset += (uint64_t)nread;
+            return 1;
         }
 
-        uint32_t chunk = (uint32_t)nread;
-        MPI_Send(&chunk, 1, MPI_UINT32_T, dst_rank, NSYNC_MSG_COPY_DATA_LEN, MPI_COMM_WORLD);
-        if (chunk == 0) {
-            break;
+        if (transfer->sparse_seek_mode) {
+#if defined(SEEK_DATA) && defined(SEEK_HOLE)
+            off_t current_off = 0;
+            if (nsync_u64_to_offt_checked(transfer->next_offset, &current_off) != 0) {
+                nsync_source_transfer_mark_failed(transfer, local_errors);
+                continue;
+            }
+
+            errno = 0;
+            off_t data_off = lseek(transfer->fd, current_off, SEEK_DATA);
+            if (data_off == (off_t)-1) {
+                if (errno == ENXIO) {
+                    uint64_t hole_len = transfer->file_size - transfer->next_offset;
+                    uint32_t hole_chunk = (uint32_t)nsync_min_u64(hole_len, (uint64_t)UINT32_MAX);
+                    slot->bytes = nsync_copy_frame_pack(
+                        slot->wire_buf,
+                        transfer->file_id,
+                        transfer->next_offset,
+                        NSYNC_COPY_FRAME_FLAG_HOLE,
+                        hole_chunk,
+                        NULL,
+                        0);
+                    transfer->next_offset += (uint64_t)hole_chunk;
+                    return 1;
+                }
+                if (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP) {
+                    transfer->sparse_seek_mode = 0;
+                    continue;
+                }
+                nsync_source_transfer_mark_failed(transfer, local_errors);
+                continue;
+            }
+
+            if ((uint64_t)data_off > transfer->next_offset) {
+                uint64_t hole_len = (uint64_t)data_off - transfer->next_offset;
+                uint32_t hole_chunk = (uint32_t)nsync_min_u64(hole_len, (uint64_t)UINT32_MAX);
+                slot->bytes = nsync_copy_frame_pack(
+                    slot->wire_buf,
+                    transfer->file_id,
+                    transfer->next_offset,
+                    NSYNC_COPY_FRAME_FLAG_HOLE,
+                    hole_chunk,
+                    NULL,
+                    0);
+                transfer->next_offset += (uint64_t)hole_chunk;
+                return 1;
+            }
+
+            errno = 0;
+            off_t hole_off = lseek(transfer->fd, data_off, SEEK_HOLE);
+            if (hole_off == (off_t)-1 || hole_off < data_off) {
+                if (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP) {
+                    transfer->sparse_seek_mode = 0;
+                    continue;
+                }
+                nsync_source_transfer_mark_failed(transfer, local_errors);
+                continue;
+            }
+
+            transfer->data_extent_end = (uint64_t)hole_off;
+            continue;
+#else
+            transfer->sparse_seek_mode = 0;
+            continue;
+#endif
         }
-        MPI_Send(buf, (int)chunk, MPI_BYTE, dst_rank, NSYNC_MSG_COPY_DATA, MPI_COMM_WORLD);
+
+        uint64_t remaining = transfer->file_size - transfer->next_offset;
+        size_t read_size = (size_t)nsync_min_u64(remaining, (uint64_t)bufsize);
+        off_t read_off = 0;
+        if (nsync_u64_to_offt_checked(transfer->next_offset, &read_off) != 0) {
+            nsync_source_transfer_mark_failed(transfer, local_errors);
+            continue;
+        }
+
+        ssize_t nread = pread(transfer->fd, slot->wire_buf + header_size, read_size, read_off);
+        if (nread <= 0) {
+            nsync_source_transfer_mark_failed(transfer, local_errors);
+            continue;
+        }
+
+        uint32_t flags = 0;
+        const char* data = slot->wire_buf + header_size;
+        if (transfer->zero_hole_fallback && nsync_is_all_null(data, (size_t)nread)) {
+            flags |= NSYNC_COPY_FRAME_FLAG_HOLE;
+            data = NULL;
+        }
+        slot->bytes = nsync_copy_frame_pack(
+            slot->wire_buf,
+            transfer->file_id,
+            transfer->next_offset,
+            flags,
+            (uint32_t)nread,
+            data,
+            (flags & NSYNC_COPY_FRAME_FLAG_HOLE) ? 0U : (uint32_t)nread);
+        transfer->next_offset += (uint64_t)nread;
+        return 1;
+    }
+}
+
+static int nsync_source_transfer_progress(
+    nsync_source_transfer_t* transfer,
+    const nsync_options_t* opts,
+    int* local_errors)
+{
+    int made_progress = 0;
+    for (int i = 0; i < NSYNC_COPY_PIPELINE_DEPTH; i++) {
+        nsync_copy_send_slot_t* slot = &transfer->slots[i];
+        if (!slot->busy) {
+            continue;
+        }
+
+        int complete = 0;
+        MPI_Test(&slot->req, &complete, MPI_STATUS_IGNORE);
+        if (complete) {
+            slot->busy = 0;
+            slot->req = MPI_REQUEST_NULL;
+            made_progress = 1;
+        }
     }
 
-    if (io_error) {
-        uint32_t terminator = 0;
-        MPI_Send(&terminator, 1, MPI_UINT32_T, dst_rank, NSYNC_MSG_COPY_DATA_LEN, MPI_COMM_WORLD);
-        (*local_errors)++;
+    for (int i = 0; i < NSYNC_COPY_PIPELINE_DEPTH; i++) {
+        nsync_copy_send_slot_t* slot = &transfer->slots[i];
+        if (slot->busy) {
+            continue;
+        }
+        if (nsync_source_transfer_prepare_next_message(transfer, slot, opts, local_errors) != 1) {
+            continue;
+        }
+
+        MPI_Isend(
+            slot->wire_buf,
+            (int)slot->bytes,
+            MPI_BYTE,
+            transfer->dst_rank,
+            NSYNC_MSG_COPY_DATA_LEN,
+            MPI_COMM_WORLD,
+            &slot->req);
+        slot->busy = 1;
+        made_progress = 1;
     }
 
-    close(fd);
-    mfu_free(&buf);
-    mfu_free(&src_fullpath);
-    return io_error ? -1 : 0;
+    if (transfer->end_sent && !nsync_source_transfer_has_busy_slots(transfer)) {
+        transfer->completed = 1;
+    }
+    return made_progress;
 }
 
 static void nsync_source_copy_service(
@@ -3934,76 +4504,272 @@ static void nsync_source_copy_service(
 
     nsync_trace_local(opts, "copy-src-service-start", expected, 0);
 
-    for (uint64_t req_idx = 0; req_idx < expected; req_idx++) {
-        MPI_Status status;
-        MPI_Probe(MPI_ANY_SOURCE, NSYNC_MSG_COPY_REQ, MPI_COMM_WORLD, &status);
-
-        int bytes = 0;
-        MPI_Get_count(&status, MPI_BYTE, &bytes);
-        if (bytes <= 0) {
-            int err = EPROTO;
-            MPI_Recv(NULL, 0, MPI_BYTE, status.MPI_SOURCE, NSYNC_MSG_COPY_REQ, MPI_COMM_WORLD, &status);
-            MPI_Send(&err, 1, MPI_INT, status.MPI_SOURCE, NSYNC_MSG_COPY_RESP, MPI_COMM_WORLD);
-            (*local_errors)++;
-            continue;
-        }
-
-        char* req_buf = (char*)MFU_MALLOC((size_t)bytes);
-        MPI_Recv(req_buf, bytes, MPI_BYTE, status.MPI_SOURCE, NSYNC_MSG_COPY_REQ, MPI_COMM_WORLD, &status);
-
-        char* relpath = NULL;
-        if (nsync_copy_req_unpack(req_buf, (size_t)bytes, &relpath) != 0) {
-            int err = EPROTO;
-            MPI_Send(&err, 1, MPI_INT, status.MPI_SOURCE, NSYNC_MSG_COPY_RESP, MPI_COMM_WORLD);
-            (*local_errors)++;
-            mfu_free(&req_buf);
-            continue;
-        }
-
-        const nsync_action_record_t* action = nsync_find_copy_action_sorted(src_actions, relpath);
-        if (action == NULL) {
-            int err = ENOENT;
-            MPI_Send(&err, 1, MPI_INT, status.MPI_SOURCE, NSYNC_MSG_COPY_RESP, MPI_COMM_WORLD);
-            (*local_errors)++;
-        } else {
-            nsync_source_send_copy_file(src_root, action, status.MPI_SOURCE, opts, local_errors);
-        }
-
-        mfu_free(&relpath);
-        mfu_free(&req_buf);
+    nsync_source_transfer_t* transfers = NULL;
+    nsync_source_request_t* pending = NULL;
+    if (expected > 0) {
+        transfers = (nsync_source_transfer_t*)calloc((size_t)expected, sizeof(*transfers));
+        pending = (nsync_source_request_t*)calloc((size_t)expected, sizeof(*pending));
     }
+    if (expected > 0 && (transfers == NULL || pending == NULL)) {
+        free(transfers);
+        free(pending);
+        (*local_errors)++;
+        return;
+    }
+
+    int file_credits = nsync_copy_file_credit_limit();
+    uint64_t received = 0;
+    uint64_t completed = 0;
+    while (completed < expected) {
+        int made_progress = 0;
+
+        for (uint64_t i = 0; i < expected; i++) {
+            nsync_source_transfer_t* transfer = &transfers[i];
+            if (!transfer->active) {
+                continue;
+            }
+
+            if (nsync_source_transfer_progress(transfer, opts, local_errors)) {
+                made_progress = 1;
+            }
+            if (transfer->completed) {
+                nsync_trace_local(opts, "copy-src-done", transfer->file_id, (uint64_t)transfer->dst_rank);
+                nsync_source_transfer_free(transfer);
+                completed++;
+                made_progress = 1;
+            }
+        }
+
+        int active_count = nsync_source_active_transfer_count(transfers, expected);
+        for (uint64_t i = 0; i < expected && active_count < file_credits; i++) {
+            nsync_source_request_t* req = &pending[i];
+            if (!req->active || nsync_source_has_active_transfer_for_dst(transfers, expected, req->dst_rank)) {
+                continue;
+            }
+
+            uint64_t transfer_idx = expected;
+            for (uint64_t idx = 0; idx < expected; idx++) {
+                if (!transfers[idx].active) {
+                    transfer_idx = idx;
+                    break;
+                }
+            }
+            if (transfer_idx >= expected) {
+                break;
+            }
+
+            int resp_status = nsync_source_transfer_init(
+                &transfers[transfer_idx], src_root, req->action, req->file_id, req->dst_rank, opts);
+            if (resp_status == 0) {
+                nsync_trace_local(opts, "copy-src-start", req->file_id, (uint64_t)req->dst_rank);
+            }
+            if (resp_status != 0) {
+                (*local_errors)++;
+                completed++;
+            } else {
+                active_count++;
+            }
+
+            char resp_buf[16];
+            size_t resp_bytes = nsync_copy_resp_pack(resp_buf, req->file_id, resp_status);
+            MPI_Send(
+                resp_buf,
+                (int)resp_bytes,
+                MPI_BYTE,
+                req->dst_rank,
+                NSYNC_MSG_COPY_RESP,
+                MPI_COMM_WORLD);
+
+            req->active = 0;
+            req->action = NULL;
+            made_progress = 1;
+        }
+
+        if (received < expected) {
+            int flag = 0;
+            MPI_Status probe_status;
+            MPI_Iprobe(MPI_ANY_SOURCE, NSYNC_MSG_COPY_REQ, MPI_COMM_WORLD, &flag, &probe_status);
+            if (flag) {
+                int bytes = 0;
+                MPI_Get_count(&probe_status, MPI_BYTE, &bytes);
+                char* req_buf = (char*)MFU_MALLOC((size_t)bytes);
+                MPI_Recv(
+                    req_buf,
+                    bytes,
+                    MPI_BYTE,
+                    probe_status.MPI_SOURCE,
+                    NSYNC_MSG_COPY_REQ,
+                    MPI_COMM_WORLD,
+                    MPI_STATUS_IGNORE);
+
+                uint64_t file_id = 0;
+                char* relpath = NULL;
+                int resp_status = EPROTO;
+                if (bytes > 0 &&
+                    nsync_copy_req_unpack(req_buf, (size_t)bytes, &file_id, &relpath) == 0)
+                {
+                    const nsync_action_record_t* action =
+                        nsync_find_copy_action_sorted(src_actions, relpath);
+                    if (action != NULL) {
+                        uint64_t pending_idx = expected;
+                        for (uint64_t idx = 0; idx < expected; idx++) {
+                            if (!pending[idx].active) {
+                                pending_idx = idx;
+                                break;
+                            }
+                        }
+                        if (pending_idx < expected) {
+                            pending[pending_idx].active = 1;
+                            pending[pending_idx].file_id = file_id;
+                            pending[pending_idx].dst_rank = probe_status.MPI_SOURCE;
+                            pending[pending_idx].action = action;
+                            nsync_trace_local(opts, "copy-src-queue", file_id, (uint64_t)probe_status.MPI_SOURCE);
+                            resp_status = 0;
+                        } else {
+                            resp_status = EBUSY;
+                            (*local_errors)++;
+                        }
+                    } else {
+                        resp_status = ENOENT;
+                        (*local_errors)++;
+                    }
+                } else {
+                    (*local_errors)++;
+                }
+
+                if (resp_status != 0) {
+                    char resp_buf[16];
+                    size_t resp_bytes = nsync_copy_resp_pack(resp_buf, file_id, resp_status);
+                    MPI_Send(
+                        resp_buf,
+                        (int)resp_bytes,
+                        MPI_BYTE,
+                        probe_status.MPI_SOURCE,
+                        NSYNC_MSG_COPY_RESP,
+                        MPI_COMM_WORLD);
+                    completed++;
+                }
+                received++;
+                mfu_free(&relpath);
+                mfu_free(&req_buf);
+                made_progress = 1;
+            }
+        }
+
+        if (!made_progress) {
+            for (uint64_t i = 0; i < expected; i++) {
+                nsync_source_transfer_t* transfer = &transfers[i];
+                if (!transfer->active) {
+                    continue;
+                }
+                for (int slot_idx = 0; slot_idx < NSYNC_COPY_PIPELINE_DEPTH; slot_idx++) {
+                    nsync_copy_send_slot_t* slot = &transfer->slots[slot_idx];
+                    if (slot->busy) {
+                        MPI_Wait(&slot->req, MPI_STATUS_IGNORE);
+                        slot->busy = 0;
+                        slot->req = MPI_REQUEST_NULL;
+                        made_progress = 1;
+                        break;
+                    }
+                }
+                if (made_progress) {
+                    break;
+                }
+            }
+
+            if (made_progress) {
+                continue;
+            }
+
+            if (received < expected) {
+                MPI_Status probe_status;
+                MPI_Probe(MPI_ANY_SOURCE, NSYNC_MSG_COPY_REQ, MPI_COMM_WORLD, &probe_status);
+                continue;
+            }
+        }
+    }
+
+    for (uint64_t i = 0; i < expected; i++) {
+        if (transfers[i].active) {
+            nsync_source_transfer_free(&transfers[i]);
+        }
+    }
+    free(transfers);
+    free(pending);
 }
 
-static int nsync_destination_receive_copy_file(
+static int nsync_copy_recv_slot_init(nsync_copy_recv_slot_t* slot, size_t bufsize)
+{
+    size_t capacity = nsync_copy_frame_pack_size((uint32_t)bufsize);
+    slot->wire_buf = (char*)MFU_MALLOC(capacity);
+    if (slot->wire_buf == NULL) {
+        return -1;
+    }
+    slot->capacity = capacity;
+    slot->bytes = 0;
+    slot->busy = 0;
+    slot->src_rank = -1;
+    slot->req = MPI_REQUEST_NULL;
+    return 0;
+}
+
+static void nsync_copy_recv_slot_free(nsync_copy_recv_slot_t* slot)
+{
+    if (slot->busy) {
+        MPI_Wait(&slot->req, MPI_STATUS_IGNORE);
+    }
+    mfu_free(&slot->wire_buf);
+    slot->capacity = 0;
+    slot->bytes = 0;
+    slot->busy = 0;
+    slot->src_rank = -1;
+    slot->req = MPI_REQUEST_NULL;
+}
+
+static int nsync_copy_recv_slots_busy_for_source(
+    const nsync_copy_recv_slot_t* slots,
+    uint64_t slot_count,
+    int src_rank)
+{
+    for (uint64_t i = 0; i < slot_count; i++) {
+        if (slots[i].busy && slots[i].src_rank == src_rank) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static nsync_destination_transfer_t* nsync_destination_find_transfer(
+    nsync_destination_transfer_t* transfers,
+    uint64_t count,
+    uint64_t file_id)
+{
+    for (uint64_t i = 0; i < count; i++) {
+        if (transfers[i].active && transfers[i].file_id == file_id) {
+            return &transfers[i];
+        }
+    }
+    return NULL;
+}
+
+static int nsync_destination_start_copy_transfer(
     const char* dst_root,
     const nsync_action_record_t* action,
-    const nsync_options_t* opts,
-    int* local_errors,
-    nsync_meta_apply_stats_t* meta_stats,
-    uint64_t* copied_files,
-    uint64_t* copied_bytes)
+    uint64_t file_id,
+    nsync_destination_transfer_t* transfer,
+    int* local_errors)
 {
-    if (action->src_owner_world < 0) {
-        (*local_errors)++;
-        return -1;
-    }
+    memset(transfer, 0, sizeof(*transfer));
+    transfer->active = 1;
+    transfer->file_id = file_id;
+    transfer->src_rank = action->src_owner_world;
+    transfer->fd = -1;
+    transfer->action = action;
+    transfer->dst_fullpath = nsync_build_full_path(dst_root, action->relpath);
 
-    size_t req_bytes = nsync_copy_req_pack_size(action->relpath);
-    char* req_buf = (char*)MFU_MALLOC(req_bytes);
-    nsync_copy_req_pack(req_buf, action->relpath);
-    MPI_Send(req_buf, (int)req_bytes, MPI_BYTE, action->src_owner_world, NSYNC_MSG_COPY_REQ, MPI_COMM_WORLD);
-    mfu_free(&req_buf);
-
-    int status = 0;
-    MPI_Recv(&status, 1, MPI_INT, action->src_owner_world, NSYNC_MSG_COPY_RESP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    if (status != 0) {
+    if (nsync_ensure_parent_dirs(transfer->dst_fullpath) != 0) {
         (*local_errors)++;
-        return -1;
-    }
-
-    char* dst_fullpath = nsync_build_full_path(dst_root, action->relpath);
-    if (nsync_ensure_parent_dirs(dst_fullpath) != 0) {
-        (*local_errors)++;
+        transfer->open_error = 1;
     }
 
     mode_t mode = (mode_t)(action->mode & 07777u);
@@ -4011,72 +4777,414 @@ static int nsync_destination_receive_copy_file(
         mode = (mode_t)0644;
     }
 
-    int fd = open(dst_fullpath, O_WRONLY | O_CREAT | O_TRUNC, mode);
-    int open_error = (fd < 0);
-    if (open_error) {
+    if (!transfer->open_error) {
+        transfer->fd = open(transfer->dst_fullpath, O_WRONLY | O_CREAT | O_TRUNC, mode);
+        if (transfer->fd < 0) {
+            (*local_errors)++;
+            transfer->open_error = 1;
+        }
+    }
+
+    if (transfer->fd >= 0) {
+        off_t file_size = 0;
+        if (nsync_u64_to_offt_checked(action->size, &file_size) != 0 ||
+            ftruncate(transfer->fd, file_size) != 0)
+        {
+            (*local_errors)++;
+            close(transfer->fd);
+            transfer->fd = -1;
+            transfer->open_error = 1;
+        }
+    }
+
+    size_t req_bytes = nsync_copy_req_pack_size(file_id, action->relpath);
+    char* req_buf = (char*)MFU_MALLOC(req_bytes);
+    nsync_copy_req_pack(req_buf, file_id, action->relpath);
+    MPI_Send(req_buf, (int)req_bytes, MPI_BYTE, action->src_owner_world, NSYNC_MSG_COPY_REQ, MPI_COMM_WORLD);
+    mfu_free(&req_buf);
+    return 0;
+}
+
+static void nsync_destination_finalize_copy_transfer(
+    nsync_destination_transfer_t* transfer,
+    const nsync_options_t* opts,
+    int* local_errors,
+    nsync_meta_apply_stats_t* meta_stats,
+    uint64_t* done_actions,
+    uint64_t* done_copy_files,
+    uint64_t* done_copy_bytes)
+{
+    int success = 1;
+    if (!transfer->response_received || transfer->response_error || transfer->transfer_error || transfer->open_error) {
+        success = 0;
+    }
+
+    if (transfer->fd >= 0) {
+        off_t file_size = 0;
+        if (success &&
+            (nsync_u64_to_offt_checked(transfer->action->size, &file_size) != 0 ||
+             ftruncate(transfer->fd, file_size) != 0))
+        {
+            (*local_errors)++;
+            success = 0;
+        }
+
+        if (close(transfer->fd) != 0) {
+            (*local_errors)++;
+            success = 0;
+        }
+        transfer->fd = -1;
+    }
+
+    if (success) {
+        nsync_apply_metadata(transfer->dst_fullpath, transfer->action, 0, opts, local_errors, meta_stats);
+        if (done_actions != NULL) {
+            (*done_actions)++;
+        }
+        if (done_copy_files != NULL) {
+            (*done_copy_files)++;
+        }
+        if (done_copy_bytes != NULL) {
+            (*done_copy_bytes) += transfer->copied_bytes;
+        }
+    } else if (transfer->dst_fullpath != NULL) {
+        (void)nsync_remove_path(transfer->dst_fullpath);
+    }
+
+    nsync_trace_local(opts, "copy-dst-finalize", transfer->file_id, (uint64_t)success);
+
+    mfu_free(&transfer->dst_fullpath);
+    transfer->completed = 1;
+    transfer->active = 0;
+}
+
+static void nsync_destination_handle_copy_response(
+    nsync_destination_transfer_t* transfers,
+    uint64_t transfer_count,
+    const nsync_options_t* opts,
+    int* local_errors)
+{
+    MPI_Status status;
+    MPI_Probe(MPI_ANY_SOURCE, NSYNC_MSG_COPY_RESP, MPI_COMM_WORLD, &status);
+    int bytes = 0;
+    MPI_Get_count(&status, MPI_BYTE, &bytes);
+    if (bytes <= 0) {
+        MPI_Recv(NULL, 0, MPI_BYTE, status.MPI_SOURCE, NSYNC_MSG_COPY_RESP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        (*local_errors)++;
+        return;
+    }
+
+    char* buf = (char*)MFU_MALLOC((size_t)bytes);
+    MPI_Recv(buf, bytes, MPI_BYTE, status.MPI_SOURCE, NSYNC_MSG_COPY_RESP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    uint64_t file_id = 0;
+    int resp_status = EPROTO;
+    if (nsync_copy_resp_unpack(buf, (size_t)bytes, &file_id, &resp_status) != 0) {
+        mfu_free(&buf);
+        (*local_errors)++;
+        return;
+    }
+
+    nsync_destination_transfer_t* transfer =
+        nsync_destination_find_transfer(transfers, transfer_count, file_id);
+    if (transfer == NULL) {
+        mfu_free(&buf);
+        (*local_errors)++;
+        return;
+    }
+
+    transfer->response_received = 1;
+    nsync_trace_local(opts, "copy-dst-response", file_id, (uint64_t)(uint32_t)resp_status);
+    if (resp_status != 0) {
+        transfer->response_error = 1;
+        transfer->end_received = 1;
+        (*local_errors)++;
+    }
+    mfu_free(&buf);
+}
+
+static void nsync_destination_handle_copy_frame(
+    nsync_destination_transfer_t* transfers,
+    uint64_t transfer_count,
+    nsync_copy_recv_slot_t* slot,
+    const nsync_options_t* opts,
+    int* local_errors)
+{
+    nsync_copy_frame_header_t header;
+    const char* data = NULL;
+    if (nsync_copy_frame_unpack(slot->wire_buf, slot->bytes, &header, &data) != 0) {
+        (*local_errors)++;
+        return;
+    }
+
+    nsync_destination_transfer_t* transfer =
+        nsync_destination_find_transfer(transfers, transfer_count, header.file_id);
+    if (transfer == NULL) {
+        (*local_errors)++;
+        return;
+    }
+
+    if (header.flags & NSYNC_COPY_FRAME_FLAG_ERROR) {
+        transfer->transfer_error = 1;
         (*local_errors)++;
     }
 
-    size_t buf_cap = nsync_effective_bufsize(opts->bufsize);
-    char* buf = (char*)MFU_MALLOC(buf_cap);
+    if ((header.flags & NSYNC_COPY_FRAME_FLAG_HOLE) == 0 &&
+        header.data_length > 0 &&
+        transfer->fd >= 0 &&
+        !transfer->open_error)
+    {
+        if (nsync_pwrite_all(transfer->fd, data, (size_t)header.data_length, header.offset) != 0) {
+            (*local_errors)++;
+            transfer->transfer_error = 1;
+        }
+    }
 
-    int io_error = 0;
-    uint64_t file_bytes_written = 0;
-    while (1) {
-        uint32_t chunk = 0;
-        MPI_Recv(&chunk, 1, MPI_UINT32_T, action->src_owner_world, NSYNC_MSG_COPY_DATA_LEN,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        if (chunk == 0) {
+    if ((header.flags & NSYNC_COPY_FRAME_FLAG_END) == 0) {
+        transfer->copied_bytes += (uint64_t)header.logical_length;
+    }
+
+    if (header.flags & NSYNC_COPY_FRAME_FLAG_END) {
+        transfer->end_received = 1;
+        nsync_trace_local(opts, "copy-dst-end", header.file_id, transfer->copied_bytes);
+    }
+}
+
+static void nsync_destination_execute_copy_actions(
+    const char* dst_root,
+    const nsync_action_ptr_vec_t* copy_actions,
+    const nsync_options_t* opts,
+    int* local_errors,
+    nsync_meta_apply_stats_t* meta_stats,
+    uint64_t* done_actions,
+    uint64_t* done_copy_files,
+    uint64_t* done_copy_bytes)
+{
+    if (copy_actions->size == 0) {
+        return;
+    }
+
+    int world_size = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    int file_credits = nsync_copy_file_credit_limit();
+
+    uint64_t unique_sources = 0;
+    int* seen_sources = (int*)calloc((size_t)world_size, sizeof(int));
+    if (seen_sources == NULL) {
+        (*local_errors)++;
+        return;
+    }
+    for (uint64_t i = 0; i < copy_actions->size; i++) {
+        int src_rank = copy_actions->records[i]->src_owner_world;
+        if (src_rank >= 0 && src_rank < world_size && !seen_sources[src_rank]) {
+            seen_sources[src_rank] = 1;
+            unique_sources++;
+        }
+    }
+    free(seen_sources);
+
+    uint64_t recv_slot_count = nsync_min_u64(
+        copy_actions->size,
+        unique_sources * (uint64_t)file_credits * (uint64_t)NSYNC_COPY_PIPELINE_DEPTH);
+    if (recv_slot_count == 0) {
+        recv_slot_count = 1;
+    }
+
+    size_t bufsize = nsync_effective_bufsize(opts->bufsize);
+    nsync_copy_recv_slot_t* recv_slots =
+        (nsync_copy_recv_slot_t*)calloc((size_t)recv_slot_count, sizeof(*recv_slots));
+    nsync_destination_transfer_t* transfers =
+        (nsync_destination_transfer_t*)calloc((size_t)copy_actions->size, sizeof(*transfers));
+    int* per_source_active = (int*)calloc((size_t)world_size, sizeof(int));
+    unsigned char* launched = (unsigned char*)calloc((size_t)copy_actions->size, sizeof(unsigned char));
+    if (recv_slots == NULL || transfers == NULL || per_source_active == NULL || launched == NULL) {
+        (*local_errors)++;
+        free(recv_slots);
+        free(transfers);
+        free(per_source_active);
+        free(launched);
+        return;
+    }
+
+    int recv_init_error = 0;
+    for (uint64_t i = 0; i < recv_slot_count; i++) {
+        if (nsync_copy_recv_slot_init(&recv_slots[i], bufsize) != 0) {
+            (*local_errors)++;
+            recv_slot_count = i;
+            recv_init_error = 1;
+            break;
+        }
+    }
+    if (recv_init_error) {
+        for (uint64_t i = 0; i < recv_slot_count; i++) {
+            nsync_copy_recv_slot_free(&recv_slots[i]);
+        }
+        free(recv_slots);
+        free(transfers);
+        free(per_source_active);
+        free(launched);
+        return;
+    }
+
+    uint64_t completed = 0;
+    uint64_t next_file_id = 1;
+    while (completed < copy_actions->size) {
+        int made_progress = 0;
+
+        for (uint64_t i = 0; i < copy_actions->size; i++) {
+            const nsync_action_record_t* action = copy_actions->records[i];
+            int src_rank = action->src_owner_world;
+            if (launched[i] || src_rank < 0 || src_rank >= world_size ||
+                per_source_active[src_rank] >= 1)
+            {
+                continue;
+            }
+
+            if (nsync_destination_start_copy_transfer(
+                    dst_root, action, next_file_id, &transfers[i], local_errors) != 0)
+            {
+                (*local_errors)++;
+                continue;
+            }
+            nsync_trace_local(opts, "copy-dst-launch", next_file_id, (uint64_t)src_rank);
+            launched[i] = 1;
+            per_source_active[src_rank]++;
+            next_file_id++;
+            made_progress = 1;
+        }
+
+        while (1) {
+            int flag = 0;
+            MPI_Status status;
+            MPI_Iprobe(MPI_ANY_SOURCE, NSYNC_MSG_COPY_RESP, MPI_COMM_WORLD, &flag, &status);
+            if (!flag) {
+                break;
+            }
+            nsync_destination_handle_copy_response(transfers, copy_actions->size, opts, local_errors);
+            made_progress = 1;
+        }
+
+        for (uint64_t i = 0; i < recv_slot_count; i++) {
+            nsync_copy_recv_slot_t* slot = &recv_slots[i];
+            if (!slot->busy) {
+                continue;
+            }
+
+            int complete = 0;
+            MPI_Test(&slot->req, &complete, MPI_STATUS_IGNORE);
+            if (complete) {
+                slot->busy = 0;
+                slot->req = MPI_REQUEST_NULL;
+                nsync_destination_handle_copy_frame(transfers, copy_actions->size, slot, opts, local_errors);
+                slot->bytes = 0;
+                slot->src_rank = -1;
+                made_progress = 1;
+            }
+        }
+
+        for (uint64_t i = 0; i < recv_slot_count; i++) {
+            nsync_copy_recv_slot_t* slot = &recv_slots[i];
+            if (slot->busy) {
+                continue;
+            }
+
+            int flag = 0;
+            MPI_Status status;
+            MPI_Iprobe(MPI_ANY_SOURCE, NSYNC_MSG_COPY_DATA_LEN, MPI_COMM_WORLD, &flag, &status);
+            if (!flag) {
+                break;
+            }
+
+            int bytes = 0;
+            MPI_Get_count(&status, MPI_BYTE, &bytes);
+            if ((size_t)bytes > slot->capacity) {
+                char* new_buf = (char*)realloc(slot->wire_buf, (size_t)bytes);
+                if (new_buf == NULL) {
+                    (*local_errors)++;
+                    char* drain = (char*)MFU_MALLOC((size_t)bytes);
+                    MPI_Recv(drain, bytes, MPI_BYTE, status.MPI_SOURCE, NSYNC_MSG_COPY_DATA_LEN,
+                        MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                    mfu_free(&drain);
+                    continue;
+                }
+                slot->wire_buf = new_buf;
+                slot->capacity = (size_t)bytes;
+            }
+
+            MPI_Irecv(
+                slot->wire_buf,
+                bytes,
+                MPI_BYTE,
+                status.MPI_SOURCE,
+                NSYNC_MSG_COPY_DATA_LEN,
+                MPI_COMM_WORLD,
+                &slot->req);
+            slot->busy = 1;
+            slot->bytes = (size_t)bytes;
+            slot->src_rank = status.MPI_SOURCE;
+            made_progress = 1;
             break;
         }
 
-        if ((size_t)chunk > buf_cap) {
-            /* Drain unexpected oversized payload to keep protocol in sync. */
-            char* tmp = (char*)MFU_MALLOC((size_t)chunk);
-            MPI_Recv(tmp, (int)chunk, MPI_BYTE, action->src_owner_world, NSYNC_MSG_COPY_DATA,
-                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            mfu_free(&tmp);
-            (*local_errors)++;
-            io_error = 1;
-            continue;
+        for (uint64_t i = 0; i < copy_actions->size; i++) {
+            nsync_destination_transfer_t* transfer = &transfers[i];
+            if (!transfer->active ||
+                !transfer->response_received ||
+                !transfer->end_received ||
+                nsync_copy_recv_slots_busy_for_source(recv_slots, recv_slot_count, transfer->src_rank))
+            {
+                continue;
+            }
+
+            nsync_destination_finalize_copy_transfer(
+                transfer, opts, local_errors, meta_stats,
+                done_actions, done_copy_files, done_copy_bytes);
+            if (transfer->src_rank >= 0 && transfer->src_rank < world_size && per_source_active[transfer->src_rank] > 0) {
+                per_source_active[transfer->src_rank]--;
+            }
+            completed++;
+            made_progress = 1;
         }
 
-        MPI_Recv(buf, (int)chunk, MPI_BYTE, action->src_owner_world, NSYNC_MSG_COPY_DATA,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        if (!made_progress) {
+            int waited = 0;
+            for (uint64_t i = 0; i < recv_slot_count; i++) {
+                nsync_copy_recv_slot_t* slot = &recv_slots[i];
+                if (!slot->busy) {
+                    continue;
+                }
+                MPI_Wait(&slot->req, MPI_STATUS_IGNORE);
+                slot->busy = 0;
+                slot->req = MPI_REQUEST_NULL;
+                nsync_destination_handle_copy_frame(transfers, copy_actions->size, slot, opts, local_errors);
+                slot->bytes = 0;
+                slot->src_rank = -1;
+                waited = 1;
+                break;
+            }
 
-        if (!open_error && nsync_write_all(fd, buf, (size_t)chunk) != 0) {
-            io_error = 1;
-            (*local_errors)++;
-            open_error = 1;
-        } else if (!open_error) {
-            file_bytes_written += (uint64_t)chunk;
+            if (!waited) {
+                MPI_Status status;
+                MPI_Probe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+            }
         }
     }
 
-    if (fd >= 0) {
-        if (close(fd) != 0) {
-            io_error = 1;
-            (*local_errors)++;
+    for (uint64_t i = 0; i < recv_slot_count; i++) {
+        nsync_copy_recv_slot_free(&recv_slots[i]);
+    }
+    for (uint64_t i = 0; i < copy_actions->size; i++) {
+        if (transfers[i].active) {
+            nsync_destination_finalize_copy_transfer(
+                &transfers[i], opts, local_errors, meta_stats,
+                done_actions, done_copy_files, done_copy_bytes);
         }
     }
 
-    if (fd >= 0 && !io_error) {
-        nsync_apply_metadata(dst_fullpath, action, 0, opts, local_errors, meta_stats);
-    }
-
-    int copy_ok = (fd >= 0 && !io_error);
-    if (copy_ok) {
-        if (copied_files != NULL) {
-            (*copied_files)++;
-        }
-        if (copied_bytes != NULL) {
-            (*copied_bytes) += file_bytes_written;
-        }
-    }
-
-    mfu_free(&buf);
-    mfu_free(&dst_fullpath);
-    return copy_ok ? 0 : -1;
+    free(recv_slots);
+    free(transfers);
+    free(per_source_active);
+    free(launched);
 }
 
 static void nsync_deferred_dir_remove_add(
@@ -4157,6 +5265,9 @@ static void nsync_destination_execute_actions(
 
     qsort(dst_actions->records, (size_t)dst_actions->size, sizeof(nsync_action_record_t), nsync_action_exec_sort);
 
+    nsync_action_ptr_vec_t copy_actions;
+    nsync_action_ptr_vec_init(&copy_actions);
+
     uint64_t local_done_actions = 0;
     uint64_t local_done_copy_files = 0;
     uint64_t local_done_copy_bytes = 0;
@@ -4215,19 +5326,11 @@ static void nsync_destination_execute_actions(
             }
             break;
         }
-        case NSYNC_ACTION_COPY: {
-            uint64_t copied_files = 0;
-            uint64_t copied_bytes = 0;
-            if (nsync_destination_receive_copy_file(
-                    dst_root, action, opts, local_errors, meta_stats,
-                    &copied_files, &copied_bytes) == 0)
-            {
-                action_completed = 1;
-                local_done_copy_files += copied_files;
-                local_done_copy_bytes += copied_bytes;
+        case NSYNC_ACTION_COPY:
+            if (nsync_action_ptr_vec_push(&copy_actions, action) != 0) {
+                (*local_errors)++;
             }
             break;
-        }
         case NSYNC_ACTION_META_UPDATE:
             if (S_ISDIR((mode_t)action->mode)) {
                 nsync_deferred_dir_meta_add(deferred_dir_meta_updates, action, local_errors);
@@ -4249,6 +5352,22 @@ static void nsync_destination_execute_actions(
         }
         mfu_free(&dst_fullpath);
     }
+
+    if (copy_actions.size > 1) {
+        qsort(copy_actions.records, (size_t)copy_actions.size, sizeof(*copy_actions.records),
+            nsync_action_ptr_copy_size_desc_sort);
+    }
+
+    nsync_destination_execute_copy_actions(
+        dst_root,
+        &copy_actions,
+        opts,
+        local_errors,
+        meta_stats,
+        &local_done_actions,
+        &local_done_copy_files,
+        &local_done_copy_bytes);
+    nsync_action_ptr_vec_free(&copy_actions);
 
     if (done_actions != NULL) {
         (*done_actions) += local_done_actions;
@@ -4705,6 +5824,463 @@ static int nsync_owner_from_group(
     return world_ranks[idx];
 }
 
+typedef struct {
+    int planner_rank;
+    uint64_t local_index;
+    uint64_t size;
+    char* relpath;
+    int src_owner_world;
+    int dst_owner_world;
+} nsync_large_copy_owner_record_t;
+
+static size_t nsync_large_copy_owner_record_pack_size(const nsync_action_record_t* action, uint64_t local_index)
+{
+    (void)local_index;
+    return 8 + 8 + 4 + strlen(action->relpath);
+}
+
+static size_t nsync_large_copy_owner_record_pack(
+    char* buf,
+    const nsync_action_record_t* action,
+    uint64_t local_index)
+{
+    uint32_t path_len = (uint32_t)strlen(action->relpath);
+    char* ptr = buf;
+    mfu_pack_uint64(&ptr, local_index);
+    mfu_pack_uint64(&ptr, action->size);
+    mfu_pack_uint32(&ptr, path_len);
+    memcpy(ptr, action->relpath, (size_t)path_len);
+    ptr += path_len;
+    return (size_t)(ptr - buf);
+}
+
+static int nsync_large_copy_owner_record_unpack(
+    const char** pptr,
+    const char* end,
+    nsync_large_copy_owner_record_t* rec,
+    int planner_rank)
+{
+    const char* ptr = *pptr;
+    if ((size_t)(end - ptr) < 20) {
+        return -1;
+    }
+
+    uint32_t path_len = 0;
+    mfu_unpack_uint64(&ptr, &rec->local_index);
+    mfu_unpack_uint64(&ptr, &rec->size);
+    mfu_unpack_uint32(&ptr, &path_len);
+    if ((size_t)(end - ptr) < (size_t)path_len) {
+        return -1;
+    }
+
+    rec->planner_rank = planner_rank;
+    rec->relpath = (char*)MFU_MALLOC((size_t)path_len + 1);
+    memcpy(rec->relpath, ptr, (size_t)path_len);
+    rec->relpath[path_len] = '\0';
+    ptr += path_len;
+    rec->src_owner_world = -1;
+    rec->dst_owner_world = -1;
+    *pptr = ptr;
+    return 0;
+}
+
+static size_t nsync_large_copy_owner_update_pack_size(void)
+{
+    return 8 + 4 + 4;
+}
+
+static size_t nsync_large_copy_owner_update_pack(char* buf, uint64_t local_index, int src_owner_world, int dst_owner_world)
+{
+    char* ptr = buf;
+    mfu_pack_uint64(&ptr, local_index);
+    mfu_pack_uint32(&ptr, (uint32_t)(src_owner_world + 1));
+    mfu_pack_uint32(&ptr, (uint32_t)(dst_owner_world + 1));
+    return (size_t)(ptr - buf);
+}
+
+static int nsync_large_copy_owner_update_unpack(
+    const char** pptr,
+    const char* end,
+    uint64_t* local_index,
+    int* src_owner_world,
+    int* dst_owner_world)
+{
+    const char* ptr = *pptr;
+    if ((size_t)(end - ptr) < nsync_large_copy_owner_update_pack_size()) {
+        return -1;
+    }
+
+    uint32_t src_u32 = 0;
+    uint32_t dst_u32 = 0;
+    mfu_unpack_uint64(&ptr, local_index);
+    mfu_unpack_uint32(&ptr, &src_u32);
+    mfu_unpack_uint32(&ptr, &dst_u32);
+    *src_owner_world = (int)src_u32 - 1;
+    *dst_owner_world = (int)dst_u32 - 1;
+    *pptr = ptr;
+    return 0;
+}
+
+static int nsync_large_copy_owner_record_sort(const void* a, const void* b)
+{
+    const nsync_large_copy_owner_record_t* aa = (const nsync_large_copy_owner_record_t*)a;
+    const nsync_large_copy_owner_record_t* bb = (const nsync_large_copy_owner_record_t*)b;
+    if (aa->size != bb->size) {
+        return (aa->size > bb->size) ? -1 : 1;
+    }
+    return strcmp(aa->relpath, bb->relpath);
+}
+
+static int nsync_large_copy_pick_min_loaded(const int* world_ranks, int count, const uint64_t* loads)
+{
+    int best = world_ranks[0];
+    uint64_t best_load = loads[best];
+    for (int i = 1; i < count; i++) {
+        int rank = world_ranks[i];
+        uint64_t load = loads[rank];
+        if (load < best_load || (load == best_load && rank < best)) {
+            best = rank;
+            best_load = load;
+        }
+    }
+    return best;
+}
+
+static int nsync_rebalance_large_copy_owners(
+    nsync_action_vec_t* planned_actions,
+    const nsync_role_info_t* role_info)
+{
+    int rank = 0;
+    int ranks = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+
+    if (role_info->src_count <= 1 && role_info->dst_count <= 1)
+    {
+        return 0;
+    }
+
+    int local_error = 0;
+    int global_error = 0;
+    uint64_t threshold = nsync_copy_large_file_threshold();
+    uint64_t* local_src_bytes = (uint64_t*)calloc((size_t)ranks, sizeof(uint64_t));
+    uint64_t* local_dst_bytes = (uint64_t*)calloc((size_t)ranks, sizeof(uint64_t));
+    uint64_t* global_src_bytes = (uint64_t*)calloc((size_t)ranks, sizeof(uint64_t));
+    uint64_t* global_dst_bytes = (uint64_t*)calloc((size_t)ranks, sizeof(uint64_t));
+    if (local_src_bytes == NULL || local_dst_bytes == NULL || global_src_bytes == NULL || global_dst_bytes == NULL) {
+        local_error = 1;
+    }
+
+    MPI_Allreduce(&local_error, &global_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (global_error != 0) {
+        free(local_src_bytes);
+        free(local_dst_bytes);
+        free(global_src_bytes);
+        free(global_dst_bytes);
+        return -1;
+    }
+
+    size_t local_large_bytes = 0;
+    for (uint64_t i = 0; i < planned_actions->size; i++) {
+        nsync_action_record_t* action = &planned_actions->records[i];
+        if (action->type != NSYNC_ACTION_COPY) {
+            continue;
+        }
+
+        int large_file = (action->size >= threshold) &&
+            (role_info->src_count > 1 || role_info->dst_count > 1);
+        if (large_file) {
+            size_t record_bytes = nsync_large_copy_owner_record_pack_size(action, i);
+            if (SIZE_MAX - local_large_bytes < record_bytes) {
+                local_error = 1;
+                break;
+            }
+            local_large_bytes += record_bytes;
+        } else {
+            if (action->src_owner_world >= 0) {
+                local_src_bytes[action->src_owner_world] += action->size;
+            }
+            if (action->dst_owner_world >= 0) {
+                local_dst_bytes[action->dst_owner_world] += action->size;
+            }
+        }
+    }
+
+    if (local_large_bytes > (size_t)INT_MAX) {
+        local_error = 1;
+    }
+
+    MPI_Allreduce(&local_error, &global_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (global_error != 0) {
+        free(local_src_bytes);
+        free(local_dst_bytes);
+        free(global_src_bytes);
+        free(global_dst_bytes);
+        return -1;
+    }
+
+    MPI_Allreduce(local_src_bytes, global_src_bytes, ranks, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(local_dst_bytes, global_dst_bytes, ranks, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    free(local_src_bytes);
+    free(local_dst_bytes);
+
+    int local_send_bytes = (int)local_large_bytes;
+    char dummy = '\0';
+    char* packed = NULL;
+    if (local_send_bytes > 0) {
+        packed = (char*)MFU_MALLOC((size_t)local_send_bytes);
+        if (packed == NULL) {
+            local_error = 1;
+        } else {
+            char* ptr = packed;
+            for (uint64_t i = 0; i < planned_actions->size; i++) {
+                nsync_action_record_t* action = &planned_actions->records[i];
+                if (action->type == NSYNC_ACTION_COPY &&
+                    action->size >= threshold &&
+                    (role_info->src_count > 1 || role_info->dst_count > 1))
+                {
+                    ptr += nsync_large_copy_owner_record_pack(ptr, action, i);
+                }
+            }
+        }
+    }
+
+    MPI_Allreduce(&local_error, &global_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (global_error != 0) {
+        mfu_free(&packed);
+        free(global_src_bytes);
+        free(global_dst_bytes);
+        return -1;
+    }
+
+    int* recv_counts = NULL;
+    int* recv_displs = NULL;
+    char* recv_buf = NULL;
+    if (rank == 0) {
+        recv_counts = (int*)MFU_MALLOC((size_t)ranks * sizeof(int));
+        recv_displs = (int*)MFU_MALLOC((size_t)ranks * sizeof(int));
+        if (recv_counts == NULL || recv_displs == NULL) {
+            local_error = 1;
+        }
+    }
+
+    MPI_Allreduce(&local_error, &global_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (global_error != 0) {
+        mfu_free(&packed);
+        mfu_free(&recv_counts);
+        mfu_free(&recv_displs);
+        free(global_src_bytes);
+        free(global_dst_bytes);
+        return -1;
+    }
+
+    MPI_Gather(&local_send_bytes, 1, MPI_INT, recv_counts, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    int root_error = 0;
+    if (rank == 0) {
+        int total_recv = 0;
+        for (int i = 0; i < ranks; i++) {
+            recv_displs[i] = total_recv;
+            total_recv += recv_counts[i];
+        }
+        recv_buf = (char*)MFU_MALLOC((size_t)(total_recv > 0 ? total_recv : 1));
+        if (recv_buf == NULL) {
+            root_error = 1;
+        }
+    }
+
+    MPI_Bcast(&root_error, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (root_error != 0) {
+        mfu_free(&packed);
+        mfu_free(&recv_counts);
+        mfu_free(&recv_displs);
+        mfu_free(&recv_buf);
+        free(global_src_bytes);
+        free(global_dst_bytes);
+        return -1;
+    }
+
+    MPI_Gatherv(
+        (local_send_bytes > 0) ? packed : &dummy,
+        local_send_bytes,
+        MPI_BYTE,
+        recv_buf,
+        recv_counts,
+        recv_displs,
+        MPI_BYTE,
+        0,
+        MPI_COMM_WORLD);
+    mfu_free(&packed);
+
+    int* update_counts = NULL;
+    int* update_displs = NULL;
+    char* update_send_buf = NULL;
+    int local_update_bytes = 0;
+    if (rank == 0) {
+        nsync_large_copy_owner_record_t* records = NULL;
+        uint64_t record_count = 0;
+        uint64_t record_capacity = 0;
+        for (int planner_rank = 0; planner_rank < ranks && root_error == 0; planner_rank++) {
+            const char* ptr = recv_buf + recv_displs[planner_rank];
+            const char* end = ptr + recv_counts[planner_rank];
+            while (ptr < end) {
+                if (record_count == record_capacity) {
+                    uint64_t new_capacity = (record_capacity > 0) ? (record_capacity * 2) : 128;
+                    nsync_large_copy_owner_record_t* new_records =
+                        (nsync_large_copy_owner_record_t*)realloc(records, (size_t)new_capacity * sizeof(*records));
+                    if (new_records == NULL) {
+                        root_error = 1;
+                        break;
+                    }
+                    records = new_records;
+                    record_capacity = new_capacity;
+                }
+                if (nsync_large_copy_owner_record_unpack(&ptr, end, &records[record_count], planner_rank) != 0) {
+                    root_error = 1;
+                    break;
+                }
+                record_count++;
+            }
+        }
+
+        if (record_count > 1 && root_error == 0) {
+            qsort(records, (size_t)record_count, sizeof(*records), nsync_large_copy_owner_record_sort);
+        }
+
+        if (root_error == 0) {
+            update_counts = (int*)MFU_MALLOC((size_t)ranks * sizeof(int));
+            update_displs = (int*)MFU_MALLOC((size_t)ranks * sizeof(int));
+            if (update_counts == NULL || update_displs == NULL) {
+                root_error = 1;
+            }
+        }
+
+        if (root_error == 0) {
+            for (int i = 0; i < ranks; i++) {
+                update_counts[i] = 0;
+                update_displs[i] = 0;
+            }
+
+            for (uint64_t i = 0; i < record_count; i++) {
+                records[i].src_owner_world = (role_info->src_count > 1) ?
+                    nsync_large_copy_pick_min_loaded(role_info->src_world_ranks, role_info->src_count, global_src_bytes) :
+                    role_info->src_world_ranks[0];
+                records[i].dst_owner_world = (role_info->dst_count > 1) ?
+                    nsync_large_copy_pick_min_loaded(role_info->dst_world_ranks, role_info->dst_count, global_dst_bytes) :
+                    role_info->dst_world_ranks[0];
+
+                global_src_bytes[records[i].src_owner_world] += records[i].size;
+                global_dst_bytes[records[i].dst_owner_world] += records[i].size;
+                update_counts[records[i].planner_rank] += (int)nsync_large_copy_owner_update_pack_size();
+            }
+
+            int total_update_bytes = 0;
+            for (int i = 0; i < ranks; i++) {
+                update_displs[i] = total_update_bytes;
+                total_update_bytes += update_counts[i];
+            }
+
+            update_send_buf = (char*)MFU_MALLOC((size_t)(total_update_bytes > 0 ? total_update_bytes : 1));
+            int* update_offsets = (int*)MFU_MALLOC((size_t)ranks * sizeof(int));
+            if (update_send_buf == NULL || update_offsets == NULL) {
+                root_error = 1;
+                mfu_free(&update_offsets);
+            } else {
+                memcpy(update_offsets, update_displs, (size_t)ranks * sizeof(int));
+                for (uint64_t i = 0; i < record_count; i++) {
+                    int planner_rank = records[i].planner_rank;
+                    int offset = update_offsets[planner_rank];
+                    offset += (int)nsync_large_copy_owner_update_pack(
+                        update_send_buf + offset,
+                        records[i].local_index,
+                        records[i].src_owner_world,
+                        records[i].dst_owner_world);
+                    update_offsets[planner_rank] = offset;
+                }
+                mfu_free(&update_offsets);
+                local_update_bytes = update_counts[0];
+            }
+        }
+
+        for (uint64_t i = 0; i < record_count; i++) {
+            mfu_free(&records[i].relpath);
+        }
+        free(records);
+    }
+
+    MPI_Bcast(&root_error, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (root_error != 0) {
+        mfu_free(&recv_counts);
+        mfu_free(&recv_displs);
+        mfu_free(&recv_buf);
+        mfu_free(&update_counts);
+        mfu_free(&update_displs);
+        mfu_free(&update_send_buf);
+        free(global_src_bytes);
+        free(global_dst_bytes);
+        return -1;
+    }
+
+    MPI_Scatter(update_counts, 1, MPI_INT, &local_update_bytes, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    char* local_update_buf = (char*)MFU_MALLOC((size_t)(local_update_bytes > 0 ? local_update_bytes : 1));
+    local_error = (local_update_buf == NULL) ? 1 : 0;
+    MPI_Allreduce(&local_error, &global_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (global_error != 0) {
+        mfu_free(&local_update_buf);
+        mfu_free(&recv_counts);
+        mfu_free(&recv_displs);
+        mfu_free(&recv_buf);
+        mfu_free(&update_counts);
+        mfu_free(&update_displs);
+        mfu_free(&update_send_buf);
+        free(global_src_bytes);
+        free(global_dst_bytes);
+        return -1;
+    }
+
+    MPI_Scatterv(
+        update_send_buf,
+        update_counts,
+        update_displs,
+        MPI_BYTE,
+        local_update_buf,
+        local_update_bytes,
+        MPI_BYTE,
+        0,
+        MPI_COMM_WORLD);
+
+    const char* update_ptr = local_update_buf;
+    const char* update_end = local_update_buf + local_update_bytes;
+    while (update_ptr < update_end) {
+        uint64_t local_index = 0;
+        int src_owner_world = -1;
+        int dst_owner_world = -1;
+        if (nsync_large_copy_owner_update_unpack(
+                &update_ptr, update_end, &local_index, &src_owner_world, &dst_owner_world) != 0 ||
+            local_index >= planned_actions->size)
+        {
+            local_error = 1;
+            break;
+        }
+
+        planned_actions->records[local_index].src_owner_world = src_owner_world;
+        planned_actions->records[local_index].dst_owner_world = dst_owner_world;
+    }
+
+    MPI_Allreduce(&local_error, &global_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
+    mfu_free(&local_update_buf);
+    mfu_free(&recv_counts);
+    mfu_free(&recv_displs);
+    mfu_free(&recv_buf);
+    mfu_free(&update_counts);
+    mfu_free(&update_displs);
+    mfu_free(&update_send_buf);
+    free(global_src_bytes);
+    free(global_dst_bytes);
+    return (global_error == 0) ? 0 : -1;
+}
+
 static int nsync_meta_identity_diff(const nsync_meta_record_t* src, const nsync_meta_record_t* dst)
 {
     if (src->mode != dst->mode) {
@@ -5019,7 +6595,6 @@ int main(int argc, char** argv)
         .delete = 0,
         .contents = 0,
         .bufsize = MFU_BUFFER_SIZE,
-        .chunksize = MFU_CHUNK_SIZE,
         .role_mode = NSYNC_ROLE_MODE_AUTO,
         .role_map = NULL,
         .trace = 0,
@@ -5044,7 +6619,6 @@ int main(int argc, char** argv)
         {"delete", 0, 0, 'D'},
         {"contents", 0, 0, 'c'},
         {"bufsize", 1, 0, 'B'},
-        {"chunksize", 1, 0, 'k'},
         {"imbalance-threshold", 1, 0, 1003},
         {"role-mode", 1, 0, 1000},
         {"role-map", 1, 0, 1001},
@@ -5055,7 +6629,7 @@ int main(int argc, char** argv)
     };
 
     while (1) {
-        int c = getopt_long(argc, argv, "b:DcnB:k:qh", long_options, &option_index);
+        int c = getopt_long(argc, argv, "b:DcnB:qh", long_options, &option_index);
         if (c == -1) {
             break;
         }
@@ -5088,16 +6662,6 @@ int main(int argc, char** argv)
                 usage = 1;
             } else {
                 opts.bufsize = (uint64_t)bytes;
-            }
-            break;
-        case 'k':
-            if (mfu_abtoull(optarg, &bytes) != MFU_SUCCESS || bytes == 0) {
-                if (rank == opts.log_rank) {
-                    MFU_LOG(MFU_LOG_ERR, "Failed to parse --chunksize: %s", optarg);
-                }
-                usage = 1;
-            } else {
-                opts.chunksize = (uint64_t)bytes;
             }
             break;
         case 1000:
@@ -5388,12 +6952,6 @@ int main(int argc, char** argv)
         {
             local_plan_error = 1;
         }
-        nsync_trace_local(&opts, "main-post-plan-local", planned_actions.size, (uint64_t)local_plan_error);
-        nsync_batch_monitor_skew(&opts, batch_id, batch_count, "planned-actions", planned_actions.size);
-        local_batch_actions = nsync_action_counts_total_actions(&batch_action_counts);
-        local_batch_copy_files = batch_action_counts.copy;
-        local_batch_copy_bytes = nsync_action_vec_copy_bytes(&planned_actions);
-
         int global_plan_error = 0;
         MPI_Allreduce(&local_plan_error, &global_plan_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
         if (global_plan_error != 0) {
@@ -5411,6 +6969,32 @@ int main(int argc, char** argv)
             rc = 1;
             goto cleanup;
         }
+
+        if (nsync_rebalance_large_copy_owners(&planned_actions, &role_info) != 0) {
+            local_plan_error = 1;
+        }
+        MPI_Allreduce(&local_plan_error, &global_plan_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        if (global_plan_error != 0) {
+            if (rank == opts.log_rank) {
+                MFU_LOG(MFU_LOG_ERR, "Failed to rebalance large copy ownership in batch %" PRIu64, batch_id);
+            }
+            nsync_action_vec_free(&dst_exec_actions);
+            nsync_action_vec_free(&src_exec_actions);
+            nsync_action_vec_free(&planned_actions);
+            nsync_meta_vec_free(&planner_meta);
+            nsync_meta_vec_free(&local_meta);
+            nsync_role_info_free(&role_info);
+            nsync_action_vec_free(&deferred_dir_removes);
+            nsync_action_vec_free(&deferred_dir_meta_updates);
+            rc = 1;
+            goto cleanup;
+        }
+
+        nsync_trace_local(&opts, "main-post-plan-local", planned_actions.size, 0);
+        nsync_batch_monitor_skew(&opts, batch_id, batch_count, "planned-actions", planned_actions.size);
+        local_batch_actions = nsync_action_counts_total_actions(&batch_action_counts);
+        local_batch_copy_files = batch_action_counts.copy;
+        local_batch_copy_bytes = nsync_action_vec_copy_bytes(&planned_actions);
 
         nsync_compare_counts_add(&local_counts_total, &batch_counts);
         nsync_action_counts_add(&local_action_counts_total, &batch_action_counts);

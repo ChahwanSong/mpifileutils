@@ -120,12 +120,13 @@
 
 `nsync.c`의 copy 메시지 태그:
 
-- `NSYNC_MSG_COPY_REQ` (4100): destination -> source, relpath 요청
-- `NSYNC_MSG_COPY_RESP` (4101): source -> destination, open 결과(status)
-- `NSYNC_MSG_COPY_DATA_LEN` (4102): source -> destination, chunk 크기
-- `NSYNC_MSG_COPY_DATA` (4103): source -> destination, chunk payload
+- `NSYNC_MSG_COPY_REQ` (4100): destination -> source, `file_id + relpath` 요청
+- `NSYNC_MSG_COPY_RESP` (4101): source -> destination, `file_id + open/status` 응답
+- `NSYNC_MSG_COPY_DATA_LEN` (4102): source -> destination, framed 데이터 메시지
 
-종료 조건은 `chunk_len == 0`입니다.
+데이터 프레임은 `file_id`, `offset`, `payload length`, `logical length`, `flags`를 담고,
+`flags`로 EOF/HOLE/ERROR를 구분합니다. 큰 파일은 한 source/destination pair 안에서
+nonblocking MPI + double-buffer pipeline으로 읽기/전송/쓰기 오버랩이 가능합니다.
 
 ## 6) 옵션 설명
 
@@ -136,7 +137,6 @@
 | `-D, --delete` | destination 초과 파일 삭제 | `only-dst` 경로에 `REMOVE` 생성 |
 | `-c, --contents` | 파일 내용 비교 | SHA256 digest 계산/비교 |
 | `--bufsize SIZE` | I/O 버퍼 크기 | copy/digest read chunk 크기 |
-| `--chunksize SIZE` | 최소 작업 크기 | 내부 chunk 정책 기준값 |
 | `--imbalance-threshold R` | batch imbalance ratio 임계값 | 진단 경고 출력 기준, 기본값 `3.0` |
 | `--role-mode auto|map` | 역할 결정 방식 | 자동 탐지 또는 명시 맵 |
 | `--role-map SPEC` | 역할 맵 | 예: `0-1:src,2-3:dst` |
