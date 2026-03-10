@@ -26,6 +26,20 @@
 - 실제 파일 데이터는 `src -> dst`로 MPI 스트리밍 복사
 - 대규모 트리에서 메모리 상한을 두는 배치 모드(`--batch-files`)
 
+### 2.1 이번 업데이트의 핵심 포인트
+
+- `--chunksize` 제거
+  - `nsync`는 file chunk ownership 기반 도구가 아니므로, 사용자 옵션으로 보이는 `--chunksize`를 제거했습니다.
+- copy path 고도화
+  - 기존의 단순 `length + payload` blocking 복사 대신, framed protocol + nonblocking MPI + buffer reuse 기반 pipeline으로 변경했습니다.
+- sparse file 보존
+  - `SEEK_DATA/SEEK_HOLE` 우선, 필요 시 보수적인 zero-hole fallback으로 hole을 유지합니다.
+- 큰 파일 owner 재배치
+  - planner가 만든 large copy action은 relpath hash만 따르지 않고 byte load를 보고 source/destination owner를 다시 배정합니다.
+- source-side credits 추가
+  - source rank는 request queue를 두고, destination rank들에 대해 file-level in-flight를 제한/스케줄합니다.
+  - 단, 같은 source/destination pair는 의도적으로 직렬화하여 deadlock과 random I/O를 피합니다.
+
 ## 3) 아키텍처
 
 아키텍처는 크게 5개 평면으로 나뉩니다.
@@ -46,6 +60,7 @@
 
 - 경로 단위로 `COPY`, `MKDIR`, `REMOVE`, `SYMLINK_UPDATE`, `META_UPDATE` 액션 생성
 - 각 경로에 대해 `src_owner_world`, `dst_owner_world`를 미리 계산해 실행 경로 확정
+- large file(`COPY`)는 planner 직후 별도 rebalance pass를 통해 byte-aware owner 재배치 가능
 
 ### 3.4 Execution Plane
 
@@ -53,6 +68,8 @@
   - source 측: copy serve 담당 액션
   - destination 측: 실제 적용 액션
 - copy는 destination이 요청하는 pull 기반 프로토콜
+- source는 요청을 queue한 뒤 source-side credit과 destination rank별 활성 상태를 보고 전송 시작
+- destination은 copy 파일들을 크기 내림차순으로 launch하여 큰 파일 head-of-line을 줄임
 
 ### 3.5 Batch/Spool Plane
 
@@ -89,10 +106,13 @@
 ### 4.4 실행 단계 (Phase 4/5 구현)
 
 1. planner 액션 재분배 (`nsync_actions_redistribute`)
-2. source rank는 요청을 받아 파일을 읽어 chunk 전송
-3. destination rank는 파일 생성/쓰기/메타 적용
-4. 삭제/디렉토리/링크/메타 업데이트를 타입별 순서로 적용
-5. 배치 모드에서는 디렉토리 remove/meta를 deferred 리스트에 모아 final pass에서 정리
+2. large copy action이 있으면 `nsync_rebalance_large_copy_owners()`로 source/destination owner를 재조정
+3. destination rank는 `COPY` 액션을 분리해 큰 파일부터 launch
+4. source rank는 요청을 queue하고 source-side credit 안에서 파일 전송 시작
+5. 파일 데이터는 `file_id + offset + payload/logical length + flags` 프레임으로 송수신
+6. destination rank는 `pwrite()` 기반으로 offset write, sparse hole frame은 실제 write 없이 건너뜀
+7. 삭제/디렉토리/링크/메타 업데이트를 타입별 순서로 적용
+8. 배치 모드에서는 디렉토리 remove/meta를 deferred 리스트에 모아 final pass에서 정리
 
 ### 4.5 배치 처리
 
@@ -124,9 +144,50 @@
 - `NSYNC_MSG_COPY_RESP` (4101): source -> destination, `file_id + open/status` 응답
 - `NSYNC_MSG_COPY_DATA_LEN` (4102): source -> destination, framed 데이터 메시지
 
-데이터 프레임은 `file_id`, `offset`, `payload length`, `logical length`, `flags`를 담고,
-`flags`로 EOF/HOLE/ERROR를 구분합니다. 큰 파일은 한 source/destination pair 안에서
-nonblocking MPI + double-buffer pipeline으로 읽기/전송/쓰기 오버랩이 가능합니다.
+데이터 프레임은 다음 필드를 가집니다.
+
+- `file_id`
+- `offset`
+- `payload length`
+- `logical length`
+- `flags`
+
+`flags`는 `EOF/HOLE/ERROR`를 표현합니다.
+
+- data frame:
+  `payload length == logical length`
+- hole frame:
+  `payload length == 0`, `logical length > 0`
+- end frame:
+  `payload length == 0`, `logical length == 0`, `EOF`
+
+복사 경로는 nonblocking MPI + double-buffer pipeline으로 읽기/전송/쓰기 오버랩이 가능하고,
+destination은 `pwrite()`로 offset write를 수행합니다.
+
+### 5.3 sparse file 처리
+
+- source:
+  `SEEK_DATA/SEEK_HOLE`를 우선 사용해 실제 data extent와 hole extent를 구분
+- fallback:
+  source 파일이 실제 sparse로 보일 때만 zero-filled chunk를 hole frame으로 대체
+- destination:
+  먼저 최종 크기로 `ftruncate()`한 뒤 hole frame은 write 없이 유지
+
+즉, logical size는 유지하면서 destination에서 hole이 materialize되지 않도록 설계했습니다.
+
+### 5.4 large file owner rebalance
+
+- 기본 planner owner는 relpath hash 기반입니다.
+- 단, 큰 `COPY` 액션은 planner 직후 다시 수집해 source/destination별 누적 byte load를 기준으로 greedy 재배치합니다.
+- 기본 threshold는 `64 MiB`이고, `NSYNC_LARGE_FILE_THRESHOLD` 환경변수로 override할 수 있습니다.
+
+### 5.5 credit 모델
+
+- source rank는 request를 바로 모두 시작하지 않고 queue합니다.
+- 동시에 active 상태가 될 수 있는 file transfer 수는 source-side credit으로 제한됩니다.
+- 기본 credit은 `2`이고, `NSYNC_COPY_FILE_CREDITS` 환경변수로 override할 수 있습니다.
+- 같은 source/destination pair에는 동시에 하나의 file transfer만 허용합니다.
+  - 이 제약은 same-pair deadlock과 random I/O 증가를 막기 위한 의도적 선택입니다.
 
 ## 6) 옵션 설명
 
@@ -145,6 +206,11 @@ nonblocking MPI + double-buffer pipeline으로 읽기/전송/쓰기 오버랩이
 | `-h` | 도움말 | 사용법 출력 |
 
 진행 로그는 launcher-console 로그 rank에서 **batch 완료 시마다 항상 출력**됩니다 (`-q` 제외).
+
+참고:
+
+- `nsync`는 더 이상 `--chunksize`를 지원하지 않습니다.
+- large-file / credit 동작은 현재 환경변수(`NSYNC_LARGE_FILE_THRESHOLD`, `NSYNC_COPY_FILE_CREDITS`)로만 조정됩니다.
 
 ## 7) 실행 예제
 
@@ -217,6 +283,8 @@ mpirun -np 2 nsync \
 1. 초기에는 `--dryrun`으로 diff/액션 확인
 2. 대용량은 `--batch-files` 사용
 3. 필요 시 `--trace`로 collective 단계 추적
+4. 큰 파일 편중이 의심되면 `NSYNC_LARGE_FILE_THRESHOLD`를 조정해 owner rebalance 범위를 검증
+5. source 병렬 파일 수를 조정해야 하면 `NSYNC_COPY_FILE_CREDITS`를 사용
 
 ### 8.3 실행 후
 
@@ -246,6 +314,16 @@ mpirun -np 2 nsync \
 - `--batch-files` 값을 너무 작게 잡으면 batch 수가 커지고 메타 오버헤드가 증가
 - imbalance 경고가 많으면 `--batch-files`를 일방적으로 키우기보다 값을 조정해 batch-to-rank 분포를 확인하는 것이 안전
 
+### 9.5 `--chunksize`가 사라진 이유
+
+- `nsync`는 `dsync`처럼 file chunk를 여러 rank가 직접 나눠 쓰는 구조가 아닙니다.
+- 현재 성능 개선은 chunk ownership이 아니라
+  - file-level pipeline
+  - sparse-aware framed transfer
+  - large-file owner rebalance
+  - source-side credits
+  에서 가져갑니다.
+
 ## 10) 현재 구현 범위와 한계
 
 - 구현됨
@@ -254,10 +332,35 @@ mpirun -np 2 nsync \
   - `--dryrun`, `--delete`, `--contents`
   - `--batch-files` + metadata spool
   - deferred directory finalize
+  - sparse file preservation
+  - large-file size-aware owner rebalance
+  - nonblocking per-file pipeline
+  - source-side credit / request queue
 
 - 현재 한계
+  - `dsync`식 file chunk parallelization은 미구현
+  - 같은 source/destination pair 내부에서는 file transfer를 직렬화
+  - large-file rebalance는 greedy byte balancing이며, topology-aware/network-aware scheduling은 아직 없음
   - extreme hash skew에 대한 자동 adaptive split(2차 해시 분할)은 미구현
 
----
+## 11) 기존 대비 무엇이 바뀌었나
 
-필요하면 다음 단계로 `nsync.md`에 **운영 체크리스트(사전 점검표/장애시 조치표)**를 추가해 runbook 형태로 더 강화할 수 있습니다.
+기존 구현 기준:
+
+- `COPY`는 사실상 file-level blocking stream
+- sparse file이 destination에서 materialize될 수 있음
+- large file owner는 relpath hash에만 의존
+- source rank는 요청을 바로 시작하는 단순 serve loop
+- 사용자 입장에서는 `--chunksize` 옵션이 보였지만 실제 설계 방향과 맞지 않았음
+
+업데이트 후:
+
+- `--chunksize` 제거
+- framed protocol + nonblocking MPI pipeline으로 copy path 변경
+- sparse hole preservation 추가
+- large `COPY` 액션에 size-aware owner rebalance 추가
+- source-side request queue / credit 도입
+- 같은 source/destination pair는 안전하게 직렬화, 여러 destination rank에 대해서는 file-level overlap 허용
+
+즉, `nsync`는 여전히 split-mount 철학을 유지하면서도, 큰 파일과 많은 파일 workload에서
+`dsync`의 chunk 분할 없이 더 높은 처리량과 더 안정적인 동작을 목표로 업데이트됐습니다.
