@@ -201,8 +201,8 @@ typedef struct {
 } nsync_progress_state_t;
 
 enum {
-    NSYNC_COPY_PIPELINE_DEPTH = 2,
-    NSYNC_COPY_FILE_CREDITS = 2,
+    NSYNC_COPY_PIPELINE_DEPTH = 4,
+    NSYNC_COPY_FILE_CREDITS = 8,
 };
 
 enum {
