@@ -36,6 +36,14 @@ OPTIONS
    Compare regular file contents with SHA256 digest. Without this option,
    regular files are compared by size and mtime.
 
+.. option:: -s, --direct
+
+   Open files with ``O_DIRECT`` for data transfer and content digest reads.
+
+.. option:: --open-noatime
+
+   Open files with ``O_NOATIME`` where supported.
+
 .. option:: --bufsize SIZE
 
    Set I/O and digest buffer size in bytes.

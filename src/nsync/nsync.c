@@ -64,6 +64,8 @@ typedef struct {
     int delete;
     int contents;
     uint64_t bufsize;
+    int direct;
+    int open_noatime;
     nsync_role_mode_t role_mode;
     const char* role_map;
     int trace;
@@ -295,6 +297,8 @@ static void nsync_usage(void)
     printf("  -b, --batch-files <N>      - process entries in batches of approximately N items\n");
     printf("  -D, --delete               - delete extraneous files from target\n");
     printf("  -c, --contents             - compare file contents instead of size+mtime\n");
+    printf("  -s, --direct               - open files with O_DIRECT\n");
+    printf("      --open-noatime         - open files with O_NOATIME\n");
     printf("      --bufsize <SIZE>       - I/O buffer size in bytes (default " MFU_BUFFER_SIZE_STR ")\n");
     printf("      --imbalance-threshold <R>\n");
     printf("                             - batch imbalance ratio threshold (default 3.0)\n");
@@ -1677,12 +1681,45 @@ static size_t nsync_effective_bufsize(uint64_t requested)
     return bufsize;
 }
 
+static int nsync_open_readonly(const char* path, const nsync_options_t* opts)
+{
+    int flags = O_RDONLY;
+    if (opts->open_noatime) {
+#ifdef O_NOATIME
+        flags |= O_NOATIME;
+#endif
+    }
+    if (opts->direct) {
+#ifdef O_DIRECT
+        flags |= O_DIRECT;
+#endif
+    }
+    return open(path, flags);
+}
+
+static int nsync_open_writeonly_create_trunc(const char* path, mode_t mode, const nsync_options_t* opts)
+{
+    int flags = O_WRONLY | O_CREAT | O_TRUNC;
+    if (opts->open_noatime) {
+#ifdef O_NOATIME
+        flags |= O_NOATIME;
+#endif
+    }
+    if (opts->direct) {
+#ifdef O_DIRECT
+        flags |= O_DIRECT;
+#endif
+    }
+    return open(path, flags, mode);
+}
+
 static int nsync_compute_sha256_file(
     const char* fullpath,
     size_t bufsize,
+    const nsync_options_t* opts,
     unsigned char digest[SHA256_DIGEST_LENGTH])
 {
-    int fd = open(fullpath, O_RDONLY);
+    int fd = nsync_open_readonly(fullpath, opts);
     if (fd < 0) {
         return -1;
     }
@@ -1939,7 +1976,7 @@ static int nsync_scan_emit_path(
             memcpy(rec.digest, NSYNC_SHA256_EMPTY, SHA256_DIGEST_LENGTH);
             rec.digest_valid = 1;
         } else {
-            if (nsync_compute_sha256_file(fullpath, digest_bufsize, rec.digest) == 0) {
+            if (nsync_compute_sha256_file(fullpath, digest_bufsize, opts, rec.digest) == 0) {
                 rec.digest_valid = 1;
             } else {
                 (*scan_errors)++;
@@ -4194,7 +4231,7 @@ static int nsync_source_transfer_init(
     transfer->file_size = action->size;
 
     char* src_fullpath = nsync_build_full_path(src_root, action->relpath);
-    transfer->fd = open(src_fullpath, O_RDONLY);
+    transfer->fd = nsync_open_readonly(src_fullpath, opts);
     mfu_free(&src_fullpath);
     if (transfer->fd < 0) {
         return errno;
@@ -4757,6 +4794,7 @@ static int nsync_destination_start_copy_transfer(
     const nsync_action_record_t* action,
     uint64_t file_id,
     nsync_destination_transfer_t* transfer,
+    const nsync_options_t* opts,
     int* local_errors)
 {
     memset(transfer, 0, sizeof(*transfer));
@@ -4778,7 +4816,7 @@ static int nsync_destination_start_copy_transfer(
     }
 
     if (!transfer->open_error) {
-        transfer->fd = open(transfer->dst_fullpath, O_WRONLY | O_CREAT | O_TRUNC, mode);
+        transfer->fd = nsync_open_writeonly_create_trunc(transfer->dst_fullpath, mode, opts);
         if (transfer->fd < 0) {
             (*local_errors)++;
             transfer->open_error = 1;
@@ -5041,7 +5079,7 @@ static void nsync_destination_execute_copy_actions(
             }
 
             if (nsync_destination_start_copy_transfer(
-                    dst_root, action, next_file_id, &transfers[i], local_errors) != 0)
+                    dst_root, action, next_file_id, &transfers[i], opts, local_errors) != 0)
             {
                 (*local_errors)++;
                 continue;
@@ -6595,6 +6633,8 @@ int main(int argc, char** argv)
         .delete = 0,
         .contents = 0,
         .bufsize = MFU_BUFFER_SIZE,
+        .direct = 0,
+        .open_noatime = 0,
         .role_mode = NSYNC_ROLE_MODE_AUTO,
         .role_map = NULL,
         .trace = 0,
@@ -6618,6 +6658,8 @@ int main(int argc, char** argv)
         {"batch-files", 1, 0, 'b'},
         {"delete", 0, 0, 'D'},
         {"contents", 0, 0, 'c'},
+        {"direct", 0, 0, 's'},
+        {"open-noatime", 0, 0, 'U'},
         {"bufsize", 1, 0, 'B'},
         {"imbalance-threshold", 1, 0, 1003},
         {"role-mode", 1, 0, 1000},
@@ -6629,7 +6671,7 @@ int main(int argc, char** argv)
     };
 
     while (1) {
-        int c = getopt_long(argc, argv, "b:DcnB:qh", long_options, &option_index);
+        int c = getopt_long(argc, argv, "b:DcnsUB:qh", long_options, &option_index);
         if (c == -1) {
             break;
         }
@@ -6643,6 +6685,18 @@ int main(int argc, char** argv)
             break;
         case 'n':
             opts.dryrun = 1;
+            break;
+        case 's':
+            opts.direct = 1;
+            if (rank == opts.log_rank) {
+                MFU_LOG(MFU_LOG_INFO, "Using O_DIRECT");
+            }
+            break;
+        case 'U':
+            opts.open_noatime = 1;
+            if (rank == opts.log_rank) {
+                MFU_LOG(MFU_LOG_INFO, "Using O_NOATIME");
+            }
             break;
         case 'b':
             if (mfu_abtoull(optarg, &bytes) != MFU_SUCCESS || bytes == 0) {
