@@ -31,6 +31,13 @@ Print usage and exit.
 .PP
 Any option not listed above is passed directly to
 .BR dsync .
+.PP
+ldsync parses wrapper options only before
+.B -- .
+Use
+.B --
+to pass remaining arguments directly to
+.BR dsync .
 .SH EXAMPLES
 .TP
 Use default one-hop source symlink follow:
@@ -41,6 +48,9 @@ Follow source symlink chain up to 3 hops:
 .TP
 Disable source symlink dereference:
 .B ldsync -N 0 /src-link /backup
+.TP
+Show dsync help through ldsync:
+.B ldsync -- --help
 .SH SEE ALSO
 .BR dsync (1),
 .BR mpifileutils (1)

@@ -13,16 +13,24 @@
 
 static void print_usage(void)
 {
-    printf("Usage: ldsync [dsync-options] [--source-link-depth N|-N N] SRC DEST\n");
+    printf("Usage: ldsync [dsync-options] [ldsync-options] SRC DEST\n");
     printf("\n");
     printf("ldsync resolves the source path symbolic link chain up to N hops before\n");
-    printf("executing dsync with the resulting path. Default N is 1.\n");
+    printf("executing dsync with the resulting source path. Default N is 1.\n");
     printf("\n");
-    printf("Options added by ldsync:\n");
+    printf("ldsync options:\n");
     printf("  -N, --source-link-depth N  Follow source symlink at most N times (default: 1)\n");
     printf("  -h, --help                 Print this usage and exit\n");
     printf("\n");
-    printf("All other options are passed through to dsync unchanged.\n");
+    printf("Notes:\n");
+    printf("  - ldsync parses its own options only before '--'.\n");
+    printf("  - Use '--' to force remaining args to dsync unchanged.\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  ldsync /src-link /dest\n");
+    printf("  ldsync -N 3 /src-link /dest\n");
+    printf("  ldsync --source-link-depth=0 /src-link /dest\n");
+    printf("  ldsync -- --help\n");
 }
 
 static int parse_nonnegative_int(const char* value, int* out)
@@ -181,6 +189,102 @@ static char* resolve_source_path(const char* src, int max_depth)
     return current;
 }
 
+static int parse_wrapper_options(
+    int argc,
+    char** argv,
+    int* max_depth,
+    bool* skip_arg,
+    int* src_index,
+    int* dst_index)
+{
+    bool parse_wrapper = true;
+
+    for (int i = 1; i < argc; i++) {
+        const char* arg = argv[i];
+
+        if (parse_wrapper) {
+            if (strcmp(arg, "--") == 0) {
+                parse_wrapper = false;
+                continue;
+            }
+
+            if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+                print_usage();
+                return 1;
+            }
+
+            if (strcmp(arg, "-N") == 0 || strcmp(arg, "--source-link-depth") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "ldsync: missing value for %s\n", arg);
+                    return -1;
+                }
+                skip_arg[i] = true;
+                skip_arg[i + 1] = true;
+
+                if (parse_nonnegative_int(argv[++i], max_depth) != 0) {
+                    fprintf(stderr, "ldsync: invalid non-negative integer for %s: %s\n", arg, argv[i]);
+                    return -1;
+                }
+                continue;
+            }
+
+            if (strncmp(arg, "--source-link-depth=", 20) == 0) {
+                skip_arg[i] = true;
+                if (parse_nonnegative_int(arg + 20, max_depth) != 0) {
+                    fprintf(stderr, "ldsync: invalid non-negative integer for --source-link-depth: %s\n", arg + 20);
+                    return -1;
+                }
+                continue;
+            }
+
+            if (strncmp(arg, "-N", 2) == 0 && arg[2] != '\0') {
+                skip_arg[i] = true;
+                if (parse_nonnegative_int(arg + 2, max_depth) != 0) {
+                    fprintf(stderr, "ldsync: invalid non-negative integer for -N: %s\n", arg + 2);
+                    return -1;
+                }
+                continue;
+            }
+        }
+    }
+
+    *src_index = -1;
+    *dst_index = -1;
+    for (int i = argc - 1; i >= 1; i--) {
+        if (skip_arg[i]) {
+            continue;
+        }
+        if (strcmp(argv[i], "--") == 0) {
+            continue;
+        }
+
+        if (*dst_index < 0) {
+            *dst_index = i;
+            continue;
+        }
+
+        *src_index = i;
+        break;
+    }
+
+    if (*src_index < 0 || *dst_index < 0) {
+        for (int i = 1; i < argc; i++) {
+            if (skip_arg[i]) {
+                continue;
+            }
+            if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+                *src_index = -1;
+                *dst_index = -1;
+                return 0;
+            }
+        }
+        fprintf(stderr, "ldsync: SRC and DEST are required\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -189,90 +293,55 @@ int main(int argc, char** argv)
     }
 
     int max_depth = 1;
-
-    for (int i = 1; i < argc; i++) {
-        const char* arg = argv[i];
-
-        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
-            print_usage();
-            return 0;
-        }
-
-        if (strcmp(arg, "-N") == 0 || strcmp(arg, "--source-link-depth") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "ldsync: missing value for %s\n", arg);
-                return 1;
-            }
-
-            if (parse_nonnegative_int(argv[++i], &max_depth) != 0) {
-                fprintf(stderr, "ldsync: invalid non-negative integer for %s: %s\n", arg, argv[i]);
-                return 1;
-            }
-            continue;
-        }
-
-        if (strncmp(arg, "--source-link-depth=", 20) == 0) {
-            if (parse_nonnegative_int(arg + 20, &max_depth) != 0) {
-                fprintf(stderr, "ldsync: invalid non-negative integer for --source-link-depth: %s\n", arg + 20);
-                return 1;
-            }
-            continue;
-        }
-
-        if (strncmp(arg, "-N", 2) == 0 && arg[2] != '\0') {
-            if (parse_nonnegative_int(arg + 2, &max_depth) != 0) {
-                fprintf(stderr, "ldsync: invalid non-negative integer for -N: %s\n", arg + 2);
-                return 1;
-            }
-            continue;
-        }
+    int src_index = -1;
+    int dst_index = -1;
+    bool* skip_arg = (bool*) calloc((size_t) argc, sizeof(bool));
+    if (skip_arg == NULL) {
+        fprintf(stderr, "ldsync: calloc failed (errno=%d %s)\n", errno, strerror(errno));
+        return 1;
     }
 
-    if (argc < 3) {
-        fprintf(stderr, "ldsync: SRC and DEST are required\n");
+    int parse_rc = parse_wrapper_options(argc, argv, &max_depth, skip_arg, &src_index, &dst_index);
+    if (parse_rc > 0) {
+        free(skip_arg);
+        return 0;
+    }
+    if (parse_rc < 0) {
         print_usage();
+        free(skip_arg);
         return 1;
     }
 
-    int src_index = argc - 2;
-
-    char* resolved_src = resolve_source_path(argv[src_index], max_depth);
-    if (resolved_src == NULL) {
-        return 1;
+    char* resolved_src = NULL;
+    if (src_index >= 0) {
+        resolved_src = resolve_source_path(argv[src_index], max_depth);
+        if (resolved_src == NULL) {
+            free(skip_arg);
+            return 1;
+        }
     }
 
-    char** pass_argv = (char**) calloc((size_t)argc + 2, sizeof(char*));
+    char** pass_argv = (char**) calloc((size_t)argc + 1, sizeof(char*));
     if (pass_argv == NULL) {
         fprintf(stderr, "ldsync: calloc failed (errno=%d %s)\n", errno, strerror(errno));
+        free(skip_arg);
         free(resolved_src);
         return 1;
     }
 
     int out = 0;
-    pass_argv[out++] = (char*)"dsync";
+    pass_argv[out++] = (char*) "dsync";
 
     for (int i = 1; i < argc; i++) {
-        const char* arg = argv[i];
+        if (skip_arg[i]) {
+            continue;
+        }
 
-        if (i == src_index) {
+        if (i == src_index && resolved_src != NULL) {
             pass_argv[out++] = resolved_src;
-            continue;
+        } else {
+            pass_argv[out++] = argv[i];
         }
-
-        if (strcmp(arg, "-N") == 0 || strcmp(arg, "--source-link-depth") == 0) {
-            i++;
-            continue;
-        }
-
-        if (strncmp(arg, "--source-link-depth=", 20) == 0) {
-            continue;
-        }
-
-        if (strncmp(arg, "-N", 2) == 0 && arg[2] != '\0') {
-            continue;
-        }
-
-        pass_argv[out++] = argv[i];
     }
 
     pass_argv[out] = NULL;
@@ -280,6 +349,7 @@ int main(int argc, char** argv)
     execvp("dsync", pass_argv);
 
     fprintf(stderr, "ldsync: failed to execute dsync (errno=%d %s)\n", errno, strerror(errno));
+    free(skip_arg);
     free(pass_argv);
     free(resolved_src);
     return 1;
