@@ -13,6 +13,7 @@ LIST(APPEND man_pages
   drm.1
   dstripe.1
   dsync.1
+  ldsync.1
   nsync.1
   dtar.1
   dwalk.1

@@ -1,0 +1,46 @@
+.TH "LDSYNC" "1" "Apr 14, 2026" "0.12" "mpiFileUtils"
+.SH NAME
+ldsync \- synchronize directory trees with bounded source symlink dereference
+.SH SYNOPSIS
+.B ldsync [OPTION]... SRC DEST
+.SH DESCRIPTION
+.B ldsync
+is a thin wrapper around
+.BR dsync (1)
+that resolves the source path through symbolic links at most
+.I N
+hops before invoking
+.BR dsync .
+All other options and arguments are passed through unchanged.
+.PP
+This can be useful when the source argument itself is a symlink chain and one
+wants deterministic one-hop (or N-hop) dereference behavior.
+.SH OPTIONS
+.TP
+.BI "-N, --source-link-depth " N
+Follow the source path symlink chain for at most
+.I N
+hops before calling
+.BR dsync .
+.I N
+must be a non-negative integer. The default value is
+.BR 1 .
+.TP
+.B -h, --help
+Print usage and exit.
+.PP
+Any option not listed above is passed directly to
+.BR dsync .
+.SH EXAMPLES
+.TP
+Use default one-hop source symlink follow:
+.B ldsync /src-link /backup
+.TP
+Follow source symlink chain up to 3 hops:
+.B ldsync --source-link-depth 3 /src-link /backup
+.TP
+Disable source symlink dereference:
+.B ldsync -N 0 /src-link /backup
+.SH SEE ALSO
+.BR dsync (1),
+.BR mpifileutils (1)
