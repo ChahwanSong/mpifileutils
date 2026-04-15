@@ -63,6 +63,7 @@ typedef struct {
     uint64_t batch_files;
     int delete;
     int contents;
+    int ignore_symlinks;
     uint64_t bufsize;
     int direct;
     int open_noatime;
@@ -297,6 +298,7 @@ static void nsync_usage(void)
     printf("  -b, --batch-files <N>      - process entries in batches of approximately N items\n");
     printf("  -D, --delete               - delete extraneous files from target\n");
     printf("  -c, --contents             - compare file contents instead of size+mtime\n");
+    printf("      --ignore-symlinks      - ignore symlink entries during scan/compare/apply\n");
     printf("  -s, --direct               - open files with O_DIRECT\n");
     printf("      --open-noatime         - open files with O_NOATIME\n");
     printf("      --bufsize <SIZE>       - I/O buffer size in bytes (default " MFU_BUFFER_SIZE_STR ")\n");
@@ -1939,6 +1941,10 @@ static int nsync_scan_emit_path(
     }
 
     mfu_filetype type = mfu_flist_mode_to_filetype(st->st_mode);
+    if (opts->ignore_symlinks && type == MFU_TYPE_LINK) {
+        return 0;
+    }
+
     int include = nsync_scan_filter_match_relpath(filter, relpath);
     if (dirs_only && type != MFU_TYPE_DIR) {
         include = 0;
@@ -6632,6 +6638,7 @@ int main(int argc, char** argv)
         .batch_files = 0,
         .delete = 0,
         .contents = 0,
+        .ignore_symlinks = 0,
         .bufsize = MFU_BUFFER_SIZE,
         .direct = 0,
         .open_noatime = 0,
@@ -6658,6 +6665,7 @@ int main(int argc, char** argv)
         {"batch-files", 1, 0, 'b'},
         {"delete", 0, 0, 'D'},
         {"contents", 0, 0, 'c'},
+        {"ignore-symlinks", 0, 0, 1004},
         {"direct", 0, 0, 's'},
         {"open-noatime", 0, 0, 'U'},
         {"bufsize", 1, 0, 'B'},
@@ -6682,6 +6690,9 @@ int main(int argc, char** argv)
             break;
         case 'c':
             opts.contents = 1;
+            break;
+        case 1004:
+            opts.ignore_symlinks = 1;
             break;
         case 'n':
             opts.dryrun = 1;

@@ -24,6 +24,10 @@ Delete extraneous files from destination.
 .B \-c, \-\-contents
 Compare regular files by SHA256 digest (instead of size+mtime checks).
 .TP
+.B \-\-ignore\-symlinks
+Ignore symlink entries during sync.
+Symlink paths are excluded from scan, compare, and apply stages.
+.TP
 .B \-\-bufsize SIZE
 Set I/O and digest buffer size in bytes.
 .TP

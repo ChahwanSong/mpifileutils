@@ -229,4 +229,22 @@ assert_not_exists "${DST_ROOT}/case4/.nsync.batch.state"
 dryrun_out=$(run_nsync --dryrun --batch-files 200 "${SRC_ROOT}/case4" "${DST_ROOT}/case4" 2>&1)
 echo "${dryrun_out}" | grep -q "changed=0"
 
+##############################################################################
+# Case 5: --ignore-symlinks excludes link paths from sync and delete
+##############################################################################
+mkdir -p "${SRC_ROOT}/case5" "${DST_ROOT}/case5"
+printf "data\n" > "${SRC_ROOT}/case5/data.txt"
+ln -sfn "data.txt" "${SRC_ROOT}/case5/link_src"
+ln -sfn "dst_target" "${DST_ROOT}/case5/link_dst_only"
+
+run_nsync --ignore-symlinks --delete "${SRC_ROOT}/case5" "${DST_ROOT}/case5"
+
+assert_file_equals "${SRC_ROOT}/case5/data.txt" "${DST_ROOT}/case5/data.txt"
+assert_not_exists "${DST_ROOT}/case5/link_src"
+assert_exists "${DST_ROOT}/case5/link_dst_only"
+assert_eq "dst_target" "$(readlink "${DST_ROOT}/case5/link_dst_only")" "dst-only symlink should remain untouched"
+
+dryrun_out=$(run_nsync --dryrun --ignore-symlinks --delete "${SRC_ROOT}/case5" "${DST_ROOT}/case5" 2>&1)
+echo "${dryrun_out}" | grep -q "changed=0"
+
 echo "PASS: nsync matrix tests completed"
