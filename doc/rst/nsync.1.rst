@@ -36,6 +36,11 @@ OPTIONS
    Compare regular file contents with SHA256 digest. Without this option,
    regular files are compared by size and mtime.
 
+.. option:: --ignore-symlinks
+
+   Ignore symlink entries during sync. Symlink paths are excluded from scan,
+   compare, and apply stages.
+
 .. option:: -s, --direct
 
    Open files with ``O_DIRECT`` for data transfer and content digest reads.
