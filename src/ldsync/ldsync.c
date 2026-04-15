@@ -55,7 +55,7 @@ static bool comp_mtime_nsec = true;
 static void print_usage(void)
 {
     printf("\n");
-    printf("Usage: dsync [options] source target\n");
+    printf("Usage: ldsync [options] source target\n");
     printf("\n");
 #ifdef DAOS_SUPPORT
     printf("DAOS paths can be specified as:\n");
