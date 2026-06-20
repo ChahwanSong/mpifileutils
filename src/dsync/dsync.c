@@ -32,6 +32,10 @@
 #define _XOPEN_SOURCE 600
 #include <fcntl.h>
 #include <string.h>
+#include <pwd.h>
+#include <grp.h>
+#include <ctype.h>
+#include <sys/stat.h>
 
 /* for bool type, true/false macros */
 #include <stdbool.h>
@@ -50,6 +54,184 @@
 
 /* True if both src and dest file systems support nsec field in mtime */
 static bool comp_mtime_nsec = true;
+
+/* ---- helpers for --chown / --chmod (destination owner/mode override) ---- */
+
+/* Resolve a single user (is_user=1) or group (is_user=0) token to a numeric id.
+ * All-digit tokens are parsed locally; name tokens are resolved on rank 0 and
+ * broadcast so all ranks agree (avoids per-rank NSS/LDAP divergence). Returns 0
+ * and stores the id in *out on success, -1 on failure. Collective for name
+ * tokens: every rank must call with identical input. */
+static int dsync_resolve_id(const char* tok, int is_user, uint64_t* out)
+{
+    if (tok == NULL || *tok == '\0') {
+        return -1;
+    }
+    int all_digit = 1;
+    for (const char* p = tok; *p != '\0'; p++) {
+        if (!isdigit((unsigned char)*p)) { all_digit = 0; break; }
+    }
+    if (all_digit) {
+        errno = 0;
+        char* end = NULL;
+        unsigned long v = strtoul(tok, &end, 10);
+        if (errno != 0 || end == tok || *end != '\0' || v > 0xffffffffUL) {
+            return -1;
+        }
+        *out = (uint64_t)v;
+        return 0;
+    }
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    uint64_t vals[2] = {0, 0}; /* [0]=valid, [1]=id */
+    if (rank == 0) {
+        if (is_user) {
+            struct passwd* pw = getpwnam(tok);
+            if (pw != NULL) { vals[0] = 1; vals[1] = (uint64_t)pw->pw_uid; }
+        } else {
+            struct group* gr = getgrnam(tok);
+            if (gr != NULL) { vals[0] = 1; vals[1] = (uint64_t)gr->gr_gid; }
+        }
+    }
+    MPI_Bcast(vals, 2, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    if (vals[0] == 0) {
+        return -1;
+    }
+    *out = vals[1];
+    return 0;
+}
+
+/* Parse and resolve a "USER:GROUP" spec into set-flags + numeric ids.
+ * Split on first ':'; empty user -> uid unchanged, no colon -> gid unchanged,
+ * trailing/empty group with colon -> error; reject "", ":", >1 colon, spaces.
+ * Collective (name tokens broadcast). Returns 0 ok, -1 error (logged on rank 0). */
+static int dsync_chown_parse_resolve(const char* spec,
+    int* set_uid, uid_t* uid, int* set_gid, gid_t* gid)
+{
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    *set_uid = 0; *set_gid = 0;
+
+    if (spec == NULL || *spec == '\0') {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: empty specification");
+        return -1;
+    }
+    for (const char* p = spec; *p != '\0'; p++) {
+        if (isspace((unsigned char)*p)) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: whitespace not allowed: '%s'", spec);
+            return -1;
+        }
+    }
+    const char* colon = strchr(spec, ':');
+    if (colon != NULL && strchr(colon + 1, ':') != NULL) {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: too many ':' in '%s'", spec);
+        return -1;
+    }
+    char user[256];
+    const char* group = NULL;
+    if (colon != NULL) {
+        size_t ulen = (size_t)(colon - spec);
+        if (ulen >= sizeof(user)) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: user name too long");
+            return -1;
+        }
+        memcpy(user, spec, ulen);
+        user[ulen] = '\0';
+        group = colon + 1;
+        if (*group == '\0') {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: empty group in '%s'", spec);
+            return -1;
+        }
+    } else {
+        if (strlen(spec) >= sizeof(user)) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: user name too long");
+            return -1;
+        }
+        strcpy(user, spec);
+    }
+    if (user[0] != '\0') {
+        uint64_t v;
+        if (dsync_resolve_id(user, 1, &v) != 0) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: unknown user '%s'", user);
+            return -1;
+        }
+        *uid = (uid_t)v; *set_uid = 1;
+    }
+    if (group != NULL) {
+        uint64_t v;
+        if (dsync_resolve_id(group, 0, &v) != 0) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: unknown group '%s'", group);
+            return -1;
+        }
+        *gid = (gid_t)v; *set_gid = 1;
+    }
+    if (!*set_uid && !*set_gid) {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: nothing to set in '%s'", spec);
+        return -1;
+    }
+    return 0;
+}
+
+/* Parse a single octal permission token (1-4 octal digits, value <= 07777). */
+static int dsync_parse_octal(const char* tok, uint32_t* out)
+{
+    size_t n = strlen(tok);
+    if (n < 1 || n > 4) return -1;
+    for (size_t i = 0; i < n; i++) {
+        if (tok[i] < '0' || tok[i] > '7') return -1;
+    }
+    errno = 0;
+    char* end = NULL;
+    unsigned long v = strtoul(tok, &end, 8);
+    if (errno != 0 || *end != '\0' || v > 07777UL) return -1;
+    *out = (uint32_t)v;
+    return 0;
+}
+
+/* Parse a --chmod SPEC: a bare octal "0750" (applies to both dirs and files),
+ * or a comma list of D<octal>/F<octal> (dir / file modes). Purely local and
+ * deterministic (no MPI). Returns 0 ok, -1 error (logged on rank 0). */
+static int dsync_chmod_parse_spec(const char* spec, int* set,
+    int* dir_set, uint32_t* dir, int* file_set, uint32_t* file)
+{
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    *set = 0; *dir_set = 0; *file_set = 0; *dir = 0; *file = 0;
+
+    if (spec == NULL || *spec == '\0') {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chmod: empty specification");
+        return -1;
+    }
+    char* copy = MFU_STRDUP(spec);
+    char* save = NULL;
+    int n_bare = 0, n_dir = 0, n_file = 0, bad = 0;
+    for (char* tok = strtok_r(copy, ",", &save); tok != NULL; tok = strtok_r(NULL, ",", &save)) {
+        const char* digits = tok;
+        int is_dir = 0, is_file = 0;
+        if (tok[0] == 'D') { is_dir = 1; digits = tok + 1; }
+        else if (tok[0] == 'F') { is_file = 1; digits = tok + 1; }
+        uint32_t perm;
+        if (dsync_parse_octal(digits, &perm) != 0) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chmod: invalid token '%s' in '%s'", tok, spec);
+            bad = 1; break;
+        }
+        if (is_dir)       { *dir = perm;  *dir_set = 1;  n_dir++; }
+        else if (is_file) { *file = perm; *file_set = 1; n_file++; }
+        else              { *dir = perm; *file = perm; *dir_set = 1; *file_set = 1; n_bare++; }
+    }
+    mfu_free(&copy);
+    if (bad) return -1;
+    if (n_dir > 1 || n_file > 1 || n_bare > 1 || (n_bare >= 1 && (n_dir >= 1 || n_file >= 1))) {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chmod: conflicting/duplicate tokens in '%s'", spec);
+        return -1;
+    }
+    if (!*dir_set && !*file_set) {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chmod: nothing to set in '%s'", spec);
+        return -1;
+    }
+    *set = 1;
+    return 0;
+}
 
 /* Print a usage message */
 static void print_usage(void)
@@ -78,6 +260,9 @@ static void print_usage(void)
     printf("      --open-noatime      - open files with O_NOATIME\n");
     printf("      --link-dest <DIR>   - hardlink to files in DIR when unchanged\n");
     printf("  -S, --sparse            - create sparse files when possible\n");
+    printf("      --chown <USER:GROUP> - set owner/group of target items (name or numeric id; needs privilege)\n");
+    printf("      --chmod <SPEC>      - set permission bits on target items\n");
+    printf("                            (octal e.g. 0750, or D<oct>,F<oct> for dirs/files; symlinks unchanged)\n");
     printf("      --progress <N>      - print progress every N seconds\n");
     printf("  -v, --verbose           - verbose output\n");
     printf("  -q, --quiet             - quiet output\n");
@@ -190,6 +375,18 @@ struct dsync_options {
     int delete;                    /* delete extraneous files from destination dirs */
     char* link_dest;               /* link dest dir */
     int need_compare[DCMPF_MAX];   /* fields that need to be compared  */
+    /* --chown: override destination ownership */
+    char* chown_str;               /* raw USER:GROUP arg (NULL if not given) */
+    int chown_set_uid;             /* override uid? */
+    int chown_set_gid;             /* override gid? */
+    uid_t chown_uid;               /* override uid value */
+    gid_t chown_gid;               /* override gid value */
+    /* --chmod: override destination permission bits (octal + optional D/F) */
+    int chmod_set;                 /* any chmod override requested? */
+    int chmod_dir_set;             /* override directory mode? */
+    int chmod_file_set;            /* override non-directory mode? */
+    uint32_t chmod_dir;            /* directory perm bits (low 12 bits) */
+    uint32_t chmod_file;           /* file perm bits (low 12 bits) */
 };
 
 struct dsync_options options = {
@@ -3086,6 +3283,8 @@ int main(int argc, char **argv)
         {"debug",          0, 0, 'd'}, // undocumented
         {"link-dest",      1, 0, 'l'},
         {"sparse",         0, 0, 'S'},
+        {"chown",          1, 0, 1001},
+        {"chmod",          1, 0, 1002},
         {"progress",       1, 0, 'R'},
         {"verbose",        0, 0, 'v'},
         {"quiet",          0, 0, 'q'},
@@ -3205,6 +3404,18 @@ int main(int argc, char **argv)
         case 'S':
             copy_opts->sparse = 1;
             break;
+        case 1001:
+            /* --chown USER:GROUP (resolved collectively after option parsing) */
+            options.chown_str = MFU_STRDUP(optarg);
+            break;
+        case 1002:
+            /* --chmod SPEC (parsed locally, no MPI) */
+            if (dsync_chmod_parse_spec(optarg, &options.chmod_set,
+                    &options.chmod_dir_set, &options.chmod_dir,
+                    &options.chmod_file_set, &options.chmod_file) != 0) {
+                usage = 1;
+            }
+            break;
         case 'R':
             mfu_progress_timeout = atoi(optarg);
             break;
@@ -3273,6 +3484,40 @@ int main(int argc, char **argv)
         }
     }
 
+    /* --chown / --chmod: guard incompatible combos, resolve names collectively,
+     * and force-enable the relevant comparisons so already-present items that
+     * differ only in owner/mode are detected even with a custom -o. */
+    int owner_mode_req = (options.chown_str != NULL) || options.chmod_set;
+    if (owner_mode_req && options.link_dest != NULL) {
+        if (rank == 0) {
+            MFU_LOG(MFU_LOG_ERR, "--chown/--chmod cannot be combined with --link-dest "
+                    "(hardlinks share the link-dest inode)");
+        }
+        rc = 1;
+        goto dsync_common_cleanup;
+    }
+    if (options.chown_str != NULL) {
+        if (dsync_chown_parse_resolve(options.chown_str, &options.chown_set_uid,
+                &options.chown_uid, &options.chown_set_gid, &options.chown_gid) != 0) {
+            rc = 1;
+            goto dsync_common_cleanup;
+        }
+    }
+    if (options.chown_set_uid) dsync_option_add_comparison(DCMPF_UID);
+    if (options.chown_set_gid) dsync_option_add_comparison(DCMPF_GID);
+    if (options.chmod_set)     dsync_option_add_comparison(DCMPF_PERM);
+    if (rank == 0 && owner_mode_req) {
+        if (options.chown_set_uid || options.chown_set_gid) {
+            MFU_LOG(MFU_LOG_INFO, "Overriding destination ownership: uid=%s gid=%s",
+                    options.chown_set_uid ? "set" : "keep",
+                    options.chown_set_gid ? "set" : "keep");
+        }
+        if (options.chmod_set) {
+            MFU_LOG(MFU_LOG_INFO, "Overriding destination mode: dir=%s file=%s",
+                    options.chmod_dir_set ? "set" : "keep",
+                    options.chmod_file_set ? "set" : "keep");
+        }
+    }
 
     /* pointer to path arguments */
     char** argpaths = &argv[optind];
@@ -3287,6 +3532,13 @@ int main(int argc, char **argv)
 
     /* Handle the DAOS API case */
     if (mfu_src_file->type == DAOS || mfu_dst_file->type == DAOS) {
+        if (owner_mode_req) {
+            if (rank == 0) {
+                MFU_LOG(MFU_LOG_ERR, "--chown/--chmod is not supported for the DAOS object API");
+            }
+            rc = 1;
+            goto dsync_common_cleanup;
+        }
         daos_rc = dsync_daos(rank, daos_args, copy_opts, mfu_src_file, mfu_dst_file);
         if (daos_rc != 0) {
             MFU_LOG(MFU_LOG_ERR, "Detected one or more DAOS errors: "MFU_ERRF, MFU_ERRP(-MFU_ERR_DAOS));
@@ -3445,6 +3697,33 @@ int main(int argc, char **argv)
     mfu_flist_free(&flist_tmp_dst);
     if (options.link_dest != NULL) {
         mfu_flist_free(&flist_tmp_link);
+    }
+
+    /* --chown / --chmod: override uid/gid/mode on the in-memory source list so
+     * the existing copy + metadata-sync pipeline writes the requested values to
+     * the destination. Only the permission bits change for mode (type bits are
+     * preserved); symlinks are never chmod'd. */
+    if (options.chown_set_uid || options.chown_set_gid || options.chmod_set) {
+        uint64_t ov_idx, ov_size = mfu_flist_size(flist_src);
+        for (ov_idx = 0; ov_idx < ov_size; ov_idx++) {
+            mfu_filetype ov_type = mfu_flist_file_get_type(flist_src, ov_idx);
+            if (options.chown_set_uid) {
+                mfu_flist_file_set_uid(flist_src, ov_idx, (uint64_t)options.chown_uid);
+            }
+            if (options.chown_set_gid) {
+                mfu_flist_file_set_gid(flist_src, ov_idx, (uint64_t)options.chown_gid);
+            }
+            if (options.chmod_set && ov_type != MFU_TYPE_LINK) {
+                int ov_is_dir = (ov_type == MFU_TYPE_DIR);
+                if ((ov_is_dir && options.chmod_dir_set) ||
+                    (!ov_is_dir && options.chmod_file_set)) {
+                    uint64_t ov_old = mfu_flist_file_get_mode(flist_src, ov_idx);
+                    uint32_t ov_perm = ov_is_dir ? options.chmod_dir : options.chmod_file;
+                    mfu_flist_file_set_mode(flist_src, ov_idx,
+                        (ov_old & (uint64_t)S_IFMT) | (uint64_t)(ov_perm & 07777));
+                }
+            }
+        }
     }
 
     /* map each file name to its index and its comparison state */

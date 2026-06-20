@@ -202,6 +202,8 @@ destination은 `pwrite()`로 offset write를 수행합니다.
 | `--role-mode auto|map` | 역할 결정 방식 | 자동 탐지 또는 명시 맵 |
 | `--role-map SPEC` | 역할 맵 | 예: `0-1:src,2-3:dst` |
 | `--trace` | 디버그 trace | stage별 per-rank trace 출력 |
+| `--chown USER:GROUP` | destination 소유권 설정 | source가 아니라 지정 uid/gid로 override (§12) |
+| `--chmod SPEC` | destination 권한 설정 | octal 또는 `D<oct>,F<oct>`로 dir/file 분리 (§12) |
 | `-q` | 최소 로그 | 출력 억제 |
 | `-h` | 도움말 | 사용법 출력 |
 
@@ -364,3 +366,40 @@ mpirun -np 2 nsync \
 
 즉, `nsync`는 여전히 split-mount 철학을 유지하면서도, 큰 파일과 많은 파일 workload에서
 `dsync`의 chunk 분할 없이 더 높은 처리량과 더 안정적인 동작을 목표로 업데이트됐습니다.
+
+## 12) `--chown` / `--chmod` (destination 소유권·권한 override)
+
+기본적으로 `nsync`는 source의 ownership·permission을 destination에 그대로 적용한다.
+`--chown` / `--chmod`를 주면, **대신 사용자가 지정한 값으로 destination 항목의 소유권·권한을 설정**한다.
+override는 **source 쪽 스캔 레코드에만** 적용되고 destination 디스크 데이터에 반영되므로, source는 변경되지 않는다.
+
+### 12.1 `--chown USER:GROUP`
+
+- 이름 또는 숫자 id (`alice:developers` / `1001:1002`), 부분 지정(`alice`=uid만, `:developers`=gid만) 지원.
+- 신규 항목, 기존이지만 소유권이 다른 항목, **destination 최상위 디렉토리**, symlink(lchown) 모두 적용된다.
+- 이름은 rank 0에서 한 번 조회 후 broadcast하여 전 rank가 동일 id를 사용한다(split 환경의 NSS/LDAP 일관성). 알 수 없는 이름이면 오류 종료.
+- 임의 소유자로 변경하려면 destination 쪽 rank가 root(또는 `CAP_CHOWN`)여야 한다. 비권한이면 chown은 건너뛰고 경고를 남기며 정상 종료한다.
+
+### 12.2 `--chmod SPEC`
+
+- **octal 절대값**: `--chmod 0750`(dir·file 동일) 또는 `--chmod D0755,F0644`(디렉토리/파일 분리, 권장). 한쪽만 줘도 된다.
+- 특수비트(`4000/2000/1000`)는 4자리 octal로 지정 가능. **symlink는 chmod하지 않는다**(타입 비트 보존).
+- **destination 최상위 디렉토리**의 모드도 함께 설정된다(이 디렉토리는 별도 경로로 복원되므로 내부적으로 동일 override를 적용).
+- 제한적 디렉토리 모드(예 `D0500`)를 줘도, nsync는 디렉토리를 임시로 쓰기 가능하게 만들어 자식을 모두 채운 뒤 마지막에 지정 모드로 마무리하므로 서브트리가 정상 동기화된다.
+- 파싱은 로컬·결정적이라 broadcast가 필요 없다. 잘못된 spec은 오류 종료.
+
+### 12.3 예제
+
+```bash
+# split-mount: source(w1-3) -> destination(w4-5), 소유권을 지정값으로 (auto role)
+mpirun --hostfile hf -np 10 nsync --chown dataadmin:datagrp /cephfs-third/job /cephfs-secondary/job
+
+# 디렉토리 0750 / 파일 0640으로 권한 통일
+mpirun --hostfile hf -np 10 nsync --chmod D0750,F0640 /cephfs-third/job /cephfs-secondary/job
+
+# 소유권 + 권한 동시 (role-map 모드)
+mpirun -np 2 nsync --role-mode map --role-map 0:src,1:dst \
+  --chown 1001:1001 --chmod D0755,F0644 /src /dst
+```
+
+> 참고: auto role 모드에서는 destination 디렉토리가 미리 존재해야 역할 판별이 된다(일반 nsync 사용법과 동일).

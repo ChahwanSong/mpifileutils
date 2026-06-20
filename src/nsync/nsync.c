@@ -17,6 +17,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <grp.h>
+#include <pwd.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
@@ -73,7 +75,191 @@ typedef struct {
     int quiet;
     int log_rank;
     double imbalance_threshold;
+    /* --chown: override destination ownership */
+    const char* chown_str;         /* raw USER:GROUP arg (NULL if not given) */
+    int chown_set_uid;
+    int chown_set_gid;
+    uint64_t chown_uid;
+    uint64_t chown_gid;
+    /* --chmod: override destination permission bits (octal + optional D/F) */
+    int chmod_set;
+    int chmod_dir_set;
+    int chmod_file_set;
+    uint32_t chmod_dir;
+    uint32_t chmod_file;
 } nsync_options_t;
+
+/* ---- helpers for --chown / --chmod (destination owner/mode override) ---- */
+
+/* Resolve a user (is_user=1) or group (is_user=0) token to a numeric id.
+ * All-digit tokens parse locally; name tokens resolve on rank 0 and broadcast.
+ * Returns 0 + *out on success, -1 on failure. Collective for name tokens. */
+static int nsync_resolve_id(const char* tok, int is_user, uint64_t* out)
+{
+    if (tok == NULL || *tok == '\0') {
+        return -1;
+    }
+    int all_digit = 1;
+    for (const char* p = tok; *p != '\0'; p++) {
+        if (!isdigit((unsigned char)*p)) { all_digit = 0; break; }
+    }
+    if (all_digit) {
+        errno = 0;
+        char* end = NULL;
+        unsigned long v = strtoul(tok, &end, 10);
+        if (errno != 0 || end == tok || *end != '\0' || v > 0xffffffffUL) {
+            return -1;
+        }
+        *out = (uint64_t)v;
+        return 0;
+    }
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    uint64_t vals[2] = {0, 0};
+    if (rank == 0) {
+        if (is_user) {
+            struct passwd* pw = getpwnam(tok);
+            if (pw != NULL) { vals[0] = 1; vals[1] = (uint64_t)pw->pw_uid; }
+        } else {
+            struct group* gr = getgrnam(tok);
+            if (gr != NULL) { vals[0] = 1; vals[1] = (uint64_t)gr->gr_gid; }
+        }
+    }
+    MPI_Bcast(vals, 2, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    if (vals[0] == 0) {
+        return -1;
+    }
+    *out = vals[1];
+    return 0;
+}
+
+/* Parse + resolve "USER:GROUP". Collective. Returns 0 ok, -1 error (logged rank0). */
+static int nsync_chown_parse_resolve(const char* spec,
+    int* set_uid, uint64_t* uid, int* set_gid, uint64_t* gid)
+{
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    *set_uid = 0; *set_gid = 0;
+
+    if (spec == NULL || *spec == '\0') {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: empty specification");
+        return -1;
+    }
+    for (const char* p = spec; *p != '\0'; p++) {
+        if (isspace((unsigned char)*p)) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: whitespace not allowed: '%s'", spec);
+            return -1;
+        }
+    }
+    const char* colon = strchr(spec, ':');
+    if (colon != NULL && strchr(colon + 1, ':') != NULL) {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: too many ':' in '%s'", spec);
+        return -1;
+    }
+    char user[256];
+    const char* group = NULL;
+    if (colon != NULL) {
+        size_t ulen = (size_t)(colon - spec);
+        if (ulen >= sizeof(user)) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: user name too long");
+            return -1;
+        }
+        memcpy(user, spec, ulen);
+        user[ulen] = '\0';
+        group = colon + 1;
+        if (*group == '\0') {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: empty group in '%s'", spec);
+            return -1;
+        }
+    } else {
+        if (strlen(spec) >= sizeof(user)) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: user name too long");
+            return -1;
+        }
+        strcpy(user, spec);
+    }
+    if (user[0] != '\0') {
+        uint64_t v;
+        if (nsync_resolve_id(user, 1, &v) != 0) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: unknown user '%s'", user);
+            return -1;
+        }
+        *uid = v; *set_uid = 1;
+    }
+    if (group != NULL) {
+        uint64_t v;
+        if (nsync_resolve_id(group, 0, &v) != 0) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: unknown group '%s'", group);
+            return -1;
+        }
+        *gid = v; *set_gid = 1;
+    }
+    if (!*set_uid && !*set_gid) {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chown: nothing to set in '%s'", spec);
+        return -1;
+    }
+    return 0;
+}
+
+/* Parse a single octal token (1-4 octal digits, value <= 07777). */
+static int nsync_parse_octal(const char* tok, uint32_t* out)
+{
+    size_t n = strlen(tok);
+    if (n < 1 || n > 4) return -1;
+    for (size_t i = 0; i < n; i++) {
+        if (tok[i] < '0' || tok[i] > '7') return -1;
+    }
+    errno = 0;
+    char* end = NULL;
+    unsigned long v = strtoul(tok, &end, 8);
+    if (errno != 0 || *end != '\0' || v > 07777UL) return -1;
+    *out = (uint32_t)v;
+    return 0;
+}
+
+/* Parse a --chmod SPEC: bare octal "0750" (both), or comma list of D<oct>/F<oct>.
+ * Local/deterministic. Returns 0 ok, -1 error (logged rank0). */
+static int nsync_chmod_parse_spec(const char* spec, int* set,
+    int* dir_set, uint32_t* dir, int* file_set, uint32_t* file)
+{
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    *set = 0; *dir_set = 0; *file_set = 0; *dir = 0; *file = 0;
+
+    if (spec == NULL || *spec == '\0') {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chmod: empty specification");
+        return -1;
+    }
+    char* copy = MFU_STRDUP(spec);
+    char* save = NULL;
+    int n_bare = 0, n_dir = 0, n_file = 0, bad = 0;
+    for (char* tok = strtok_r(copy, ",", &save); tok != NULL; tok = strtok_r(NULL, ",", &save)) {
+        const char* digits = tok;
+        int is_dir = 0, is_file = 0;
+        if (tok[0] == 'D') { is_dir = 1; digits = tok + 1; }
+        else if (tok[0] == 'F') { is_file = 1; digits = tok + 1; }
+        uint32_t perm;
+        if (nsync_parse_octal(digits, &perm) != 0) {
+            if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chmod: invalid token '%s' in '%s'", tok, spec);
+            bad = 1; break;
+        }
+        if (is_dir)       { *dir = perm;  *dir_set = 1;  n_dir++; }
+        else if (is_file) { *file = perm; *file_set = 1; n_file++; }
+        else              { *dir = perm; *file = perm; *dir_set = 1; *file_set = 1; n_bare++; }
+    }
+    mfu_free(&copy);
+    if (bad) return -1;
+    if (n_dir > 1 || n_file > 1 || n_bare > 1 || (n_bare >= 1 && (n_dir >= 1 || n_file >= 1))) {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chmod: conflicting/duplicate tokens in '%s'", spec);
+        return -1;
+    }
+    if (!*dir_set && !*file_set) {
+        if (rank == 0) MFU_LOG(MFU_LOG_ERR, "--chmod: nothing to set in '%s'", spec);
+        return -1;
+    }
+    *set = 1;
+    return 0;
+}
 
 typedef struct {
     nsync_role_t role;
@@ -307,6 +493,9 @@ static void nsync_usage(void)
     printf("      --role-mode <MODE>     - role assignment mode: auto or map\n");
     printf("      --role-map <SPEC>      - explicit role map (used with --role-mode map)\n");
     printf("      --trace                - print detailed per-rank stage traces (debug)\n");
+    printf("      --chown <USER:GROUP>   - set owner/group of target items (name or numeric id; needs privilege)\n");
+    printf("      --chmod <SPEC>         - set permission bits on target items\n");
+    printf("                               (octal e.g. 0750, or D<oct>,F<oct> for dirs/files; symlinks unchanged)\n");
     printf("  -q, --quiet                - quiet output\n");
     printf("  -h, --help                 - print usage\n");
     printf("\n");
@@ -1961,6 +2150,21 @@ static int nsync_scan_emit_path(
     rec.mode = (uint64_t)st->st_mode;
     rec.uid = (uint64_t)st->st_uid;
     rec.gid = (uint64_t)st->st_gid;
+    /* --chown/--chmod: override owner/mode on the SOURCE-side scan only. The
+     * destination scan must keep real on-disk values so nsync_meta_identity_diff
+     * detects the difference and emits a META_UPDATE. Type (S_IFMT) bits are
+     * preserved; symlink modes are never changed. */
+    if (side == NSYNC_ROLE_SRC) {
+        if (opts->chown_set_uid) rec.uid = opts->chown_uid;
+        if (opts->chown_set_gid) rec.gid = opts->chown_gid;
+        if (opts->chmod_set && rec.type != MFU_TYPE_LINK) {
+            int is_dir = (rec.type == MFU_TYPE_DIR);
+            if ((is_dir && opts->chmod_dir_set) || (!is_dir && opts->chmod_file_set)) {
+                uint32_t perm = is_dir ? opts->chmod_dir : opts->chmod_file;
+                rec.mode = (rec.mode & (uint64_t)S_IFMT) | (uint64_t)(perm & 07777);
+            }
+        }
+    }
     rec.size = (uint64_t)st->st_size;
     rec.mtime = (uint64_t)st->st_mtim.tv_sec;
     rec.mtime_nsec = (uint64_t)st->st_mtim.tv_nsec;
@@ -5344,6 +5548,13 @@ static void nsync_destination_execute_actions(
             if (mode == 0) {
                 mode = (mode_t)0777;
             }
+            if (opts->chmod_set) {
+                /* Create directories with a permissive working mode so children
+                 * can be written even when --chmod requests a restrictive dir
+                 * mode (e.g. D0500). The deferred dir-meta finalize stamps the
+                 * real override mode after all children exist. */
+                mode |= (mode_t)0700;
+            }
             if (nsync_mkdirs(dst_fullpath, mode) != 0) {
                 (*local_errors)++;
             } else {
@@ -5559,6 +5770,15 @@ static int nsync_restore_destination_root_metadata(
                 root_meta[2] = (uint64_t)st.st_gid;
                 root_meta[3] = (uint64_t)st.st_mtim.tv_sec;
                 root_meta[4] = (uint64_t)st.st_mtim.tv_nsec;
+                /* --chown/--chmod: the destination root '.' dir is written only
+                 * here (it bypasses the scan records), so apply the override to
+                 * its broadcast metadata. The root is always a directory. */
+                if (opts->chown_set_uid) root_meta[1] = opts->chown_uid;
+                if (opts->chown_set_gid) root_meta[2] = opts->chown_gid;
+                if (opts->chmod_set && opts->chmod_dir_set) {
+                    root_meta[0] = (root_meta[0] & (uint64_t)S_IFMT) |
+                                   (uint64_t)(opts->chmod_dir & 07777);
+                }
             }
         } else {
             root_meta_error = 1;
@@ -6673,6 +6893,8 @@ int main(int argc, char** argv)
         {"role-mode", 1, 0, 1000},
         {"role-map", 1, 0, 1001},
         {"trace", 0, 0, 1002},
+        {"chown", 1, 0, 1005},
+        {"chmod", 1, 0, 1006},
         {"quiet", 0, 0, 'q'},
         {"help", 0, 0, 'h'},
         {0, 0, 0, 0},
@@ -6743,6 +6965,18 @@ int main(int argc, char** argv)
         case 1002:
             opts.trace = 1;
             break;
+        case 1005:
+            /* --chown USER:GROUP (resolved collectively after option parsing) */
+            opts.chown_str = optarg;
+            break;
+        case 1006:
+            /* --chmod SPEC (parsed locally, no MPI) */
+            if (nsync_chmod_parse_spec(optarg, &opts.chmod_set,
+                    &opts.chmod_dir_set, &opts.chmod_dir,
+                    &opts.chmod_file_set, &opts.chmod_file) != 0) {
+                usage = 1;
+            }
+            break;
         case 1003: {
             errno = 0;
             char* end = NULL;
@@ -6796,6 +7030,23 @@ int main(int argc, char** argv)
         }
         rc = help ? 0 : 1;
         goto cleanup;
+    }
+
+    /* --chown: resolve user/group names collectively (rank-0 getpwnam/getgrnam +
+     * MPI_Bcast) so every rank holds identical ids. --chmod was already parsed
+     * locally during getopt. On error every rank aborts (identical argv). */
+    if (opts.chown_str != NULL) {
+        if (nsync_chown_parse_resolve(opts.chown_str, &opts.chown_set_uid,
+                &opts.chown_uid, &opts.chown_set_gid, &opts.chown_gid) != 0) {
+            rc = 1;
+            goto cleanup;
+        }
+    }
+    if (rank == opts.log_rank && (opts.chown_set_uid || opts.chown_set_gid || opts.chmod_set)) {
+        MFU_LOG(MFU_LOG_INFO, "Override active: chown(uid=%s,gid=%s) chmod(dir=%s,file=%s)",
+                opts.chown_set_uid ? "set" : "keep", opts.chown_set_gid ? "set" : "keep",
+                opts.chmod_set && opts.chmod_dir_set ? "set" : "keep",
+                opts.chmod_set && opts.chmod_file_set ? "set" : "keep");
     }
 
     nsync_role_info_t role_info;

@@ -70,6 +70,8 @@ mpirun -np <N> dsync [options] <SRC> <DEST>
 | `--open-noatime` | `O_NOATIME` 사용 | 파일 open 시 atime 갱신 회피 시도 |
 | `--link-dest DIR` | 동일 파일을 새 복사 대신 hardlink로 생성 | 증분 백업용, destination과 같은 filesystem이어야 함 |
 | `-S, --sparse` | 가능하면 sparse file 생성 | copy option의 sparse path 활성화 |
+| `--chown USER:GROUP` | destination 항목의 소유권을 지정값으로 설정 | source가 아니라 지정 uid/gid로 override (§14) |
+| `--chmod SPEC` | destination 항목의 권한 비트를 지정값으로 설정 | octal 또는 `D<oct>,F<oct>`로 dir/file 분리 (§14) |
 | `--progress N` | N초마다 진행 로그 출력 | `0`이면 progress 비활성화 |
 | `-v, --verbose` | 상세 로그 | 기본도 verbose 수준으로 시작 |
 | `-q, --quiet` | 로그 억제 | progress도 비활성화 |
@@ -336,3 +338,50 @@ mpirun -np 64 dsync --sparse /path/to/src /path/to/dst
 - `--link-dest`는 같은 filesystem hardlink 조건에 의존
 - DAOS 경로는 POSIX 경로와 지원 옵션이 다름
 - split-mount 환경은 지원 대상이 아니며, 그 경우 `nsync`가 필요
+
+## 14) `--chown` / `--chmod` (destination 소유권·권한 override)
+
+기본적으로 `dsync`는 source의 ownership·permission을 destination에 그대로 보존한다.
+`--chown` / `--chmod`를 주면, **보존 대신 사용자가 지정한 값으로 destination 항목의 소유권·권한을 설정**한다.
+source 디스크 데이터는 변경되지 않는다(메모리상 메타데이터만 override하여 복사/메타 동기화 경로에 태운다).
+
+### 14.1 `--chown USER:GROUP`
+
+- `USER`/`GROUP`은 **이름 또는 숫자 id** 모두 가능 (`alice:developers` 또는 `1001:1002`).
+- **부분 지정**: `--chown alice`(uid만, gid는 source 유지), `--chown :developers`(gid만, uid는 source 유지).
+- 신규 복사 항목뿐 아니라, 이미 존재하지만 소유권이 다른 destination 항목도 맞춰진다(재실행 수렴).
+- symlink 자체도 `lchown`으로 설정된다(타깃은 따라가지 않음).
+- **권한**: 임의의 다른 사용자로 바꾸려면 root(또는 `CAP_CHOWN`)가 필요하다. 비권한으로 실행하면 chown은 조용히 건너뛰고(파일은 실행 사용자 소유로 남음) 종료코드는 0이다.
+- 이름은 rank 0에서 한 번 조회해 전 rank에 broadcast하므로(NSS/LDAP 일관성) 모든 rank가 동일 id를 쓴다. 알 수 없는 이름이면 오류로 종료한다.
+
+### 14.2 `--chmod SPEC`
+
+- **octal 절대값**만 지원한다. 두 가지 형식:
+  - `--chmod 0750` — 디렉토리·파일에 **동일하게** 적용(파일에 실행비트가 붙거나 디렉토리에서 traverse 비트가 빠질 수 있으니 주의).
+  - `--chmod D0755,F0644` — **디렉토리(`D`)와 파일(`F`)을 분리** 지정(권장). 한쪽만 줘도 된다(`D0755`는 디렉토리만, 파일은 source 유지).
+- 특수비트(setuid `4000`/setgid `2000`/sticky `1000`)는 4자리 octal로 지정 가능(`F4755`).
+- **symlink는 chmod하지 않는다**(타입 비트는 보존). 디렉토리의 타입/실행 라우팅도 보존된다.
+- 제한적 디렉토리 모드(예 `D0500`)를 줘도 내부 파일은 정상 생성되고, 동기화 종료 시 디렉토리가 지정 모드로 마무리된다.
+- 파싱은 로컬·결정적이라 MPI broadcast가 필요 없다. 잘못된 spec(비-octal, 4자리 초과, 충돌 토큰 등)은 오류로 종료한다.
+
+### 14.3 제약
+
+- `--link-dest`와 함께 사용할 수 없다(하드링크는 link-dest와 inode를 공유하므로 override가 link-dest 트리를 오염시킨다) — 조합 시 오류로 종료.
+- DAOS object API 경로에서는 지원하지 않는다(POSIX/DFS 경로에서만 동작).
+- `--chown`과 `--chmod`는 함께 쓸 수 있고 서로 독립적이다.
+
+### 14.4 예제
+
+```bash
+# destination 전체를 특정 소유자로
+mpirun -np 64 dsync --chown dataadmin:datagrp /src /dst
+
+# 디렉토리 0750, 파일 0640으로 권한 통일
+mpirun -np 64 dsync --chmod D0750,F0640 /src /dst
+
+# 소유권과 권한을 동시에
+mpirun -np 128 dsync --chown 1001:1001 --chmod D0755,F0644 /src /dst
+
+# 그룹만 변경(uid는 source 유지)
+mpirun -np 32 dsync --chown :projteam /src /dst
+```
