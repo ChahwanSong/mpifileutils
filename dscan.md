@@ -5,8 +5,8 @@ It recursively walks a target directory, computes analytics, and writes a JSON r
 
 ## Features
 
-- File size histogram (regular files)
-- atime/mtime/ctime histograms (regular files + directories)
+- File size histogram (count of regular files per size bucket)
+- atime/mtime/ctime capacity histograms (sum of regular-file sizes in bytes per age bucket; files only)
 - Oldest top-K by atime/mtime/ctime
   - Each entry includes path, type, timestamps, and size
   - Directory size is computed as the sum of regular-file sizes under that subtree
@@ -60,8 +60,8 @@ Top-level keys:
 - `top_k`: configured top-K
 - `thresholds`: threshold constants used for checks
 - `summary`: total entry counters
-- `file_size_histogram`: file-size bucket counts
-- `time_histograms`: atime/mtime/ctime bucket counts
+- `file_size_histogram`: file-size bucket counts (number of files; `count` field)
+- `time_histograms`: atime/mtime/ctime capacity buckets (sum of file sizes in bytes; `bytes` field; files only)
 - `oldest`: top-K arrays for `atime`, `mtime`, `ctime`
 - `broken_paths`: array of broken entries with reason labels
 
@@ -98,7 +98,7 @@ Top-level keys:
         "bucket": "[0d,1d]",
         "min_age_days": 0,
         "max_age_days": 1,
-        "count": 777
+        "bytes": 81920000
       }
     ],
     "mtime": [],
@@ -180,6 +180,11 @@ Buckets use these upper bounds:
 - and one final `INF` bucket
 
 ### Time histograms (age in days)
+
+Each bucket value is the **sum of regular-file sizes in bytes** (capacity) whose
+`atime`/`mtime`/`ctime` falls in that age range. Only regular files are counted;
+directories and symlinks are excluded (the JSON field is `bytes`, not `count`).
+The "oldest top-K" listings, by contrast, still include directories.
 
 Age buckets use these upper bounds:
 

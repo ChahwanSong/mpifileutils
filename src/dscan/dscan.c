@@ -546,7 +546,7 @@ static void print_pretty_report(
     }
     printf("\n");
 
-    printf("atime histogram (files + directories)\n");
+    printf("atime histogram by capacity in bytes (files)\n");
     for (uint64_t i = 0; i < (uint64_t)DSCAN_TIME_BIN_COUNT; i++) {
         printf("  ");
         print_time_bucket_label(i);
@@ -554,7 +554,7 @@ static void print_pretty_report(
     }
     printf("\n");
 
-    printf("mtime histogram (files + directories)\n");
+    printf("mtime histogram by capacity in bytes (files)\n");
     for (uint64_t i = 0; i < (uint64_t)DSCAN_TIME_BIN_COUNT; i++) {
         printf("  ");
         print_time_bucket_label(i);
@@ -562,7 +562,7 @@ static void print_pretty_report(
     }
     printf("\n");
 
-    printf("ctime histogram (files + directories)\n");
+    printf("ctime histogram by capacity in bytes (files)\n");
     for (uint64_t i = 0; i < (uint64_t)DSCAN_TIME_BIN_COUNT; i++) {
         printf("  ");
         print_time_bucket_label(i);
@@ -823,7 +823,7 @@ static int write_json_report(
             } else {
                 fprintf(out, "        \"max_age_days\": null,\n");
             }
-            fprintf(out, "        \"count\": %" PRIu64 "\n", time_hists[t][i]);
+            fprintf(out, "        \"bytes\": %" PRIu64 "\n", time_hists[t][i]);
 
             fprintf(out, "      }%s\n", (i + 1 == (uint64_t)DSCAN_TIME_BIN_COUNT) ? "" : ",");
         }
@@ -1280,6 +1280,12 @@ int main(int argc, char** argv)
                     total_files++;
                     uint64_t bin = size_hist_bin(items[i].size);
                     size_hist[bin]++;
+
+                    /* time histograms accumulate file capacity (bytes), files
+                     * only -- directories hold no file data and are excluded */
+                    atime_hist[time_hist_bin(now, items[i].atime)] += items[i].size;
+                    mtime_hist[time_hist_bin(now, items[i].mtime)] += items[i].size;
+                    ctime_hist[time_hist_bin(now, items[i].ctime)] += items[i].size;
                 } else if (items[i].type == MFU_TYPE_DIR) {
                     total_dirs++;
                 } else if (items[i].type == MFU_TYPE_LINK) {
@@ -1288,10 +1294,9 @@ int main(int argc, char** argv)
                     total_other++;
                 }
 
+                /* candidate set for the "oldest by" top-K still spans files and
+                 * directories (membership unchanged) */
                 if (items[i].type == MFU_TYPE_FILE || items[i].type == MFU_TYPE_DIR) {
-                    atime_hist[time_hist_bin(now, items[i].atime)]++;
-                    mtime_hist[time_hist_bin(now, items[i].mtime)]++;
-                    ctime_hist[time_hist_bin(now, items[i].ctime)]++;
                     candidate_count++;
                 }
 
