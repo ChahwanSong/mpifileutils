@@ -282,6 +282,8 @@ typedef struct {
     uint64_t size;
     uint64_t mtime;
     uint64_t mtime_nsec;
+    uint64_t atime;
+    uint64_t atime_nsec;
     char* link_target;
     uint32_t digest_valid;
     unsigned char digest[SHA256_DIGEST_LENGTH];
@@ -321,6 +323,8 @@ typedef struct {
     uint64_t gid;
     uint64_t mtime;
     uint64_t mtime_nsec;
+    uint64_t atime;
+    uint64_t atime_nsec;
 } nsync_action_record_t;
 
 typedef struct {
@@ -2168,6 +2172,8 @@ static int nsync_scan_emit_path(
     rec.size = (uint64_t)st->st_size;
     rec.mtime = (uint64_t)st->st_mtim.tv_sec;
     rec.mtime_nsec = (uint64_t)st->st_mtim.tv_nsec;
+    rec.atime = (uint64_t)st->st_atim.tv_sec;
+    rec.atime_nsec = (uint64_t)st->st_atim.tv_nsec;
     rec.link_target = NULL;
     rec.digest_valid = 0;
     rec.side = side;
@@ -2633,7 +2639,7 @@ static size_t nsync_meta_pack_size(const nsync_meta_record_t* rec, int include_d
     uint32_t path_len = (uint32_t)strlen(rec->relpath);
     uint32_t link_len = (rec->link_target != NULL) ? (uint32_t)strlen(rec->link_target) : 0;
     size_t digest_bytes = include_digest ? (4 + SHA256_DIGEST_LENGTH) : 0;
-    return 4 + 4 + (6 * 8) + 4 + 4 + digest_bytes + (size_t)path_len + (size_t)link_len;
+    return 4 + 4 + (8 * 8) + 4 + 4 + digest_bytes + (size_t)path_len + (size_t)link_len;
 }
 
 static size_t nsync_meta_pack(char* buf, const nsync_meta_record_t* rec, int include_digest)
@@ -2652,6 +2658,8 @@ static size_t nsync_meta_pack(char* buf, const nsync_meta_record_t* rec, int inc
     mfu_pack_uint64(&ptr, rec->size);
     mfu_pack_uint64(&ptr, rec->mtime);
     mfu_pack_uint64(&ptr, rec->mtime_nsec);
+    mfu_pack_uint64(&ptr, rec->atime);
+    mfu_pack_uint64(&ptr, rec->atime_nsec);
     mfu_pack_uint32(&ptr, path_len);
     mfu_pack_uint32(&ptr, link_len);
     if (include_digest) {
@@ -2679,7 +2687,7 @@ static int nsync_meta_unpack(
 {
     const char* ptr = *pptr;
 
-    size_t base_bytes = 4 + 4 + (6 * 8) + 4 + 4 + (include_digest ? (4 + SHA256_DIGEST_LENGTH) : 0);
+    size_t base_bytes = 4 + 4 + (8 * 8) + 4 + 4 + (include_digest ? (4 + SHA256_DIGEST_LENGTH) : 0);
     if ((size_t)(end - ptr) < base_bytes) {
         return -1;
     }
@@ -2697,6 +2705,8 @@ static int nsync_meta_unpack(
     mfu_unpack_uint64(&ptr, &rec->size);
     mfu_unpack_uint64(&ptr, &rec->mtime);
     mfu_unpack_uint64(&ptr, &rec->mtime_nsec);
+    mfu_unpack_uint64(&ptr, &rec->atime);
+    mfu_unpack_uint64(&ptr, &rec->atime_nsec);
     mfu_unpack_uint32(&ptr, &path_len);
     mfu_unpack_uint32(&ptr, &link_len);
     rec->digest_valid = 0;
@@ -2767,7 +2777,7 @@ static int nsync_meta_unpack_relpath(
     const char* ptr = packed;
     const char* end = packed + packed_size;
 
-    size_t base_bytes = 4 + 4 + (6 * 8) + 4 + 4 + (include_digest ? (4 + SHA256_DIGEST_LENGTH) : 0);
+    size_t base_bytes = 4 + 4 + (8 * 8) + 4 + 4 + (include_digest ? (4 + SHA256_DIGEST_LENGTH) : 0);
     if ((size_t)(end - ptr) < base_bytes) {
         return -1;
     }
@@ -2779,6 +2789,8 @@ static int nsync_meta_unpack_relpath(
 
     mfu_unpack_uint32(&ptr, &tmp32);
     mfu_unpack_uint32(&ptr, &tmp32);
+    mfu_unpack_uint64(&ptr, &tmp64);
+    mfu_unpack_uint64(&ptr, &tmp64);
     mfu_unpack_uint64(&ptr, &tmp64);
     mfu_unpack_uint64(&ptr, &tmp64);
     mfu_unpack_uint64(&ptr, &tmp64);
@@ -3634,7 +3646,7 @@ static size_t nsync_action_pack_size(const nsync_action_record_t* action)
 {
     uint32_t path_len = (uint32_t)strlen(action->relpath);
     uint32_t link_len = (action->link_target != NULL) ? (uint32_t)strlen(action->link_target) : 0;
-    return 4 + 4 + 4 + (6 * 8) + 4 + 4 + (size_t)path_len + (size_t)link_len;
+    return 4 + 4 + 4 + (8 * 8) + 4 + 4 + (size_t)path_len + (size_t)link_len;
 }
 
 static size_t nsync_action_pack(char* buf, const nsync_action_record_t* action)
@@ -3655,6 +3667,8 @@ static size_t nsync_action_pack(char* buf, const nsync_action_record_t* action)
     mfu_pack_uint64(&ptr, action->gid);
     mfu_pack_uint64(&ptr, action->mtime);
     mfu_pack_uint64(&ptr, action->mtime_nsec);
+    mfu_pack_uint64(&ptr, action->atime);
+    mfu_pack_uint64(&ptr, action->atime_nsec);
     mfu_pack_uint32(&ptr, path_len);
     mfu_pack_uint32(&ptr, link_len);
     memcpy(ptr, action->relpath, (size_t)path_len);
@@ -3673,7 +3687,7 @@ static int nsync_action_unpack(const char** pptr, const char* end, nsync_action_
     memset(action, 0, sizeof(*action));
 
     const char* ptr = *pptr;
-    size_t base_bytes = 4 + 4 + 4 + (6 * 8) + 4 + 4;
+    size_t base_bytes = 4 + 4 + 4 + (8 * 8) + 4 + 4;
     if ((size_t)(end - ptr) < base_bytes) {
         return -1;
     }
@@ -3693,6 +3707,8 @@ static int nsync_action_unpack(const char** pptr, const char* end, nsync_action_
     mfu_unpack_uint64(&ptr, &action->gid);
     mfu_unpack_uint64(&ptr, &action->mtime);
     mfu_unpack_uint64(&ptr, &action->mtime_nsec);
+    mfu_unpack_uint64(&ptr, &action->atime);
+    mfu_unpack_uint64(&ptr, &action->atime_nsec);
     mfu_unpack_uint32(&ptr, &path_len);
     mfu_unpack_uint32(&ptr, &link_len);
 
@@ -4144,12 +4160,12 @@ static void nsync_apply_metadata(
     }
 
     struct timespec times[2];
-    long nsec = (action->mtime_nsec <= 999999999ULL) ? (long)action->mtime_nsec : 0L;
-    time_t sec = (time_t)action->mtime;
-    times[0].tv_sec = sec;
-    times[0].tv_nsec = nsec;
-    times[1].tv_sec = sec;
-    times[1].tv_nsec = nsec;
+    long mtime_ns = (action->mtime_nsec <= 999999999ULL) ? (long)action->mtime_nsec : 0L;
+    long atime_ns = (action->atime_nsec <= 999999999ULL) ? (long)action->atime_nsec : 0L;
+    times[0].tv_sec = (time_t)action->atime;   /* access time (atime) */
+    times[0].tv_nsec = atime_ns;
+    times[1].tv_sec = (time_t)action->mtime;   /* modify time (mtime) */
+    times[1].tv_nsec = mtime_ns;
 
     int flags = nofollow ? AT_SYMLINK_NOFOLLOW : 0;
     if (utimensat(AT_FDCWD, path, times, flags) != 0) {
@@ -4214,6 +4230,24 @@ static int nsync_action_relpath_sort(const void* a, const void* b)
 {
     const nsync_action_record_t* aa = (const nsync_action_record_t*)a;
     const nsync_action_record_t* bb = (const nsync_action_record_t*)b;
+    return strcmp(aa->relpath, bb->relpath);
+}
+
+/* Order directory-metadata actions deepest-first (ties broken by path). Used to
+ * finalize child directories before their parents, so locking a parent to a
+ * search-restricted mode (e.g. --chmod D0600 under a non-root run) cannot make
+ * a child finalize fail with EACCES and be left over-permissive. Combined with
+ * a per-depth MPI barrier this also holds when a parent and child are owned by
+ * different destination ranks. */
+static int nsync_action_depth_sort_desc(const void* a, const void* b)
+{
+    const nsync_action_record_t* aa = (const nsync_action_record_t*)a;
+    const nsync_action_record_t* bb = (const nsync_action_record_t*)b;
+    int da = nsync_relpath_depth(aa->relpath);
+    int db = nsync_relpath_depth(bb->relpath);
+    if (da != db) {
+        return (da > db) ? -1 : 1;
+    }
     return strcmp(aa->relpath, bb->relpath);
 }
 
@@ -5458,6 +5492,8 @@ static void nsync_deferred_dir_remove_add(
     entry.gid = action->gid;
     entry.mtime = action->mtime;
     entry.mtime_nsec = action->mtime_nsec;
+    entry.atime = action->atime;
+    entry.atime_nsec = action->atime_nsec;
 
     if (nsync_action_vec_push(deferred_dir_removes, &entry) != 0) {
         nsync_action_record_free(&entry);
@@ -5488,6 +5524,8 @@ static void nsync_deferred_dir_meta_add(
     entry.gid = action->gid;
     entry.mtime = action->mtime;
     entry.mtime_nsec = action->mtime_nsec;
+    entry.atime = action->atime;
+    entry.atime_nsec = action->atime_nsec;
 
     if (nsync_action_vec_push(deferred_dir_meta_updates, &entry) != 0) {
         nsync_action_record_free(&entry);
@@ -5711,30 +5749,54 @@ static void nsync_finalize_deferred_dir_meta_updates(
     const char* dst_root,
     const nsync_options_t* opts,
     nsync_action_vec_t* deferred_dir_meta_updates,
+    MPI_Comm dst_comm,
     int* local_errors,
     nsync_meta_apply_stats_t* meta_stats)
 {
-    if (deferred_dir_meta_updates == NULL || deferred_dir_meta_updates->size == 0) {
-        return;
+    /* Finalize directory metadata in GLOBAL deepest-first order: every dst rank
+     * applies all of its directories at depth D, then all dst ranks synchronize
+     * on a barrier, before any rank moves to depth D-1. This guarantees a child
+     * directory -- which may be owned by a different rank -- is stamped before
+     * its parent is locked to a search-restricted mode, so a --chmod that drops
+     * owner execute on a directory cannot make a child finalize fail with
+     * EACCES (and be left over-permissive) under a non-root run.
+     *
+     * Every dst rank reaches this function (the caller gates on role, not on
+     * list contents), so the collectives below stay matched even when a given
+     * rank's deferred list is empty. */
+    uint64_t total = (deferred_dir_meta_updates != NULL) ? deferred_dir_meta_updates->size : 0;
+
+    int local_max_depth = 0;
+    if (total > 0) {
+        qsort(
+            deferred_dir_meta_updates->records,
+            (size_t)total,
+            sizeof(nsync_action_record_t),
+            nsync_action_depth_sort_desc);
+        /* deepest path sorts first */
+        local_max_depth = nsync_relpath_depth(deferred_dir_meta_updates->records[0].relpath);
     }
 
-    qsort(
-        deferred_dir_meta_updates->records,
-        (size_t)deferred_dir_meta_updates->size,
-        sizeof(nsync_action_record_t),
-        nsync_action_relpath_sort);
+    int global_max_depth = local_max_depth;
+    if (dst_comm != MPI_COMM_NULL) {
+        MPI_Allreduce(&local_max_depth, &global_max_depth, 1, MPI_INT, MPI_MAX, dst_comm);
+    }
 
-    const char* last = NULL;
-    for (uint64_t i = 0; i < deferred_dir_meta_updates->size; i++) {
-        nsync_action_record_t* action = &deferred_dir_meta_updates->records[i];
-        if (last != NULL && strcmp(last, action->relpath) == 0) {
-            continue;
+    uint64_t idx = 0;
+    for (int depth = global_max_depth; depth >= 0; depth--) {
+        while (idx < total) {
+            nsync_action_record_t* action = &deferred_dir_meta_updates->records[idx];
+            if (nsync_relpath_depth(action->relpath) != depth) {
+                break;
+            }
+            char* dst_fullpath = nsync_build_full_path(dst_root, action->relpath);
+            nsync_apply_metadata(dst_fullpath, action, 0, opts, local_errors, meta_stats);
+            mfu_free(&dst_fullpath);
+            idx++;
         }
-        last = action->relpath;
-
-        char* dst_fullpath = nsync_build_full_path(dst_root, action->relpath);
-        nsync_apply_metadata(dst_fullpath, action, 0, opts, local_errors, meta_stats);
-        mfu_free(&dst_fullpath);
+        if (dst_comm != MPI_COMM_NULL) {
+            MPI_Barrier(dst_comm);
+        }
     }
 }
 
@@ -5756,7 +5818,7 @@ static int nsync_restore_destination_root_metadata(
     int src_owner = role_info->src_world_ranks[0];
     int dst_owner = role_info->dst_world_ranks[0];
 
-    uint64_t root_meta[5] = {0, 0, 0, 0, 0};
+    uint64_t root_meta[7] = {0, 0, 0, 0, 0, 0, 0};
     int restore_root_meta = 0;
     int root_meta_error = 0;
 
@@ -5770,6 +5832,8 @@ static int nsync_restore_destination_root_metadata(
                 root_meta[2] = (uint64_t)st.st_gid;
                 root_meta[3] = (uint64_t)st.st_mtim.tv_sec;
                 root_meta[4] = (uint64_t)st.st_mtim.tv_nsec;
+                root_meta[5] = (uint64_t)st.st_atim.tv_sec;
+                root_meta[6] = (uint64_t)st.st_atim.tv_nsec;
                 /* --chown/--chmod: the destination root '.' dir is written only
                  * here (it bypasses the scan records), so apply the override to
                  * its broadcast metadata. The root is always a directory. */
@@ -5802,7 +5866,7 @@ static int nsync_restore_destination_root_metadata(
         return -1;
     }
 
-    MPI_Bcast(root_meta, 5, MPI_UINT64_T, src_owner, MPI_COMM_WORLD);
+    MPI_Bcast(root_meta, 7, MPI_UINT64_T, src_owner, MPI_COMM_WORLD);
 
     if (rank == dst_owner) {
         nsync_action_record_t action;
@@ -5812,6 +5876,8 @@ static int nsync_restore_destination_root_metadata(
         action.gid = root_meta[2];
         action.mtime = root_meta[3];
         action.mtime_nsec = root_meta[4];
+        action.atime = root_meta[5];
+        action.atime_nsec = root_meta[6];
 
         int local_errors = 0;
         nsync_apply_metadata(dst_root, &action, 0, opts, &local_errors, meta_stats);
@@ -6648,6 +6714,8 @@ static int nsync_plan_emit_action(
     uint64_t gid,
     uint64_t mtime,
     uint64_t mtime_nsec,
+    uint64_t atime,
+    uint64_t atime_nsec,
     const char* link_target)
 {
     nsync_action_record_t action;
@@ -6663,6 +6731,8 @@ static int nsync_plan_emit_action(
     action.gid = gid;
     action.mtime = mtime;
     action.mtime_nsec = mtime_nsec;
+    action.atime = atime;
+    action.atime_nsec = atime_nsec;
 
     if (nsync_action_vec_push(actions, &action) != 0) {
         nsync_action_record_free(&action);
@@ -6685,7 +6755,7 @@ static int nsync_plan_create_action(
     return nsync_plan_emit_action(
         actions, counts, create_type, relpath, src_owner_world, dst_owner_world,
         src_rec->size, src_rec->mode, src_rec->uid, src_rec->gid,
-        src_rec->mtime, src_rec->mtime_nsec, src_rec->link_target);
+        src_rec->mtime, src_rec->mtime_nsec, src_rec->atime, src_rec->atime_nsec, src_rec->link_target);
 }
 
 static int nsync_plan_planner_records(
@@ -6735,7 +6805,7 @@ static int nsync_plan_planner_records(
                 if (nsync_plan_emit_action(
                         planned_actions, action_counts, NSYNC_ACTION_REMOVE,
                         relpath, -1, dst_owner_world, 0, dst_rec->mode,
-                        dst_rec->uid, dst_rec->gid, dst_rec->mtime, dst_rec->mtime_nsec, NULL) != 0)
+                        dst_rec->uid, dst_rec->gid, dst_rec->mtime, dst_rec->mtime_nsec, dst_rec->atime, dst_rec->atime_nsec, NULL) != 0)
                 {
                     return -1;
                 }
@@ -6753,7 +6823,7 @@ static int nsync_plan_planner_records(
                             planned_actions, action_counts, NSYNC_ACTION_COPY,
                             relpath, src_owner_world, dst_owner_world,
                             src_rec->size, src_rec->mode,
-                            src_rec->uid, src_rec->gid, src_rec->mtime, src_rec->mtime_nsec, NULL) != 0)
+                            src_rec->uid, src_rec->gid, src_rec->mtime, src_rec->mtime_nsec, src_rec->atime, src_rec->atime_nsec, NULL) != 0)
                     {
                         return -1;
                     }
@@ -6763,7 +6833,7 @@ static int nsync_plan_planner_records(
                             planned_actions, action_counts, NSYNC_ACTION_META_UPDATE,
                             relpath, src_owner_world, dst_owner_world,
                             0, src_rec->mode,
-                            src_rec->uid, src_rec->gid, src_rec->mtime, src_rec->mtime_nsec, NULL) != 0)
+                            src_rec->uid, src_rec->gid, src_rec->mtime, src_rec->mtime_nsec, src_rec->atime, src_rec->atime_nsec, NULL) != 0)
                     {
                         return -1;
                     }
@@ -6776,7 +6846,7 @@ static int nsync_plan_planner_records(
                             relpath, src_owner_world, dst_owner_world,
                             0, src_rec->mode,
                             src_rec->uid, src_rec->gid, src_rec->mtime, src_rec->mtime_nsec,
-                            src_rec->link_target) != 0)
+                            src_rec->atime, src_rec->atime_nsec, src_rec->link_target) != 0)
                     {
                         return -1;
                     }
@@ -6787,7 +6857,7 @@ static int nsync_plan_planner_records(
                             relpath, src_owner_world, dst_owner_world,
                             0, src_rec->mode,
                             src_rec->uid, src_rec->gid, src_rec->mtime, src_rec->mtime_nsec,
-                            src_rec->link_target) != 0)
+                            src_rec->atime, src_rec->atime_nsec, src_rec->link_target) != 0)
                     {
                         return -1;
                     }
@@ -6799,7 +6869,7 @@ static int nsync_plan_planner_records(
                             planned_actions, action_counts, NSYNC_ACTION_META_UPDATE,
                             relpath, src_owner_world, dst_owner_world,
                             0, src_rec->mode,
-                            src_rec->uid, src_rec->gid, src_rec->mtime, src_rec->mtime_nsec, NULL) != 0)
+                            src_rec->uid, src_rec->gid, src_rec->mtime, src_rec->mtime_nsec, src_rec->atime, src_rec->atime_nsec, NULL) != 0)
                     {
                         return -1;
                     }
@@ -6829,7 +6899,7 @@ static int nsync_plan_planner_records(
                 if (nsync_plan_emit_action(
                         planned_actions, action_counts, NSYNC_ACTION_REMOVE,
                         relpath, -1, dst_owner_world, 0, dst_rec->mode,
-                        dst_rec->uid, dst_rec->gid, dst_rec->mtime, dst_rec->mtime_nsec, NULL) != 0)
+                        dst_rec->uid, dst_rec->gid, dst_rec->mtime, dst_rec->mtime_nsec, dst_rec->atime, dst_rec->atime_nsec, NULL) != 0)
                 {
                     return -1;
                 }
@@ -7415,7 +7485,7 @@ int main(int argc, char** argv)
     if (!opts.dryrun && role_info.role == NSYNC_ROLE_DST) {
         int local_finalize_errors = 0;
         nsync_finalize_deferred_dir_meta_updates(
-            dst_path, &opts, &deferred_dir_meta_updates, &local_finalize_errors, &local_meta_apply_stats);
+            dst_path, &opts, &deferred_dir_meta_updates, role_info.dst_comm, &local_finalize_errors, &local_meta_apply_stats);
         local_exec_errors_total += (uint64_t)local_finalize_errors;
     }
 
@@ -7443,11 +7513,11 @@ int main(int argc, char** argv)
     nsync_trace_local(&opts, "main-pre-scanerr-allreduce", (uint64_t)local_scan_errors_total, 0);
     MPI_Allreduce(&local_scan_errors_total, &global_scan_errors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
 
-    uint64_t global_exec_errors_before_finalize = 0;
-    MPI_Allreduce(
-        &local_exec_errors_total, &global_exec_errors_before_finalize, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
-
-    if (!opts.dryrun && global_scan_errors == 0 && global_exec_errors_before_finalize == 0) {
+    /* Always finalize the destination root's metadata (owner/mode/mtime +
+     * --chown/--chmod override), even when some entries failed: otherwise a
+     * single unrelated error would leave the root inconsistent with the rest
+     * of the tree, whose directories are finalized unconditionally above. */
+    if (!opts.dryrun) {
         (void)nsync_restore_destination_root_metadata(
             &opts, &role_info, src_path, dst_path, &local_exec_errors_total, &local_meta_apply_stats);
     }
