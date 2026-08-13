@@ -11,8 +11,6 @@
 
 - 파일 크기 히스토그램 (크기 버킷별 일반 파일 **개수**)
 - atime/mtime/ctime 용량 히스토그램 (나이 버킷별 일반 파일 크기의 **byte 합계**; 파일만)
-- atime/mtime/ctime 기준 가장 오래된 top-K
-  - 각 항목은 경로, 타입, 타임스탬프, 크기(`lstat`의 `st_size`)를 포함
 - 손상 경로(broken path) 탐지
   - 비정상 크기 (abnormal size)
   - 누락된 경로 (missing path)
@@ -27,8 +25,8 @@
 
 이전 구현 대비 제외된 기능:
 
-- 디렉토리 서브트리 크기 집계 (top-K 항목의 디렉토리 `size_bytes`는
-  이제 서브트리 합계가 아니라 `lstat` 크기입니다).
+- atime/mtime/ctime 기준 가장 오래된 top-K 목록
+- 디렉토리 서브트리 크기 집계.
   이 기능은 rank 0에서 파일수 × 경로깊이 × log(디렉토리수) 규모의
   직렬 문자열 비교를 요구해 대규모 스캔의 최대 병목이었습니다.
 - 손상 판정을 위한 항목당 재검사 syscall (`lstat` 재호출, `open`/`opendir`/`readlink`).
@@ -49,7 +47,6 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
 선택 옵션:
 
 - `--print` (`-p`): 사람이 읽기 좋은 요약을 stdout(rank 0)에 출력
-- `--top-k <number>` (`-k`): 타임스탬프 필드별 가장 오래된 top-K 개수 (기본값: `10`)
 - `--batch-files <N>` (`-b`): 약 N개 항목 단위 배치로 진행 상황을 로그 출력
 - `--broken-limit <N>`: 리포트에 나열할 손상 경로 최대 개수 (기본값: `10000`;
   `0`이면 목록 없이 개수만 집계)
@@ -84,12 +81,10 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
 
 - `directory`: 스캔한 루트 경로
 - `generated_at_epoch`: 리포트 생성 시각 (epoch 초)
-- `top_k`: 설정된 top-K
 - `thresholds`: 검사에 사용된 임계값 상수
 - `summary`: 전체 항목 카운터 (`scan_errors` 포함)
 - `file_size_histogram`: 파일 크기 버킷 개수 (파일 수; `count` 필드)
 - `time_histograms`: atime/mtime/ctime 용량 버킷 (파일 크기 byte 합계; `bytes` 필드; 파일만)
-- `oldest`: `atime`, `mtime`, `ctime`별 top-K 배열
 - `broken_paths_total`: 손상 항목 전체 개수 (정확한 값)
 - `broken_paths_limit`: 적용된 `--broken-limit`
 - `broken_paths`: 사유 라벨이 포함된 손상 항목 배열 (상한 적용)
@@ -100,7 +95,6 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
 {
   "directory": "/data/project",
   "generated_at_epoch": 1772360000,
-  "top_k": 10,
   "thresholds": {
     "abnormal_size_bytes": 1125899906842624,
     "time_past_limit_epoch": 1457000000,
@@ -134,20 +128,6 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
     "mtime": [],
     "ctime": []
   },
-  "oldest": {
-    "atime": [
-      {
-        "path": "/data/project/old/file.bin",
-        "type": "file",
-        "size_bytes": 4294967296,
-        "atime": 1600000000,
-        "mtime": 1600000000,
-        "ctime": 1600000000
-      }
-    ],
-    "mtime": [],
-    "ctime": []
-  },
   "broken_paths_total": 1,
   "broken_paths_limit": 10000,
   "broken_paths": [
@@ -170,7 +150,6 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
 - 각 rank는 자기 소유 디렉토리를 `opendir`/`readdir`/`lstat`으로 스캔하고,
   발견한 항목을 **즉시** 로컬 누적기에 반영합니다 (전체 목록 미보관):
   - 타입별 카운터, 크기/시간 히스토그램
-  - 필드별 top-K 힙 (항목 K개 상한)
   - 손상 경로 상한 목록 + 정확한 전체 카운터
 - 발견된 하위 디렉토리는 소유 rank로 `MPI_Alltoallv` 라운드 교환을 통해 전달됩니다
 - 라운드는 항목 quota와 교환 버퍼 byte 상한(64 MiB)으로 제한되어
@@ -187,9 +166,6 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
 ### 3) 병합 단계 (gather-all 제거)
 
 - 요약 카운터와 모든 히스토그램: 고정 크기 배열 1개를 `MPI_Reduce`(SUM)
-- top-K: 각 rank가 로컬 힙의 최대 K개 항목만 rank 0으로 gather,
-  rank 0이 (타임스탬프, 경로) 순으로 병합 정렬 후 K개 선택
-  - 동일한 정렬 기준을 쓰므로 rank 수와 무관하게 결과가 결정적입니다
 - 손상 경로: 각 rank의 상한 목록만 gather, rank 0이 경로 정렬 후
   `--broken-limit`까지 나열 (전체 개수는 reduce로 정확히 집계)
 
@@ -200,9 +176,9 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
 
 ### 규모 특성
 
-- rank당 메모리: O(top-K + broken-limit + 대기 디렉토리 큐) —
+- rank당 메모리: O(broken-limit + 대기 디렉토리 큐) —
   전체 항목 수와 무관 (수십~수백 MB 수준)
-- rank 0으로의 통신량: O(top-K × ranks + broken-limit × ranks + 히스토그램) —
+- rank 0으로의 통신량: O(broken-limit × ranks + 히스토그램) —
   전체 항목 수와 무관
 - 항목당 파일시스템 연산: `lstat` 1회 (+ 디렉토리당 `opendir`/`readdir`)
 - 이전 구현의 `MPI_Gatherv` int 카운터 한계(전체 메타데이터 2 GiB,
@@ -229,7 +205,6 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
 
 각 버킷 값은 `atime`/`mtime`/`ctime`이 해당 나이 범위에 속하는 **일반 파일 크기의 byte 합계**(용량)입니다.
 일반 파일만 집계하며, 디렉토리와 심볼릭링크는 제외됩니다(JSON 필드는 `count`가 아닌 `bytes`).
-반면 "가장 오래된 top-K" 목록에는 디렉토리도 포함됩니다.
 
 나이 버킷은 다음 상한값을 사용합니다:
 
@@ -258,7 +233,6 @@ cmake --build build -j
 mpirun -np 8 build/src/dscan/dscan \
   --directory /path/to/scan \
   --output /tmp/dscan_report.json \
-  --top-k 20 \
   --batch-files 1000000 \
   --print
 ```
@@ -277,7 +251,7 @@ mpirun --hostfile hf -np 32 dscan \
 - `dscan` 출력 파일은 rank 0이 작성합니다.
 - 전체 메타데이터를 rank 0으로 모으지 않으므로, rank 0의 메모리 사용량은
   트리 크기와 무관하게 일정합니다.
-- 결과(요약/히스토그램/top-K)는 rank 수와 배치 설정에 관계없이 동일합니다.
+- 결과(요약/히스토그램)는 rank 수와 배치 설정에 관계없이 동일합니다.
   단, `broken_paths` **목록**은 전체 손상 수가 `--broken-limit`을 초과하면
   샘플이므로 rank 수에 따라 달라질 수 있습니다 (`broken_paths_total`은 항상 정확).
 - 스캔 도중 파일시스템이 변경되면 (entries가 사라지는 등) `missing`

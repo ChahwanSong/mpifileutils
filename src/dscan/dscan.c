@@ -7,8 +7,6 @@
  *   rank ever holds the full listing in memory
  * - global statistics (summary counters and histograms) are combined with a
  *   single MPI_Reduce of fixed-size arrays instead of gathering all records
- * - oldest top-K is kept as a bounded per-rank heap and only K entries per
- *   rank travel to rank 0 for the final merge
  * - broken path detection uses the lstat data collected during the walk (no
  *   second lstat/open pass) and the reported list is capped by --broken-limit
  * - memory-bounded batch mode via --batch-files with per-batch progress
@@ -74,49 +72,16 @@ static const uint64_t DSCAN_TIME_DAY_LIMITS[] = {
 #define DSCAN_SIZE_BIN_COUNT ((sizeof(DSCAN_SIZE_LIMITS) / sizeof(DSCAN_SIZE_LIMITS[0])) + 1)
 #define DSCAN_TIME_BIN_COUNT ((sizeof(DSCAN_TIME_DAY_LIMITS) / sizeof(DSCAN_TIME_DAY_LIMITS[0])) + 1)
 
-typedef enum {
-    DSCAN_TOP_ATIME = 0,
-    DSCAN_TOP_MTIME,
-    DSCAN_TOP_CTIME,
-} dscan_top_field_t;
-
-/* one scanned entry as kept in top-K heaps and the merged report */
-typedef struct {
-    char* path;
-    uint64_t type;
-    uint64_t size;
-    uint64_t atime;
-    uint64_t mtime;
-    uint64_t ctime;
-} dscan_entry_t;
-
 typedef struct {
     char* path;
     uint64_t flags;
 } dscan_broken_t;
 
-/* fixed-size wire record for the small top-K / broken gathers */
-typedef struct {
-    uint64_t type;
-    uint64_t size;
-    uint64_t atime;
-    uint64_t mtime;
-    uint64_t ctime;
-    uint64_t path_len; /* including NUL */
-} dscan_wire_entry_t;
-
+/* fixed-size wire record for the small broken-path gather */
 typedef struct {
     uint64_t flags;
     uint64_t path_len; /* including NUL */
 } dscan_wire_broken_t;
-
-/* bounded heap holding the K oldest candidates for one time field */
-typedef struct {
-    dscan_entry_t* entries;
-    uint64_t count;
-    uint64_t k;
-    dscan_top_field_t field;
-} dscan_topk_t;
 
 /* growable list of directory paths pending scan on this rank (LIFO) */
 typedef struct {
@@ -146,10 +111,6 @@ typedef struct {
     uint64_t mtime_hist[DSCAN_TIME_BIN_COUNT];
     uint64_t ctime_hist[DSCAN_TIME_BIN_COUNT];
 
-    dscan_topk_t top_atime;
-    dscan_topk_t top_mtime;
-    dscan_topk_t top_ctime;
-
     dscan_broken_t* broken;
     uint64_t broken_count;
     uint64_t broken_limit;
@@ -172,7 +133,6 @@ static void print_usage(void)
     printf("\n");
     printf("Optional:\n");
     printf("  -p, --print              - print pretty summary on stdout (rank 0)\n");
-    printf("  -k, --top-k <N>          - oldest top-K per time field (default 10)\n");
     printf("  -b, --batch-files <N>    - report progress and account scanning in\n");
     printf("                             batches of approximately N entries\n");
     printf("      --broken-limit <N>   - max broken paths kept in the report\n");
@@ -199,20 +159,6 @@ static int parse_uint64(const char* text, uint64_t* value)
     return 0;
 }
 
-static const char* type_to_string(uint64_t type)
-{
-    if (type == MFU_TYPE_FILE) {
-        return "file";
-    }
-    if (type == MFU_TYPE_DIR) {
-        return "directory";
-    }
-    if (type == MFU_TYPE_LINK) {
-        return "symlink";
-    }
-    return "other";
-}
-
 static uint64_t mode_to_type(mode_t mode)
 {
     if (S_ISREG(mode)) {
@@ -225,41 +171,6 @@ static uint64_t mode_to_type(mode_t mode)
         return (uint64_t) MFU_TYPE_LINK;
     }
     return (uint64_t) MFU_TYPE_UNKNOWN;
-}
-
-static uint64_t entry_field_value(const dscan_entry_t* entry, dscan_top_field_t field)
-{
-    if (field == DSCAN_TOP_ATIME) {
-        return entry->atime;
-    }
-    if (field == DSCAN_TOP_MTIME) {
-        return entry->mtime;
-    }
-    return entry->ctime;
-}
-
-/* ascending (field value, path) order shared by heaps and the final merge so
- * results are identical for any rank count */
-static int entry_cmp_field(const dscan_entry_t* a, const dscan_entry_t* b, dscan_top_field_t field)
-{
-    uint64_t va = entry_field_value(a, field);
-    uint64_t vb = entry_field_value(b, field);
-
-    if (va < vb) {
-        return -1;
-    }
-    if (va > vb) {
-        return 1;
-    }
-
-    return strcmp(a->path, b->path);
-}
-
-static dscan_top_field_t g_sort_field = DSCAN_TOP_ATIME;
-
-static int entry_qsort_cmp(const void* a, const void* b)
-{
-    return entry_cmp_field((const dscan_entry_t*) a, (const dscan_entry_t*) b, g_sort_field);
 }
 
 static int broken_qsort_cmp(const void* a, const void* b)
@@ -307,122 +218,6 @@ static uint64_t time_hist_bin(uint64_t now, uint64_t timestamp)
         }
     }
     return nlimits;
-}
-
-static void format_epoch(uint64_t ts, char* buf, size_t buf_size)
-{
-    time_t t = (time_t) ts;
-    struct tm tmval;
-
-    if (localtime_r(&t, &tmval) == NULL) {
-        snprintf(buf, buf_size, "-");
-        return;
-    }
-
-    if (strftime(buf, buf_size, "%Y-%m-%d %H:%M:%S", &tmval) == 0) {
-        snprintf(buf, buf_size, "-");
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * top-K heap (max-heap over the shared ordering, root = worst kept entry)
- * ------------------------------------------------------------------------- */
-
-static void topk_init(dscan_topk_t* topk, uint64_t k, dscan_top_field_t field)
-{
-    topk->entries = (k > 0) ? (dscan_entry_t*) MFU_MALLOC((size_t)k * sizeof(dscan_entry_t)) : NULL;
-    topk->count = 0;
-    topk->k = k;
-    topk->field = field;
-}
-
-static void topk_free(dscan_topk_t* topk)
-{
-    for (uint64_t i = 0; i < topk->count; i++) {
-        mfu_free(&topk->entries[i].path);
-    }
-    mfu_free(&topk->entries);
-    topk->count = 0;
-}
-
-static void topk_sift_up(dscan_topk_t* topk, uint64_t idx)
-{
-    while (idx > 0) {
-        uint64_t parent = (idx - 1) / 2;
-        if (entry_cmp_field(&topk->entries[idx], &topk->entries[parent], topk->field) <= 0) {
-            break;
-        }
-        dscan_entry_t tmp = topk->entries[idx];
-        topk->entries[idx] = topk->entries[parent];
-        topk->entries[parent] = tmp;
-        idx = parent;
-    }
-}
-
-static void topk_sift_down(dscan_topk_t* topk, uint64_t idx)
-{
-    while (1) {
-        uint64_t left = 2 * idx + 1;
-        uint64_t right = 2 * idx + 2;
-        uint64_t largest = idx;
-
-        if (left < topk->count &&
-            entry_cmp_field(&topk->entries[left], &topk->entries[largest], topk->field) > 0)
-        {
-            largest = left;
-        }
-        if (right < topk->count &&
-            entry_cmp_field(&topk->entries[right], &topk->entries[largest], topk->field) > 0)
-        {
-            largest = right;
-        }
-        if (largest == idx) {
-            break;
-        }
-
-        dscan_entry_t tmp = topk->entries[idx];
-        topk->entries[idx] = topk->entries[largest];
-        topk->entries[largest] = tmp;
-        idx = largest;
-    }
-}
-
-static void topk_insert(
-    dscan_topk_t* topk,
-    const char* path,
-    uint64_t type,
-    uint64_t size,
-    uint64_t atime,
-    uint64_t mtime,
-    uint64_t ctime)
-{
-    if (topk->k == 0) {
-        return;
-    }
-
-    dscan_entry_t candidate;
-    candidate.path = (char*) path; /* borrowed for comparison only */
-    candidate.type = type;
-    candidate.size = size;
-    candidate.atime = atime;
-    candidate.mtime = mtime;
-    candidate.ctime = ctime;
-
-    if (topk->count < topk->k) {
-        dscan_entry_t* slot = &topk->entries[topk->count];
-        *slot = candidate;
-        slot->path = MFU_STRDUP(path);
-        topk->count++;
-        topk_sift_up(topk, topk->count - 1);
-        return;
-    }
-
-    if (entry_cmp_field(&candidate, &topk->entries[0], topk->field) < 0) {
-        mfu_free(&topk->entries[0].path);
-        topk->entries[0] = candidate;
-        topk->entries[0].path = MFU_STRDUP(path);
-        topk_sift_down(topk, 0);
-    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -521,13 +316,9 @@ static void buf_free(dscan_buf_t* b)
  * streaming accumulation
  * ------------------------------------------------------------------------- */
 
-static void acc_init(dscan_acc_t* acc, uint64_t top_k, uint64_t broken_limit, uint64_t now)
+static void acc_init(dscan_acc_t* acc, uint64_t broken_limit, uint64_t now)
 {
     memset(acc, 0, sizeof(*acc));
-
-    topk_init(&acc->top_atime, top_k, DSCAN_TOP_ATIME);
-    topk_init(&acc->top_mtime, top_k, DSCAN_TOP_MTIME);
-    topk_init(&acc->top_ctime, top_k, DSCAN_TOP_CTIME);
 
     acc->broken = (broken_limit > 0) ? (dscan_broken_t*) MFU_MALLOC((size_t)broken_limit * sizeof(dscan_broken_t)) : NULL;
     acc->broken_count = 0;
@@ -538,10 +329,6 @@ static void acc_init(dscan_acc_t* acc, uint64_t top_k, uint64_t broken_limit, ui
 
 static void acc_free(dscan_acc_t* acc)
 {
-    topk_free(&acc->top_atime);
-    topk_free(&acc->top_mtime);
-    topk_free(&acc->top_ctime);
-
     for (uint64_t i = 0; i < acc->broken_count; i++) {
         mfu_free(&acc->broken[i].path);
     }
@@ -603,13 +390,6 @@ static void acc_emit_entry(dscan_acc_t* acc, const char* path, const struct stat
         acc->total_links++;
     } else {
         acc->total_other++;
-    }
-
-    /* candidate set for the "oldest by" top-K spans files and directories */
-    if (type == MFU_TYPE_FILE || type == MFU_TYPE_DIR) {
-        topk_insert(&acc->top_atime, path, type, size, atime, mtime, ctime);
-        topk_insert(&acc->top_mtime, path, type, size, atime, mtime, ctime);
-        topk_insert(&acc->top_ctime, path, type, size, atime, mtime, ctime);
     }
 
     uint64_t flags = stat_broken_flags(acc, type, size, atime, mtime, ctime);
@@ -921,159 +701,8 @@ static int walk_directory_streaming(
 }
 
 /* ---------------------------------------------------------------------------
- * merge phase: reduce histograms, gather small top-K / broken samples
+ * merge phase: reduce histograms, gather broken samples
  * ------------------------------------------------------------------------- */
-
-/* gather at most K entries from every rank to rank 0; on rank 0 returns a
- * merged array (paths owned by the array) sorted by the shared ordering and
- * truncated to K */
-static dscan_entry_t* gather_and_merge_topk(
-    const dscan_topk_t* topk,
-    int rank,
-    int ranks,
-    uint64_t k,
-    uint64_t* out_count,
-    int* out_rc)
-{
-    *out_count = 0;
-
-    uint64_t local_count = topk->count;
-    uint64_t local_path_bytes = 0;
-    for (uint64_t i = 0; i < local_count; i++) {
-        local_path_bytes += strlen(topk->entries[i].path) + 1;
-    }
-
-    dscan_wire_entry_t* local_wires = (local_count > 0) ?
-        (dscan_wire_entry_t*) MFU_MALLOC((size_t)local_count * sizeof(dscan_wire_entry_t)) : NULL;
-    char* local_paths = (local_path_bytes > 0) ? (char*) MFU_MALLOC((size_t)local_path_bytes) : NULL;
-
-    uint64_t path_off = 0;
-    for (uint64_t i = 0; i < local_count; i++) {
-        const dscan_entry_t* e = &topk->entries[i];
-        uint64_t plen = strlen(e->path) + 1;
-        local_wires[i].type = e->type;
-        local_wires[i].size = e->size;
-        local_wires[i].atime = e->atime;
-        local_wires[i].mtime = e->mtime;
-        local_wires[i].ctime = e->ctime;
-        local_wires[i].path_len = plen;
-        memcpy(local_paths + path_off, e->path, (size_t)plen);
-        path_off += plen;
-    }
-
-    uint64_t* counts = NULL;
-    uint64_t* path_counts = NULL;
-    if (rank == 0) {
-        counts = (uint64_t*) MFU_MALLOC((size_t)ranks * sizeof(uint64_t));
-        path_counts = (uint64_t*) MFU_MALLOC((size_t)ranks * sizeof(uint64_t));
-    }
-
-    MPI_Gather(&local_count, 1, MPI_UINT64_T, counts, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
-    MPI_Gather(&local_path_bytes, 1, MPI_UINT64_T, path_counts, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
-
-    dscan_wire_entry_t* all_wires = NULL;
-    char* all_paths = NULL;
-    int* wire_recvcounts = NULL;
-    int* wire_displs = NULL;
-    int* path_recvcounts = NULL;
-    int* path_displs = NULL;
-    uint64_t total_count = 0;
-    uint64_t total_path_bytes = 0;
-
-    int fatal = 0;
-    if (rank == 0) {
-        wire_recvcounts = (int*) MFU_MALLOC((size_t)ranks * sizeof(int));
-        wire_displs = (int*) MFU_MALLOC((size_t)ranks * sizeof(int));
-        path_recvcounts = (int*) MFU_MALLOC((size_t)ranks * sizeof(int));
-        path_displs = (int*) MFU_MALLOC((size_t)ranks * sizeof(int));
-
-        uint64_t wire_off = 0;
-        uint64_t poff = 0;
-        for (int r = 0; r < ranks; r++) {
-            uint64_t wire_bytes = counts[r] * sizeof(dscan_wire_entry_t);
-            wire_displs[r] = (int) wire_off;
-            wire_recvcounts[r] = (int) wire_bytes;
-            wire_off += wire_bytes;
-
-            path_displs[r] = (int) poff;
-            path_recvcounts[r] = (int) path_counts[r];
-            poff += path_counts[r];
-
-            total_count += counts[r];
-        }
-        total_path_bytes = poff;
-
-        if (wire_off > (uint64_t)INT_MAX || total_path_bytes > (uint64_t)INT_MAX) {
-            MFU_LOG(MFU_LOG_ERR, "top-K merge data exceeds MPI int range; lower --top-k");
-            fatal = 1;
-        }
-
-        if (!fatal) {
-            all_wires = (total_count > 0) ?
-                (dscan_wire_entry_t*) MFU_MALLOC((size_t)total_count * sizeof(dscan_wire_entry_t)) : NULL;
-            all_paths = (total_path_bytes > 0) ? (char*) MFU_MALLOC((size_t)total_path_bytes) : NULL;
-        }
-    }
-
-    MPI_Bcast(&fatal, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if (fatal) {
-        *out_rc = 1;
-        mfu_free(&local_wires);
-        mfu_free(&local_paths);
-        mfu_free(&counts);
-        mfu_free(&path_counts);
-        mfu_free(&wire_recvcounts);
-        mfu_free(&wire_displs);
-        mfu_free(&path_recvcounts);
-        mfu_free(&path_displs);
-        return NULL;
-    }
-
-    MPI_Gatherv(
-        local_wires, (int)(local_count * sizeof(dscan_wire_entry_t)), MPI_BYTE,
-        all_wires, wire_recvcounts, wire_displs, MPI_BYTE, 0, MPI_COMM_WORLD);
-    MPI_Gatherv(
-        local_paths, (int)local_path_bytes, MPI_BYTE,
-        all_paths, path_recvcounts, path_displs, MPI_BYTE, 0, MPI_COMM_WORLD);
-
-    dscan_entry_t* merged = NULL;
-    if (rank == 0 && total_count > 0) {
-        merged = (dscan_entry_t*) MFU_MALLOC((size_t)total_count * sizeof(dscan_entry_t));
-
-        uint64_t poff = 0;
-        for (uint64_t i = 0; i < total_count; i++) {
-            merged[i].type = all_wires[i].type;
-            merged[i].size = all_wires[i].size;
-            merged[i].atime = all_wires[i].atime;
-            merged[i].mtime = all_wires[i].mtime;
-            merged[i].ctime = all_wires[i].ctime;
-            merged[i].path = MFU_STRDUP(all_paths + poff);
-            poff += all_wires[i].path_len;
-        }
-
-        g_sort_field = topk->field;
-        qsort(merged, (size_t)total_count, sizeof(dscan_entry_t), entry_qsort_cmp);
-
-        uint64_t keep = (k < total_count) ? k : total_count;
-        for (uint64_t i = keep; i < total_count; i++) {
-            mfu_free(&merged[i].path);
-        }
-        *out_count = keep;
-    }
-
-    mfu_free(&local_wires);
-    mfu_free(&local_paths);
-    mfu_free(&counts);
-    mfu_free(&path_counts);
-    mfu_free(&wire_recvcounts);
-    mfu_free(&wire_displs);
-    mfu_free(&path_recvcounts);
-    mfu_free(&path_displs);
-    mfu_free(&all_wires);
-    mfu_free(&all_paths);
-
-    return merged;
-}
 
 /* gather the capped broken-path samples to rank 0, sorted by path and
  * truncated to broken_limit */
@@ -1381,41 +1010,8 @@ static void print_time_bucket_label(uint64_t bucket)
     printf("[%" PRIu64 "d, INF]", low);
 }
 
-static void print_top_section(const char* title, const dscan_entry_t* entries, uint64_t count)
-{
-    printf("%s\n", title);
-    if (count == 0) {
-        printf("  (none)\n");
-    }
-    for (uint64_t i = 0; i < count; i++) {
-        const dscan_entry_t* e = &entries[i];
-        char at[64];
-        char mt[64];
-        char ct[64];
-        format_epoch(e->atime, at, sizeof(at));
-        format_epoch(e->mtime, mt, sizeof(mt));
-        format_epoch(e->ctime, ct, sizeof(ct));
-
-        double size_v;
-        const char* size_u;
-        mfu_format_bytes(e->size, &size_v, &size_u);
-
-        printf("  %3" PRIu64 ". %s | %s | %.2f %s | atime=%s | mtime=%s | ctime=%s\n",
-            i + 1,
-            type_to_string(e->type),
-            e->path,
-            size_v,
-            size_u,
-            at,
-            mt,
-            ct);
-    }
-    printf("\n");
-}
-
 static void print_pretty_report(
     const char* directory,
-    uint64_t top_k,
     uint64_t total_items,
     uint64_t total_files,
     uint64_t total_dirs,
@@ -1426,12 +1022,6 @@ static void print_pretty_report(
     const uint64_t* atime_hist,
     const uint64_t* mtime_hist,
     const uint64_t* ctime_hist,
-    const dscan_entry_t* top_atime,
-    uint64_t top_atime_count,
-    const dscan_entry_t* top_mtime,
-    uint64_t top_mtime_count,
-    const dscan_entry_t* top_ctime,
-    uint64_t top_ctime_count,
     const dscan_broken_t* broken,
     uint64_t broken_count,
     uint64_t broken_total)
@@ -1439,7 +1029,6 @@ static void print_pretty_report(
     printf("\n");
     printf("dscan report\n");
     printf("directory: %s\n", directory);
-    printf("top-k: %" PRIu64 "\n", top_k);
     printf("\n");
 
     printf("summary\n");
@@ -1483,10 +1072,6 @@ static void print_pretty_report(
     }
     printf("\n");
 
-    print_top_section("oldest by atime", top_atime, top_atime_count);
-    print_top_section("oldest by mtime", top_mtime, top_mtime_count);
-    print_top_section("oldest by ctime", top_ctime, top_ctime_count);
-
     printf("broken paths\n");
     printf("  count: %" PRIu64 "%s\n", broken_total,
         (broken_count < broken_total) ? " (list truncated by --broken-limit)" : "");
@@ -1498,41 +1083,10 @@ static void print_pretty_report(
     printf("\n");
 }
 
-static void write_json_top_array(
-    FILE* out,
-    const char* key,
-    const dscan_entry_t* entries,
-    uint64_t count)
-{
-    fprintf(out, "    \"%s\": [\n", key);
-    for (uint64_t i = 0; i < count; i++) {
-        const dscan_entry_t* e = &entries[i];
-
-        fprintf(out, "      {\n");
-
-        fprintf(out, "        \"path\": ");
-        json_write_escaped(out, e->path);
-        fprintf(out, ",\n");
-
-        fprintf(out, "        \"type\": ");
-        json_write_escaped(out, type_to_string(e->type));
-        fprintf(out, ",\n");
-
-        fprintf(out, "        \"size_bytes\": %" PRIu64 ",\n", e->size);
-        fprintf(out, "        \"atime\": %" PRIu64 ",\n", e->atime);
-        fprintf(out, "        \"mtime\": %" PRIu64 ",\n", e->mtime);
-        fprintf(out, "        \"ctime\": %" PRIu64 "\n", e->ctime);
-
-        fprintf(out, "      }%s\n", (i + 1 == count) ? "" : ",");
-    }
-    fprintf(out, "    ]");
-}
-
 static int write_json_report(
     const char* output_file,
     const char* directory,
     uint64_t generated_at,
-    uint64_t top_k,
     uint64_t total_items,
     uint64_t total_files,
     uint64_t total_dirs,
@@ -1543,12 +1097,6 @@ static int write_json_report(
     const uint64_t* atime_hist,
     const uint64_t* mtime_hist,
     const uint64_t* ctime_hist,
-    const dscan_entry_t* top_atime,
-    uint64_t top_atime_count,
-    const dscan_entry_t* top_mtime,
-    uint64_t top_mtime_count,
-    const dscan_entry_t* top_ctime,
-    uint64_t top_ctime_count,
     const dscan_broken_t* broken,
     uint64_t broken_count,
     uint64_t broken_total,
@@ -1568,7 +1116,6 @@ static int write_json_report(
     fprintf(out, ",\n");
 
     fprintf(out, "  \"generated_at_epoch\": %" PRIu64 ",\n", generated_at);
-    fprintf(out, "  \"top_k\": %" PRIu64 ",\n", top_k);
 
     fprintf(out, "  \"thresholds\": {\n");
     fprintf(out, "    \"abnormal_size_bytes\": %" PRIu64 ",\n", (uint64_t)DSCAN_ABNORMAL_SIZE_BYTES);
@@ -1656,15 +1203,6 @@ static int write_json_report(
     }
     fprintf(out, "  },\n");
 
-    fprintf(out, "  \"oldest\": {\n");
-    write_json_top_array(out, "atime", top_atime, top_atime_count);
-    fprintf(out, ",\n");
-    write_json_top_array(out, "mtime", top_mtime, top_mtime_count);
-    fprintf(out, ",\n");
-    write_json_top_array(out, "ctime", top_ctime, top_ctime_count);
-    fprintf(out, "\n");
-    fprintf(out, "  },\n");
-
     fprintf(out, "  \"broken_paths_total\": %" PRIu64 ",\n", broken_total);
     fprintf(out, "  \"broken_paths_limit\": %" PRIu64 ",\n", broken_limit);
     fprintf(out, "  \"broken_paths\": [\n");
@@ -1711,7 +1249,6 @@ int main(int argc, char** argv)
 
     char* directory = NULL;
     char* output_file = NULL;
-    uint64_t top_k = 10;
     uint64_t batch_files = 0;
     uint64_t broken_limit = DSCAN_DEFAULT_BROKEN_LIMIT;
     int print_pretty = 0;
@@ -1720,7 +1257,6 @@ int main(int argc, char** argv)
         {"directory", required_argument, 0, 'd'},
         {"output", required_argument, 0, 'o'},
         {"print", no_argument, 0, 'p'},
-        {"top-k", required_argument, 0, 'k'},
         {"batch-files", required_argument, 0, 'b'},
         {"broken-limit", required_argument, 0, 'B'},
         {"verbose", no_argument, 0, 'v'},
@@ -1731,7 +1267,7 @@ int main(int argc, char** argv)
 
     int option_index = 0;
     int c;
-    while ((c = getopt_long(argc, argv, "d:o:pk:b:vqh", long_options, &option_index)) != -1) {
+    while ((c = getopt_long(argc, argv, "d:o:pb:vqh", long_options, &option_index)) != -1) {
         switch (c) {
             case 'd':
                 directory = MFU_STRDUP(optarg);
@@ -1741,11 +1277,6 @@ int main(int argc, char** argv)
                 break;
             case 'p':
                 print_pretty = 1;
-                break;
-            case 'k':
-                if (parse_uint64(optarg, &top_k) != 0 || top_k == 0) {
-                    usage = 1;
-                }
                 break;
             case 'b':
                 if (parse_uint64(optarg, &batch_files) != 0 || batch_files == 0) {
@@ -1829,7 +1360,7 @@ int main(int argc, char** argv)
     MPI_Bcast(&now, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
 
     dscan_acc_t acc;
-    acc_init(&acc, top_k, broken_limit, now);
+    acc_init(&acc, broken_limit, now);
 
     dscan_walk_opts_t wopts;
     wopts.rank = rank;
@@ -1890,14 +1421,7 @@ int main(int argc, char** argv)
 
         MPI_Reduce(red_local, red_global, (int)red_count, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
 
-        /* small gathers: at most K entries and broken-limit paths per rank */
-        uint64_t top_atime_count = 0;
-        uint64_t top_mtime_count = 0;
-        uint64_t top_ctime_count = 0;
-        dscan_entry_t* top_atime = gather_and_merge_topk(&acc.top_atime, rank, ranks, top_k, &top_atime_count, &rc);
-        dscan_entry_t* top_mtime = gather_and_merge_topk(&acc.top_mtime, rank, ranks, top_k, &top_mtime_count, &rc);
-        dscan_entry_t* top_ctime = gather_and_merge_topk(&acc.top_ctime, rank, ranks, top_k, &top_ctime_count, &rc);
-
+        /* small gather: at most broken-limit paths per rank */
         uint64_t broken_count = 0;
         dscan_broken_t* broken = gather_broken(&acc, rank, ranks, broken_limit, &broken_count, &rc);
 
@@ -1922,7 +1446,6 @@ int main(int argc, char** argv)
                     output_file,
                     directory,
                     now,
-                    top_k,
                     total_items,
                     total_files,
                     total_dirs,
@@ -1933,12 +1456,6 @@ int main(int argc, char** argv)
                     atime_hist,
                     mtime_hist,
                     ctime_hist,
-                    top_atime,
-                    top_atime_count,
-                    top_mtime,
-                    top_mtime_count,
-                    top_ctime,
-                    top_ctime_count,
                     broken,
                     broken_count,
                     broken_total,
@@ -1953,7 +1470,6 @@ int main(int argc, char** argv)
             if (rc == 0 && print_pretty) {
                 print_pretty_report(
                     directory,
-                    top_k,
                     total_items,
                     total_files,
                     total_dirs,
@@ -1964,33 +1480,15 @@ int main(int argc, char** argv)
                     atime_hist,
                     mtime_hist,
                     ctime_hist,
-                    top_atime,
-                    top_atime_count,
-                    top_mtime,
-                    top_mtime_count,
-                    top_ctime,
-                    top_ctime_count,
                     broken,
                     broken_count,
                     broken_total);
             }
         }
 
-        for (uint64_t i = 0; i < top_atime_count; i++) {
-            mfu_free(&top_atime[i].path);
-        }
-        for (uint64_t i = 0; i < top_mtime_count; i++) {
-            mfu_free(&top_mtime[i].path);
-        }
-        for (uint64_t i = 0; i < top_ctime_count; i++) {
-            mfu_free(&top_ctime[i].path);
-        }
         for (uint64_t i = 0; i < broken_count; i++) {
             mfu_free(&broken[i].path);
         }
-        mfu_free(&top_atime);
-        mfu_free(&top_mtime);
-        mfu_free(&top_ctime);
         mfu_free(&broken);
         mfu_free(&red_local);
         mfu_free(&red_global);

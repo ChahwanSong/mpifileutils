@@ -1,6 +1,6 @@
 .TH "DSCAN" "1" "Aug 13, 2026" "0.12" "mpiFileUtils"
 .SH NAME
-dscan \- distributed streaming directory scanner with histogram and oldest-entry reporting
+dscan \- distributed streaming directory scanner with histogram reporting
 .SH SYNOPSIS
 .B dscan
 [\fIOPTION\fR]
@@ -11,13 +11,12 @@ report containing:
 .sp
 - file size histogram
 - atime/mtime/ctime capacity histograms (bytes of regular files per age bucket)
-- oldest top-K items for atime/mtime/ctime, including path, timestamps, and size
 - broken-path detection (exact total count, capped listing)
 .sp
 The walk is streaming: entries are folded into fixed-size accumulators as they
 are discovered, statistics are combined with MPI reductions, and only up to
-top-K and broken-limit records per rank travel to rank 0. Memory use per rank
-and traffic to rank 0 are independent of the tree size, so very large trees
+broken-limit records per rank travel to rank 0. Memory use per rank and
+traffic to rank 0 are independent of the tree size, so very large trees
 (billions of entries) can be scanned.
 .SH OPTIONS
 .TP
@@ -30,10 +29,6 @@ Write JSON output to FILE. Required.
 .TP
 .B \-p, \-\-print
 Print a human-readable summary to stdout on rank 0.
-.TP
-.B \-k, \-\-top-k N
-Number of oldest entries to report for each timestamp field.
-Default is 10.
 .TP
 .B \-b, \-\-batch-files N
 Account scanning in batches of approximately N entries and print a progress
@@ -63,4 +58,4 @@ per-entry syscalls are issued):
 - unreadable: a directory could not be opened or lstat failed otherwise
 .SH EXAMPLE
 .sp
-\fBmpirun -np 8 dscan --directory /data --output report.json --top-k 25 --batch-files 1000000 --print\fR
+\fBmpirun -np 8 dscan --directory /data --output report.json --batch-files 1000000 --print\fR
