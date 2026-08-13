@@ -1,6 +1,6 @@
-.TH "DSCAN" "1" "Mar 1, 2026" "0.12" "mpiFileUtils"
+.TH "DSCAN" "1" "Aug 13, 2026" "0.12" "mpiFileUtils"
 .SH NAME
-dscan \- distributed directory scanner with histogram and oldest-entry reporting
+dscan \- distributed streaming directory scanner with histogram and oldest-entry reporting
 .SH SYNOPSIS
 .B dscan
 [\fIOPTION\fR]
@@ -10,16 +10,20 @@ dscan \- distributed directory scanner with histogram and oldest-entry reporting
 report containing:
 .sp
 - file size histogram
-- atime/mtime/ctime histograms for files and directories
+- atime/mtime/ctime capacity histograms (bytes of regular files per age bucket)
 - oldest top-K items for atime/mtime/ctime, including path, timestamps, and size
-- broken-path list
+- broken-path detection (exact total count, capped listing)
 .sp
-Directory size in top-K output is computed as the sum of all regular-file sizes
-under that directory subtree.
+The walk is streaming: entries are folded into fixed-size accumulators as they
+are discovered, statistics are combined with MPI reductions, and only up to
+top-K and broken-limit records per rank travel to rank 0. Memory use per rank
+and traffic to rank 0 are independent of the tree size, so very large trees
+(billions of entries) can be scanned.
 .SH OPTIONS
 .TP
 .B \-d, \-\-directory PATH
-Directory tree to scan. Required.
+Directory tree to scan. Required. Must be mounted at the same path on every
+node running dscan ranks.
 .TP
 .B \-o, \-\-output FILE
 Write JSON output to FILE. Required.
@@ -31,6 +35,14 @@ Print a human-readable summary to stdout on rank 0.
 Number of oldest entries to report for each timestamp field.
 Default is 10.
 .TP
+.B \-b, \-\-batch-files N
+Account scanning in batches of approximately N entries and print a progress
+line on rank 0 as each batch completes.
+.TP
+.B \-\-broken-limit N
+Maximum number of broken paths listed in the report. The total broken count is
+always exact. Default is 10000; 0 keeps only the count.
+.TP
 .B \-v, \-\-verbose
 Enable verbose logging.
 .TP
@@ -41,12 +53,14 @@ Suppress verbose logging.
 Print usage.
 .SH BROKEN-PATH RULES
 .sp
-An item is marked broken when one or more conditions hold:
+An item is marked broken when one or more conditions hold, judged from the
+lstat data collected during the walk and from actual scan errors (no extra
+per-entry syscalls are issued):
 .sp
 - abnormal_size: regular file size is larger than 1 PiB
-- missing: path does not exist
+- missing: lstat failed with ENOENT/ENOTDIR during the scan
 - abnormal_time: atime/mtime/ctime older than 10 years or in the future
-- unreadable: file or directory cannot be opened/read
+- unreadable: a directory could not be opened or lstat failed otherwise
 .SH EXAMPLE
 .sp
-\fBmpirun -np 8 dscan --directory /data --output report.json --top-k 25 --print\fR
+\fBmpirun -np 8 dscan --directory /data --output report.json --top-k 25 --batch-files 1000000 --print\fR
