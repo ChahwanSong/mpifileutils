@@ -48,7 +48,7 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
 
 - `--print` (`-p`): 사람이 읽기 좋은 요약을 stdout(rank 0)에 출력
 - `--batch-files <N>` (`-b`): 약 N개 항목 단위 배치로 진행 상황을 로그 출력
-- `--broken-limit <N>`: 리포트에 나열할 손상 경로 최대 개수 (기본값: `10000`;
+- `--broken-limit <N>`: 리포트에 나열할 손상 경로 최대 개수 (기본값: `100`;
   `0`이면 목록 없이 개수만 집계)
 - `--verbose` (`-v`): 상세 로깅
 - `--quiet` (`-q`): 최소 로깅
@@ -129,7 +129,7 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
     "ctime": []
   },
   "broken_paths_total": 1,
-  "broken_paths_limit": 10000,
+  "broken_paths_limit": 100,
   "broken_paths": [
     {
       "path": "/data/project/bad/file",
