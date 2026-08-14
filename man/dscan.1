@@ -32,7 +32,8 @@ Print a human-readable summary to stdout on rank 0.
 .TP
 .B \-b, \-\-batch-files N
 Account scanning in batches of approximately N entries and print a progress
-line on rank 0 as each batch completes.
+line on rank 0 as each batch completes. Default is 1000000; 0 disables
+batch accounting.
 .TP
 .B \-\-broken-limit N
 Maximum number of broken paths listed in the report. The total broken count is

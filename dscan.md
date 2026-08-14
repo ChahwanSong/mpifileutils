@@ -19,7 +19,7 @@
   - 전체 개수는 항상 정확히 집계되며, 리포트에 나열되는 목록은
     `--broken-limit`으로 상한이 적용됩니다
 - `--batch-files` 기반 배치 진행 (`dsync`/`nsync`와 동일한 옵션 스타일)
-  - 약 N개 항목 단위로 배치를 완료할 때마다 진행 로그 출력
+  - 약 N개 항목 단위로 배치를 완료할 때마다 진행 로그 출력 (기본값 100만)
 - 파일로 JSON 리포트 출력
 - `--print` 옵션으로 선택적 터미널 요약 출력
 
@@ -48,6 +48,7 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
 
 - `--print` (`-p`): 사람이 읽기 좋은 요약을 stdout(rank 0)에 출력
 - `--batch-files <N>` (`-b`): 약 N개 항목 단위 배치로 진행 상황을 로그 출력
+  (기본값: `1000000`; `0`이면 배치 진행 로그 비활성화)
 - `--broken-limit <N>`: 리포트에 나열할 손상 경로 최대 개수 (기본값: `100`;
   `0`이면 목록 없이 개수만 집계)
 - `--verbose` (`-v`): 상세 로깅
@@ -157,6 +158,7 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
 
 ### 2) 배치 진행 (`--batch-files`)
 
+- 기본값은 100만 항목이며 `-b 0`으로 비활성화할 수 있습니다
 - 라운드 경계마다 전역 스캔 항목 수를 `MPI_Allreduce`로 집계
 - 누적 스캔 수가 배치 크기 N을 넘을 때마다 배치 완료로 간주하고
   rank 0(launcher console)에서 진행 로그를 출력:
@@ -233,7 +235,6 @@ cmake --build build -j
 mpirun -np 8 build/src/dscan/dscan \
   --directory /path/to/scan \
   --output /tmp/dscan_report.json \
-  --batch-files 1000000 \
   --print
 ```
 

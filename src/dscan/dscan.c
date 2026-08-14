@@ -45,6 +45,7 @@
 #define DSCAN_ROUND_TASK_BYTES_MAX (64ULL * 1024ULL * 1024ULL)
 
 #define DSCAN_DEFAULT_BROKEN_LIMIT 100ULL
+#define DSCAN_DEFAULT_BATCH_FILES 1000000ULL
 
 static const uint64_t DSCAN_SIZE_LIMITS[] = {
     4ULL * 1024ULL,
@@ -135,6 +136,7 @@ static void print_usage(void)
     printf("  -p, --print              - print pretty summary on stdout (rank 0)\n");
     printf("  -b, --batch-files <N>    - report progress and account scanning in\n");
     printf("                             batches of approximately N entries\n");
+    printf("                             (default %" PRIu64 ", 0 disables batching)\n", (uint64_t)DSCAN_DEFAULT_BATCH_FILES);
     printf("      --broken-limit <N>   - max broken paths kept in the report\n");
     printf("                             (default %" PRIu64 ", total count is always exact)\n", (uint64_t)DSCAN_DEFAULT_BROKEN_LIMIT);
     printf("  -v, --verbose            - verbose output\n");
@@ -1249,7 +1251,7 @@ int main(int argc, char** argv)
 
     char* directory = NULL;
     char* output_file = NULL;
-    uint64_t batch_files = 0;
+    uint64_t batch_files = DSCAN_DEFAULT_BATCH_FILES;
     uint64_t broken_limit = DSCAN_DEFAULT_BROKEN_LIMIT;
     int print_pretty = 0;
 
@@ -1279,7 +1281,8 @@ int main(int argc, char** argv)
                 print_pretty = 1;
                 break;
             case 'b':
-                if (parse_uint64(optarg, &batch_files) != 0 || batch_files == 0) {
+                /* 0 disables batch accounting */
+                if (parse_uint64(optarg, &batch_files) != 0) {
                     usage = 1;
                 }
                 break;
