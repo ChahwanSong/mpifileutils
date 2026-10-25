@@ -1892,22 +1892,6 @@ static int nsync_open_readonly(const char* path, const nsync_options_t* opts)
     return open(path, flags);
 }
 
-static int nsync_open_writeonly_create_trunc(const char* path, mode_t mode, const nsync_options_t* opts)
-{
-    int flags = O_WRONLY | O_CREAT | O_TRUNC;
-    if (opts->open_noatime) {
-#ifdef O_NOATIME
-        flags |= O_NOATIME;
-#endif
-    }
-    if (opts->direct) {
-#ifdef O_DIRECT
-        flags |= O_DIRECT;
-#endif
-    }
-    return open(path, flags, mode);
-}
-
 static int nsync_compute_sha256_file(
     const char* fullpath,
     size_t bufsize,
@@ -3989,116 +3973,259 @@ static int nsync_action_exec_sort(const void* a, const void* b)
     return strcmp(aa->relpath, bb->relpath);
 }
 
-static int nsync_mkdir_one(const char* path, mode_t mode)
+/* ---- destination filesystem layer: never follow a symlink below dst_root ----
+ *
+ * Every create, directory make, removal, and metadata update on the destination
+ * resolves each path component *beneath* the destination root with O_NOFOLLOW.
+ * The root itself -- and anything above it, e.g. a mount point or a managed-root
+ * symlink -- is resolved normally by opening it once up front; only components
+ * inside the destination tree are refused when they are symlinks.
+ *
+ * Why this is needed (and why dsync does not need it): for a destination entry
+ * whose type changed (an existing symlink that must become a directory) nsync
+ * plans "remove the stale entry, make the directory, copy the children into it".
+ * The child copy and the parent remove+mkdir may be owned by different ranks or
+ * land in different --batch-files batches, with no ordering between them. If a
+ * child create runs while the stale symlink is still in place, a path-based
+ * create (open/mkdir with the full path string) traverses that symlink and
+ * writes outside the destination tree. Resolving each component with O_NOFOLLOW
+ * makes such a create fail closed. dsync avoids the race structurally: it
+ * unlinks every type-changed destination entry in a synchronized phase before
+ * any copy begins (dsync_sync_files: delete list, then copy list). nsync's
+ * per-rank, per-batch pipeline has no such global barrier, so it must refuse to
+ * follow symlinks at the filesystem layer instead. */
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+/* Traversal fds (the root anchor and each intermediate directory) are opened
+ * O_PATH so that, exactly like kernel path resolution and the original
+ * path-string syscalls, only search (x) permission is needed on ancestor
+ * directories -- never read (r). An O_PATH dir fd is still a valid dirfd for the
+ * *at syscalls below. O_PATH|O_DIRECTORY|O_NOFOLLOW on a symlink component fails
+ * with ENOTDIR (the directory requirement is not met), so symlinks stay refused.
+ * Where O_PATH is unavailable it degrades to a plain read-only dir fd (correct,
+ * just stricter on ancestor permissions). */
+#ifndef O_PATH
+#define O_PATH 0
+#endif
+#define NSYNC_DIR_TRAVERSE_FLAGS (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+
+/* Open a directory fd for the destination root. The root path is resolved
+ * normally (a mount point or managed-root symlink above the tree is fine).
+ * Returns -1 if the root does not exist or is not a directory -- callers then
+ * let each destination op fail while keeping the MPI copy protocol matched. */
+static int nsync_open_dst_root(const char* dst_root)
 {
-    if (mkdir(path, mode) == 0) {
-        return 0;
+    if (dst_root == NULL || *dst_root == '\0') {
+        errno = ENOENT;
+        return -1;
     }
-
-    if (errno == EEXIST) {
-        struct stat st;
-        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-            return 0;
-        }
-    }
-
-    return -1;
+    /* Resolve the root path normally (a symlink above/at the root is fine) but
+     * open it O_PATH so traversal needs only search on ancestors, not read. */
+    return open(dst_root, O_PATH | O_DIRECTORY | O_CLOEXEC);
 }
 
-static int nsync_mkdirs(const char* path, mode_t mode)
+/* Open the directory that contains relpath's final component, descending one
+ * component at a time from root_fd and refusing to follow any symlink. With
+ * create != 0 each missing intermediate directory is created with dir_mode.
+ * On success returns an open (O_PATH) dir fd (caller closes) and stores a strdup
+ * of the final component in *base_out. Returns -1 otherwise; a symlink component
+ * makes the underlying openat fail with ENOTDIR/ELOOP (fail closed). root_fd < 0
+ * returns EBADF; an empty / "." relpath or a "." / ".." component is rejected. */
+static int nsync_open_parent_at(int root_fd, const char* relpath,
+                                int create, mode_t dir_mode, char** base_out)
 {
-    if (path == NULL || *path == '\0') {
-        return 0;
+    *base_out = NULL;
+    if (root_fd < 0) {
+        errno = EBADF;   /* distinct from a genuinely-missing parent (ENOENT) */
+        return -1;
+    }
+    if (relpath == NULL || relpath[0] == '\0' || strcmp(relpath, ".") == 0) {
+        errno = ENOENT;
+        return -1;
     }
 
-    char* copy = MFU_STRDUP(path);
-    size_t len = strlen(copy);
-    if (len == 0) {
-        mfu_free(&copy);
-        return 0;
-    }
-
-    char* p = copy + 1;
-    for (; *p != '\0'; p++) {
-        if (*p != '/') {
-            continue;
-        }
-
-        *p = '\0';
-        if (*copy != '\0' && nsync_mkdir_one(copy, mode) != 0) {
-            mfu_free(&copy);
-            return -1;
-        }
-        *p = '/';
+    char* work = MFU_STRDUP(relpath);
+    int cur = dup(root_fd);
+    if (cur < 0) {
+        mfu_free(&work);
+        return -1;
     }
 
     int rc = 0;
-    if (*copy != '\0' && nsync_mkdir_one(copy, mode) != 0) {
+    int err = 0;
+    char* base = NULL;
+    char* save = NULL;
+    char* comp = strtok_r(work, "/", &save);
+    while (comp != NULL) {
+        char* next = strtok_r(NULL, "/", &save);
+        if (strcmp(comp, ".") == 0 || strcmp(comp, "..") == 0) {
+            err = ELOOP;   /* never resolve "." / ".." components */
+            rc = -1;
+            break;
+        }
+        if (next == NULL) {
+            base = comp;   /* final component: its parent is `cur` */
+            break;
+        }
+        if (create && mkdirat(cur, comp, dir_mode) != 0 && errno != EEXIST) {
+            err = errno;
+            rc = -1;
+            break;
+        }
+        int child = openat(cur, comp, NSYNC_DIR_TRAVERSE_FLAGS);
+        if (child < 0) {
+            err = errno;   /* ENOTDIR/ELOOP (symlink), ENOENT, ... -> fail closed */
+            rc = -1;
+            break;
+        }
+        close(cur);
+        cur = child;
+        comp = next;
+    }
+
+    if (rc == 0 && base != NULL) {
+        *base_out = MFU_STRDUP(base);
+    } else if (rc == 0) {
+        err = ENOENT;      /* relpath had no usable final component */
         rc = -1;
     }
 
-    mfu_free(&copy);
-    return rc;
-}
-
-static int nsync_ensure_parent_dirs(const char* path)
-{
-    char* copy = MFU_STRDUP(path);
-    char* slash = strrchr(copy, '/');
-    if (slash == NULL || slash == copy) {
-        mfu_free(&copy);
-        return 0;
+    mfu_free(&work);
+    if (rc != 0) {
+        close(cur);
+        errno = err;
+        return -1;
     }
+    return cur;
+}
 
-    *slash = '\0';
-    int rc = nsync_mkdirs(copy, (mode_t)0777);
-    mfu_free(&copy);
+/* Open (O_CREAT|O_TRUNC) a destination regular file. No parent component below
+ * the root and not the final component itself may be a symlink (O_NOFOLLOW on
+ * the final open rejects an existing symlink with ELOOP). */
+static int nsync_open_dst_file_at(int root_fd, const char* relpath, mode_t mode,
+                                  const nsync_options_t* opts)
+{
+    char* base = NULL;
+    int parent = nsync_open_parent_at(root_fd, relpath, 1, (mode_t)0777, &base);
+    if (parent < 0) {
+        return -1;
+    }
+    int flags = O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC;
+    if (opts->open_noatime) {
+#ifdef O_NOATIME
+        flags |= O_NOATIME;
+#endif
+    }
+    if (opts->direct) {
+#ifdef O_DIRECT
+        flags |= O_DIRECT;
+#endif
+    }
+    int fd = openat(parent, base, flags, mode);
+    close(parent);
+    mfu_free(&base);
+    return fd;
+}
+
+/* Create relpath as a directory (making missing parents) without following
+ * symlinks. An existing real directory is accepted; an existing symlink or
+ * non-directory at the final component is refused (fail closed). */
+static int nsync_mkdir_at(int root_fd, const char* relpath, mode_t mode)
+{
+    char* base = NULL;
+    int parent = nsync_open_parent_at(root_fd, relpath, 1, mode, &base);
+    if (parent < 0) {
+        return -1;
+    }
+    int rc = 0;
+    if (mkdirat(parent, base, mode) != 0) {
+        if (errno == EEXIST) {
+            struct stat st;
+            if (fstatat(parent, base, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+                !S_ISDIR(st.st_mode)) {
+                rc = -1;   /* a symlink or a non-directory is in the way */
+            }
+        } else {
+            rc = -1;
+        }
+    }
+    close(parent);
+    mfu_free(&base);
     return rc;
 }
 
-static int nsync_remove_path(const char* fullpath)
+/* Recursively remove `name` within dirfd, never following a symlink: a symlink
+ * (even one pointing at a directory) is unlinked as a link, not descended. */
+static int nsync_remove_entry_at(int pfd, const char* name)
 {
     struct stat st;
-    if (lstat(fullpath, &st) != 0) {
-        if (errno == ENOENT) {
-            return 0;
-        }
-        return -1;
+    if (fstatat(pfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        return (errno == ENOENT) ? 0 : -1;
     }
 
     if (S_ISDIR(st.st_mode)) {
-        DIR* dir = opendir(fullpath);
-        if (dir == NULL) {
+        int cfd = openat(pfd, name, O_DIRECTORY | O_NOFOLLOW | O_RDONLY | O_CLOEXEC);
+        if (cfd < 0) {
             return -1;
         }
-
+        DIR* d = fdopendir(cfd);
+        if (d == NULL) {
+            close(cfd);
+            return -1;
+        }
+        int rc = 0;
+        int ddfd = dirfd(d);
         struct dirent* dent;
-        while ((dent = readdir(dir)) != NULL) {
-            const char* name = dent->d_name;
-            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        while ((dent = readdir(d)) != NULL) {
+            const char* child = dent->d_name;
+            if (strcmp(child, ".") == 0 || strcmp(child, "..") == 0) {
                 continue;
             }
-
-            char* child = nsync_child_relpath(fullpath, name);
-            if (nsync_remove_path(child) != 0) {
-                mfu_free(&child);
-                closedir(dir);
-                return -1;
+            if (nsync_remove_entry_at(ddfd, child) != 0) {
+                rc = -1;
+                break;
             }
-            mfu_free(&child);
         }
-
-        closedir(dir);
-        if (rmdir(fullpath) != 0 && errno != ENOENT) {
+        closedir(d);   /* also closes cfd */
+        if (rc != 0) {
+            return -1;
+        }
+        if (unlinkat(pfd, name, AT_REMOVEDIR) != 0 && errno != ENOENT) {
             return -1;
         }
         return 0;
     }
 
-    if (unlink(fullpath) != 0) {
+    if (unlinkat(pfd, name, 0) != 0 && errno != ENOENT) {
         return -1;
     }
     return 0;
+}
+
+/* Remove relpath from the destination tree without following symlinks. A
+ * missing entry -- or a missing parent -- is treated as success; a symlink
+ * parent component (ELOOP) is reported as an error. */
+static int nsync_remove_at(int root_fd, const char* relpath)
+{
+    if (root_fd < 0) {
+        return -1;   /* unusable destination root is an error, not "nothing to remove" */
+    }
+    char* base = NULL;
+    int parent = nsync_open_parent_at(root_fd, relpath, 0, 0, &base);
+    if (parent < 0) {
+        /* a genuinely-absent parent path means there is nothing to remove;
+         * a symlink parent (ENOTDIR/ELOOP) or other error is reported. */
+        return (errno == ENOENT) ? 0 : -1;
+    }
+    int rc = nsync_remove_entry_at(parent, base);
+    int saved = errno;   /* preserve ENOTEMPTY etc. for the batched-remove retry */
+    close(parent);
+    mfu_free(&base);
+    errno = saved;
+    return rc;
 }
 
 static int nsync_metadata_errno_ignorable(int err)
@@ -4183,6 +4310,143 @@ static void nsync_apply_metadata(
             MFU_LOG(MFU_LOG_WARN, "Skipping metadata timestamp update for `%s`: %s", path, strerror(utime_err));
         }
     }
+}
+
+/* Apply owner/mode/timestamps to relpath without following a symlink in any
+ * component below the root. Mirrors nsync_apply_metadata but resolves the parent
+ * with O_NOFOLLOW and uses the *at syscalls. nofollow != 0 operates on a symlink
+ * itself (chown/utimens with AT_SYMLINK_NOFOLLOW; mode is never set on a link). */
+static void nsync_apply_metadata_at(
+    int root_fd,
+    const char* relpath,
+    const nsync_action_record_t* action,
+    int nofollow,
+    const nsync_options_t* opts,
+    int* local_errors,
+    nsync_meta_apply_stats_t* meta_stats)
+{
+    (void)opts;
+    if (relpath == NULL || action == NULL || local_errors == NULL) {
+        return;
+    }
+
+    /* relpath "." is the destination root itself: operate on the root fd (the
+     * anchor) directly. Every other path resolves its parent without following
+     * a symlink below the root. */
+    char* base = NULL;
+    int parent;
+    if (strcmp(relpath, ".") == 0) {
+        parent = (root_fd >= 0) ? dup(root_fd) : -1;
+        if (parent >= 0) {
+            base = MFU_STRDUP(".");
+        }
+    } else {
+        parent = nsync_open_parent_at(root_fd, relpath, 0, 0, &base);
+    }
+    if (parent < 0) {
+        (*local_errors)++;
+        MFU_LOG(MFU_LOG_WARN, "Failed metadata update for `%s`: %s", relpath, strerror(errno));
+        return;
+    }
+
+    int at_flags = nofollow ? AT_SYMLINK_NOFOLLOW : 0;
+    uid_t uid = (uid_t)action->uid;
+    gid_t gid = (gid_t)action->gid;
+    if (fchownat(parent, base, uid, gid, at_flags) != 0) {
+        int chown_err = errno;
+        if (nsync_metadata_errno_ignorable(chown_err)) {
+            if (meta_stats != NULL) {
+                meta_stats->chown_ignored++;
+            }
+            MFU_LOG(MFU_LOG_WARN, "Skipping owner update for `%s`: %s", relpath, strerror(chown_err));
+        } else {
+            if (meta_stats != NULL) {
+                meta_stats->chown_failed++;
+            }
+            (*local_errors)++;
+            MFU_LOG(MFU_LOG_WARN, "Failed owner update for `%s`: %s", relpath, strerror(chown_err));
+        }
+    }
+
+    if (!nofollow) {
+        mode_t perms = (mode_t)(action->mode & 07777u);
+        if (fchmodat(parent, base, perms, 0) != 0) {
+            int chmod_err = errno;
+            if (nsync_metadata_errno_ignorable(chmod_err)) {
+                if (meta_stats != NULL) {
+                    meta_stats->chmod_ignored++;
+                }
+                MFU_LOG(MFU_LOG_WARN, "Skipping mode update for `%s`: %s", relpath, strerror(chmod_err));
+            } else {
+                if (meta_stats != NULL) {
+                    meta_stats->chmod_failed++;
+                }
+                (*local_errors)++;
+                MFU_LOG(MFU_LOG_WARN, "Failed mode update for `%s`: %s", relpath, strerror(chmod_err));
+            }
+        }
+    }
+
+    struct timespec times[2];
+    long mtime_ns = (action->mtime_nsec <= 999999999ULL) ? (long)action->mtime_nsec : 0L;
+    long atime_ns = (action->atime_nsec <= 999999999ULL) ? (long)action->atime_nsec : 0L;
+    times[0].tv_sec = (time_t)action->atime;
+    times[0].tv_nsec = atime_ns;
+    times[1].tv_sec = (time_t)action->mtime;
+    times[1].tv_nsec = mtime_ns;
+
+    if (utimensat(parent, base, times, at_flags) != 0) {
+        int utime_err = errno;
+        if (!nsync_metadata_errno_ignorable(utime_err)) {
+            if (meta_stats != NULL) {
+                meta_stats->utime_failed++;
+            }
+            (*local_errors)++;
+            MFU_LOG(MFU_LOG_WARN, "Failed metadata timestamp update for `%s`: %s", relpath, strerror(utime_err));
+        } else {
+            if (meta_stats != NULL) {
+                meta_stats->utime_ignored++;
+            }
+            MFU_LOG(MFU_LOG_WARN, "Skipping metadata timestamp update for `%s`: %s", relpath, strerror(utime_err));
+        }
+    }
+
+    close(parent);
+    mfu_free(&base);
+}
+
+/* Create (or replace) a destination symlink without following a symlink in any
+ * component below the root. Any pre-existing entry at relpath is removed first
+ * (as a link, not descended). Returns 0 on success, -1 if anything errored. */
+static int nsync_symlink_at(
+    int root_fd,
+    const char* relpath,
+    const nsync_action_record_t* action,
+    const nsync_options_t* opts,
+    int* local_errors,
+    nsync_meta_apply_stats_t* meta_stats)
+{
+    char* base = NULL;
+    int parent = nsync_open_parent_at(root_fd, relpath, 1, (mode_t)0777, &base);
+    if (parent < 0) {
+        (*local_errors)++;
+        return -1;
+    }
+
+    int errors_before = *local_errors;
+    if (nsync_remove_entry_at(parent, base) != 0) {
+        (*local_errors)++;
+    }
+    if (action->link_target == NULL || symlinkat(action->link_target, parent, base) != 0) {
+        (*local_errors)++;
+    }
+    close(parent);
+    mfu_free(&base);
+
+    if (*local_errors == errors_before) {
+        nsync_apply_metadata_at(root_fd, relpath, action, 1, opts, local_errors, meta_stats);
+    }
+    return (*local_errors == errors_before) ? 0 : -1;
 }
 
 static int nsync_u64_to_offt_checked(uint64_t value, off_t* out)
@@ -5035,6 +5299,7 @@ static nsync_destination_transfer_t* nsync_destination_find_transfer(
 
 static int nsync_destination_start_copy_transfer(
     const char* dst_root,
+    int root_fd,
     const nsync_action_record_t* action,
     uint64_t file_id,
     nsync_destination_transfer_t* transfer,
@@ -5049,22 +5314,17 @@ static int nsync_destination_start_copy_transfer(
     transfer->action = action;
     transfer->dst_fullpath = nsync_build_full_path(dst_root, action->relpath);
 
-    if (nsync_ensure_parent_dirs(transfer->dst_fullpath) != 0) {
-        (*local_errors)++;
-        transfer->open_error = 1;
-    }
-
     mode_t mode = (mode_t)(action->mode & 07777u);
     if (mode == 0) {
         mode = (mode_t)0644;
     }
 
-    if (!transfer->open_error) {
-        transfer->fd = nsync_open_writeonly_create_trunc(transfer->dst_fullpath, mode, opts);
-        if (transfer->fd < 0) {
-            (*local_errors)++;
-            transfer->open_error = 1;
-        }
+    /* Resolve parents and open the destination file without following any
+     * symlink below the root (nsync_open_dst_file_at creates missing parents). */
+    transfer->fd = nsync_open_dst_file_at(root_fd, action->relpath, mode, opts);
+    if (transfer->fd < 0) {
+        (*local_errors)++;
+        transfer->open_error = 1;
     }
 
     if (transfer->fd >= 0) {
@@ -5088,6 +5348,7 @@ static int nsync_destination_start_copy_transfer(
 }
 
 static void nsync_destination_finalize_copy_transfer(
+    int root_fd,
     nsync_destination_transfer_t* transfer,
     const nsync_options_t* opts,
     int* local_errors,
@@ -5119,7 +5380,7 @@ static void nsync_destination_finalize_copy_transfer(
     }
 
     if (success) {
-        nsync_apply_metadata(transfer->dst_fullpath, transfer->action, 0, opts, local_errors, meta_stats);
+        nsync_apply_metadata_at(root_fd, transfer->action->relpath, transfer->action, 0, opts, local_errors, meta_stats);
         if (done_actions != NULL) {
             (*done_actions)++;
         }
@@ -5129,8 +5390,8 @@ static void nsync_destination_finalize_copy_transfer(
         if (done_copy_bytes != NULL) {
             (*done_copy_bytes) += transfer->copied_bytes;
         }
-    } else if (transfer->dst_fullpath != NULL) {
-        (void)nsync_remove_path(transfer->dst_fullpath);
+    } else if (transfer->action != NULL) {
+        (void)nsync_remove_at(root_fd, transfer->action->relpath);
     }
 
     nsync_trace_local(opts, "copy-dst-finalize", transfer->file_id, (uint64_t)success);
@@ -5234,6 +5495,7 @@ static void nsync_destination_handle_copy_frame(
 
 static void nsync_destination_execute_copy_actions(
     const char* dst_root,
+    int root_fd,
     const nsync_action_ptr_vec_t* copy_actions,
     const nsync_options_t* opts,
     int* local_errors,
@@ -5323,7 +5585,7 @@ static void nsync_destination_execute_copy_actions(
             }
 
             if (nsync_destination_start_copy_transfer(
-                    dst_root, action, next_file_id, &transfers[i], opts, local_errors) != 0)
+                    dst_root, root_fd, action, next_file_id, &transfers[i], opts, local_errors) != 0)
             {
                 (*local_errors)++;
                 continue;
@@ -5419,7 +5681,7 @@ static void nsync_destination_execute_copy_actions(
             }
 
             nsync_destination_finalize_copy_transfer(
-                transfer, opts, local_errors, meta_stats,
+                root_fd, transfer, opts, local_errors, meta_stats,
                 done_actions, done_copy_files, done_copy_bytes);
             if (transfer->src_rank >= 0 && transfer->src_rank < world_size && per_source_active[transfer->src_rank] > 0) {
                 per_source_active[transfer->src_rank]--;
@@ -5458,7 +5720,7 @@ static void nsync_destination_execute_copy_actions(
     for (uint64_t i = 0; i < copy_actions->size; i++) {
         if (transfers[i].active) {
             nsync_destination_finalize_copy_transfer(
-                &transfers[i], opts, local_errors, meta_stats,
+                root_fd, &transfers[i], opts, local_errors, meta_stats,
                 done_actions, done_copy_files, done_copy_bytes);
         }
     }
@@ -5549,6 +5811,14 @@ static void nsync_destination_execute_actions(
         return;
     }
 
+    /* Open the destination root once; all destination ops resolve relative to it
+     * and refuse to follow symlinks below it. On failure keep going so the MPI
+     * copy protocol stays matched -- every op below then fails closed. */
+    int root_fd = nsync_open_dst_root(dst_root);
+    if (root_fd < 0) {
+        MFU_LOG(MFU_LOG_ERR, "Cannot open destination root `%s`: %s", dst_root, strerror(errno));
+    }
+
     qsort(dst_actions->records, (size_t)dst_actions->size, sizeof(nsync_action_record_t), nsync_action_exec_sort);
 
     nsync_action_ptr_vec_t copy_actions;
@@ -5567,10 +5837,9 @@ static void nsync_destination_execute_actions(
         }
 
         int action_completed = 0;
-        char* dst_fullpath = nsync_build_full_path(dst_root, action->relpath);
         switch (action->type) {
         case NSYNC_ACTION_REMOVE:
-            if (nsync_remove_path(dst_fullpath) != 0 && errno != ENOENT) {
+            if (nsync_remove_at(root_fd, action->relpath) != 0) {
                 mode_t mode = (mode_t)action->mode;
                 if (opts->batch_files > 0 && S_ISDIR(mode) && errno == ENOTEMPTY) {
                     nsync_deferred_dir_remove_add(deferred_dir_removes, action, local_errors);
@@ -5593,7 +5862,7 @@ static void nsync_destination_execute_actions(
                  * real override mode after all children exist. */
                 mode |= (mode_t)0700;
             }
-            if (nsync_mkdirs(dst_fullpath, mode) != 0) {
+            if (nsync_mkdir_at(root_fd, action->relpath, mode) != 0) {
                 (*local_errors)++;
             } else {
                 nsync_deferred_dir_meta_add(deferred_dir_meta_updates, action, local_errors);
@@ -5601,24 +5870,11 @@ static void nsync_destination_execute_actions(
             }
             break;
         }
-        case NSYNC_ACTION_SYMLINK_UPDATE: {
-            int errors_before = *local_errors;
-            if (nsync_ensure_parent_dirs(dst_fullpath) != 0) {
-                (*local_errors)++;
-            }
-            if (nsync_remove_path(dst_fullpath) != 0 && errno != ENOENT) {
-                (*local_errors)++;
-            }
-            if (action->link_target == NULL || symlink(action->link_target, dst_fullpath) != 0) {
-                (*local_errors)++;
-            } else {
-                nsync_apply_metadata(dst_fullpath, action, 1, opts, local_errors, meta_stats);
-            }
-            if (*local_errors == errors_before) {
+        case NSYNC_ACTION_SYMLINK_UPDATE:
+            if (nsync_symlink_at(root_fd, action->relpath, action, opts, local_errors, meta_stats) == 0) {
                 action_completed = 1;
             }
             break;
-        }
         case NSYNC_ACTION_COPY:
             if (nsync_action_ptr_vec_push(&copy_actions, action) != 0) {
                 (*local_errors)++;
@@ -5630,7 +5886,7 @@ static void nsync_destination_execute_actions(
             } else {
                 int errors_before = *local_errors;
                 int nofollow = S_ISLNK((mode_t)action->mode) ? 1 : 0;
-                nsync_apply_metadata(dst_fullpath, action, nofollow, opts, local_errors, meta_stats);
+                nsync_apply_metadata_at(root_fd, action->relpath, action, nofollow, opts, local_errors, meta_stats);
                 if (*local_errors == errors_before) {
                     action_completed = 1;
                 }
@@ -5643,7 +5899,6 @@ static void nsync_destination_execute_actions(
         if (action_completed) {
             local_done_actions++;
         }
-        mfu_free(&dst_fullpath);
     }
 
     if (copy_actions.size > 1) {
@@ -5653,6 +5908,7 @@ static void nsync_destination_execute_actions(
 
     nsync_destination_execute_copy_actions(
         dst_root,
+        root_fd,
         &copy_actions,
         opts,
         local_errors,
@@ -5670,6 +5926,10 @@ static void nsync_destination_execute_actions(
     }
     if (done_copy_bytes != NULL) {
         (*done_copy_bytes) += local_done_copy_bytes;
+    }
+
+    if (root_fd >= 0) {
+        close(root_fd);
     }
 }
 
@@ -5718,6 +5978,13 @@ static void nsync_finalize_deferred_dir_removes(
         return;
     }
 
+    int root_fd = nsync_open_dst_root(dst_root);
+    if (root_fd < 0) {
+        MFU_LOG(MFU_LOG_ERR, "Cannot open destination root `%s`: %s", dst_root, strerror(errno));
+        (*local_errors)++;
+        return;
+    }
+
     qsort(
         deferred_dir_removes->records,
         (size_t)deferred_dir_removes->size,
@@ -5736,13 +6003,12 @@ static void nsync_finalize_deferred_dir_removes(
             continue;
         }
 
-        char* dst_fullpath = nsync_build_full_path(dst_root, action->relpath);
-        if (nsync_remove_path(dst_fullpath) != 0 && errno != ENOENT)
-        {
+        if (nsync_remove_at(root_fd, action->relpath) != 0) {
             (*local_errors)++;
         }
-        mfu_free(&dst_fullpath);
     }
+
+    close(root_fd);
 }
 
 static void nsync_finalize_deferred_dir_meta_updates(
@@ -5765,6 +6031,13 @@ static void nsync_finalize_deferred_dir_meta_updates(
      * list contents), so the collectives below stay matched even when a given
      * rank's deferred list is empty. */
     uint64_t total = (deferred_dir_meta_updates != NULL) ? deferred_dir_meta_updates->size : 0;
+
+    /* Open the root once; do NOT early-return on failure -- every dst rank must
+     * reach the barriers below, so a bad root just makes each apply fail. */
+    int root_fd = nsync_open_dst_root(dst_root);
+    if (root_fd < 0 && total > 0) {
+        MFU_LOG(MFU_LOG_ERR, "Cannot open destination root `%s`: %s", dst_root, strerror(errno));
+    }
 
     int local_max_depth = 0;
     if (total > 0) {
@@ -5789,14 +6062,16 @@ static void nsync_finalize_deferred_dir_meta_updates(
             if (nsync_relpath_depth(action->relpath) != depth) {
                 break;
             }
-            char* dst_fullpath = nsync_build_full_path(dst_root, action->relpath);
-            nsync_apply_metadata(dst_fullpath, action, 0, opts, local_errors, meta_stats);
-            mfu_free(&dst_fullpath);
+            nsync_apply_metadata_at(root_fd, action->relpath, action, 0, opts, local_errors, meta_stats);
             idx++;
         }
         if (dst_comm != MPI_COMM_NULL) {
             MPI_Barrier(dst_comm);
         }
+    }
+
+    if (root_fd >= 0) {
+        close(root_fd);
     }
 }
 
