@@ -4349,7 +4349,12 @@ static void nsync_apply_metadata_at(
         return;
     }
 
-    int at_flags = nofollow ? AT_SYMLINK_NOFOLLOW : 0;
+    /* Never follow the final component. chown/utimes take AT_SYMLINK_NOFOLLOW
+     * unconditionally: for a real file/dir it is a no-op, and if `base` was
+     * raced into a symlink it operates on the link itself (an in-tree entry) --
+     * it can never be followed out of the tree. chmod (no working
+     * AT_SYMLINK_NOFOLLOW on Linux) is applied below through an O_NOFOLLOW fd. */
+    int at_flags = AT_SYMLINK_NOFOLLOW;
     uid_t uid = (uid_t)action->uid;
     gid_t gid = (gid_t)action->gid;
     if (fchownat(parent, base, uid, gid, at_flags) != 0) {
@@ -4369,21 +4374,45 @@ static void nsync_apply_metadata_at(
     }
 
     if (!nofollow) {
+        /* Resolve the final component once with O_PATH|O_NOFOLLOW (which, unlike
+         * a bare O_NOFOLLOW, opens the entry even when it is a symlink), confirm
+         * via fstat that it is NOT a symlink, then chmod the pinned inode through
+         * /proc/self/fd. This is atomic against a racing name swap -- the fd
+         * refers to the inode we verified, so no later rename/symlink can divert
+         * the chmod outside the tree. (fchmodat has no usable AT_SYMLINK_NOFOLLOW
+         * on Linux, so a by-name chmod could otherwise follow a swapped symlink.) */
         mode_t perms = (mode_t)(action->mode & 07777u);
-        if (fchmodat(parent, base, perms, 0) != 0) {
-            int chmod_err = errno;
-            if (nsync_metadata_errno_ignorable(chmod_err)) {
-                if (meta_stats != NULL) {
-                    meta_stats->chmod_ignored++;
-                }
-                MFU_LOG(MFU_LOG_WARN, "Skipping mode update for `%s`: %s", relpath, strerror(chmod_err));
+        int efd = openat(parent, base, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        struct stat est;
+        if (efd < 0) {
+            if (nsync_metadata_errno_ignorable(errno)) {
+                if (meta_stats != NULL) meta_stats->chmod_ignored++;
             } else {
-                if (meta_stats != NULL) {
-                    meta_stats->chmod_failed++;
-                }
+                if (meta_stats != NULL) meta_stats->chmod_failed++;
                 (*local_errors)++;
-                MFU_LOG(MFU_LOG_WARN, "Failed mode update for `%s`: %s", relpath, strerror(chmod_err));
+                MFU_LOG(MFU_LOG_WARN, "Failed mode update for `%s`: %s", relpath, strerror(errno));
             }
+        } else if (fstat(efd, &est) != 0 || S_ISLNK(est.st_mode)) {
+            /* vanished or raced into a symlink: skip chmod, never follow it */
+            if (meta_stats != NULL) meta_stats->chmod_ignored++;
+            MFU_LOG(MFU_LOG_WARN, "Skipping mode update for `%s`: not a regular file or directory", relpath);
+        } else {
+            char procpath[64];
+            snprintf(procpath, sizeof(procpath), "/proc/self/fd/%d", efd);
+            if (fchmodat(AT_FDCWD, procpath, perms, 0) != 0) {
+                int chmod_err = errno;
+                if (nsync_metadata_errno_ignorable(chmod_err)) {
+                    if (meta_stats != NULL) meta_stats->chmod_ignored++;
+                    MFU_LOG(MFU_LOG_WARN, "Skipping mode update for `%s`: %s", relpath, strerror(chmod_err));
+                } else {
+                    if (meta_stats != NULL) meta_stats->chmod_failed++;
+                    (*local_errors)++;
+                    MFU_LOG(MFU_LOG_WARN, "Failed mode update for `%s`: %s", relpath, strerror(chmod_err));
+                }
+            }
+        }
+        if (efd >= 0) {
+            close(efd);
         }
     }
 
