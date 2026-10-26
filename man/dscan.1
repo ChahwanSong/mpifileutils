@@ -12,6 +12,10 @@ report containing:
 - file size histogram
 - atime/mtime/ctime capacity histograms (bytes of regular files per age bucket)
 - broken-path detection (exact total count, capped listing)
+- summary.total_bytes: exact sum of st_size over regular files
+- summary.invalid_name_entries: number of scanned entries whose own name
+(the last path component) is not well-formed UTF-8; a counter only, not a
+broken-path reason
 .sp
 The walk is streaming: entries are folded into fixed-size accumulators as they
 are discovered, statistics are combined with MPI reductions, and only up to

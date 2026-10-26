@@ -10,6 +10,9 @@
  * - broken path detection uses the lstat data collected during the walk (no
  *   second lstat/open pass) and the reported list is capped by --broken-limit
  * - memory-bounded batch mode via --batch-files with per-batch progress
+ * - summary.total_bytes (sum of regular-file st_size) and
+ *   summary.invalid_name_entries (entries whose own name is not strict UTF-8)
+ *   are plain counters folded into the same single reduce
  */
 
 #define _GNU_SOURCE
@@ -106,6 +109,8 @@ typedef struct {
     uint64_t total_other;
     uint64_t scan_errors;
     uint64_t broken_total;
+    uint64_t total_bytes;          /* sum of st_size over regular files */
+    uint64_t invalid_name_entries; /* entries whose own name is not strict UTF-8 */
 
     uint64_t size_hist[DSCAN_SIZE_BIN_COUNT];
     uint64_t atime_hist[DSCAN_TIME_BIN_COUNT];
@@ -220,6 +225,64 @@ static uint64_t time_hist_bin(uint64_t now, uint64_t timestamp)
         }
     }
     return nlimits;
+}
+
+/* strict UTF-8 well-formedness (Unicode Table 3-7): rejects stray
+ * continuation bytes, truncated sequences, overlong forms (C0/C1, E0 80..9F,
+ * F0 80..8F), UTF-16 surrogates (ED A0..BF) and code points above U+10FFFF
+ * (F4 90.., F5..FF). Same verdict as a strict decoder such as Python's
+ * bytes.decode("utf-8"). */
+static int name_is_valid_utf8(const char* text)
+{
+    const unsigned char* p = (const unsigned char*) text;
+    while (*p != '\0') {
+        unsigned char c = p[0];
+        if (c < 0x80) {
+            p++;
+            continue;
+        }
+
+        int need;
+        unsigned char lo = 0x80;
+        unsigned char hi = 0xBF;
+        if (c >= 0xC2 && c <= 0xDF) {
+            need = 1;
+        } else if (c == 0xE0) {
+            need = 2;
+            lo = 0xA0;
+        } else if (c >= 0xE1 && c <= 0xEC) {
+            need = 2;
+        } else if (c == 0xED) {
+            need = 2;
+            hi = 0x9F;
+        } else if (c >= 0xEE && c <= 0xEF) {
+            need = 2;
+        } else if (c == 0xF0) {
+            need = 3;
+            lo = 0x90;
+        } else if (c >= 0xF1 && c <= 0xF3) {
+            need = 3;
+        } else if (c == 0xF4) {
+            need = 3;
+            hi = 0x8F;
+        } else {
+            /* 80..C1 (continuation/overlong lead) and F5..FF */
+            return 0;
+        }
+
+        /* the second byte has the lead-specific range; a NUL terminator
+         * fails the range check, so truncation is caught here too */
+        if (p[1] < lo || p[1] > hi) {
+            return 0;
+        }
+        for (int i = 2; i <= need; i++) {
+            if (p[i] < 0x80 || p[i] > 0xBF) {
+                return 0;
+            }
+        }
+        p += need + 1;
+    }
+    return 1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -379,6 +442,7 @@ static void acc_emit_entry(dscan_acc_t* acc, const char* path, const struct stat
 
     if (type == MFU_TYPE_FILE) {
         acc->total_files++;
+        acc->total_bytes += size;
         acc->size_hist[size_hist_bin(size)]++;
 
         /* time histograms accumulate file capacity (bytes), files only --
@@ -465,6 +529,15 @@ static void walk_scan_directory(
 
         (*scanned)++;
         acc_emit_entry(acc, child, &st);
+
+        /* judge the entry's own name only: checking the full path would
+         * also count every descendant of a badly named directory. Only
+         * entries counted in total_entries are judged (the scan root's name
+         * is the caller's argument, not a tree entry name). Counter only:
+         * an undecodable name is not a broken path. */
+        if (!name_is_valid_utf8(name)) {
+            acc->invalid_name_entries++;
+        }
 
         if (S_ISDIR(st.st_mode)) {
             int owner = (int) (dscan_hash_path(child) % (uint64_t)wopts->ranks);
@@ -1020,6 +1093,8 @@ static void print_pretty_report(
     uint64_t total_links,
     uint64_t total_other,
     uint64_t scan_errors,
+    uint64_t total_bytes,
+    uint64_t invalid_name_entries,
     const uint64_t* size_hist,
     const uint64_t* atime_hist,
     const uint64_t* mtime_hist,
@@ -1040,6 +1115,13 @@ static void print_pretty_report(
     printf("  total_symlinks   : %" PRIu64 "\n", total_links);
     printf("  total_other      : %" PRIu64 "\n", total_other);
     printf("  scan_errors      : %" PRIu64 "\n", scan_errors);
+    {
+        double bytes_v;
+        const char* bytes_u;
+        mfu_format_bytes(total_bytes, &bytes_v, &bytes_u);
+        printf("  total_bytes      : %" PRIu64 " (%.2f %s)\n", total_bytes, bytes_v, bytes_u);
+    }
+    printf("  invalid_names    : %" PRIu64 "\n", invalid_name_entries);
     printf("\n");
 
     printf("file size histogram\n");
@@ -1095,6 +1177,8 @@ static int write_json_report(
     uint64_t total_links,
     uint64_t total_other,
     uint64_t scan_errors,
+    uint64_t total_bytes,
+    uint64_t invalid_name_entries,
     const uint64_t* size_hist,
     const uint64_t* atime_hist,
     const uint64_t* mtime_hist,
@@ -1131,7 +1215,9 @@ static int write_json_report(
     fprintf(out, "    \"total_directories\": %" PRIu64 ",\n", total_dirs);
     fprintf(out, "    \"total_symlinks\": %" PRIu64 ",\n", total_links);
     fprintf(out, "    \"total_other\": %" PRIu64 ",\n", total_other);
-    fprintf(out, "    \"scan_errors\": %" PRIu64 "\n", scan_errors);
+    fprintf(out, "    \"scan_errors\": %" PRIu64 ",\n", scan_errors);
+    fprintf(out, "    \"total_bytes\": %" PRIu64 ",\n", total_bytes);
+    fprintf(out, "    \"invalid_name_entries\": %" PRIu64 "\n", invalid_name_entries);
     fprintf(out, "  },\n");
 
     fprintf(out, "  \"file_size_histogram\": [\n");
@@ -1399,6 +1485,8 @@ int main(int argc, char** argv)
             RED_OTHER,
             RED_SCAN_ERRORS,
             RED_BROKEN_TOTAL,
+            RED_TOTAL_BYTES,
+            RED_INVALID_NAMES,
             RED_HIST_BASE,
         };
         const uint64_t red_count = RED_HIST_BASE +
@@ -1414,6 +1502,8 @@ int main(int argc, char** argv)
         red_local[RED_OTHER] = acc.total_other;
         red_local[RED_SCAN_ERRORS] = acc.scan_errors;
         red_local[RED_BROKEN_TOTAL] = acc.broken_total;
+        red_local[RED_TOTAL_BYTES] = acc.total_bytes;
+        red_local[RED_INVALID_NAMES] = acc.invalid_name_entries;
         memcpy(&red_local[off], acc.size_hist, sizeof(acc.size_hist));
         off += DSCAN_SIZE_BIN_COUNT;
         memcpy(&red_local[off], acc.atime_hist, sizeof(acc.atime_hist));
@@ -1435,6 +1525,8 @@ int main(int argc, char** argv)
             uint64_t total_other = red_global[RED_OTHER];
             uint64_t scan_errors = red_global[RED_SCAN_ERRORS];
             uint64_t broken_total = red_global[RED_BROKEN_TOTAL];
+            uint64_t total_bytes = red_global[RED_TOTAL_BYTES];
+            uint64_t invalid_name_entries = red_global[RED_INVALID_NAMES];
             uint64_t total_items = total_files + total_dirs + total_links + total_other;
 
             const uint64_t* size_hist = &red_global[RED_HIST_BASE];
@@ -1455,6 +1547,8 @@ int main(int argc, char** argv)
                     total_links,
                     total_other,
                     scan_errors,
+                    total_bytes,
+                    invalid_name_entries,
                     size_hist,
                     atime_hist,
                     mtime_hist,
@@ -1479,6 +1573,8 @@ int main(int argc, char** argv)
                     total_links,
                     total_other,
                     scan_errors,
+                    total_bytes,
+                    invalid_name_entries,
                     size_hist,
                     atime_hist,
                     mtime_hist,

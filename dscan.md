@@ -10,6 +10,9 @@
 ## 기능 (Features)
 
 - 파일 크기 히스토그램 (크기 버킷별 일반 파일 **개수**)
+- 총 용량 `summary.total_bytes` (일반 파일 `st_size` 합계, 정확한 값)
+- 이름 인코딩 카운터 `summary.invalid_name_entries`
+  (자기 이름이 엄격한 UTF-8이 아닌 항목 수; 손상 경로로 취급하지 않음)
 - atime/mtime/ctime 용량 히스토그램 (나이 버킷별 일반 파일 크기의 **byte 합계**; 파일만)
 - 손상 경로(broken path) 탐지
   - 비정상 크기 (abnormal size)
@@ -83,7 +86,17 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
 - `directory`: 스캔한 루트 경로
 - `generated_at_epoch`: 리포트 생성 시각 (epoch 초)
 - `thresholds`: 검사에 사용된 임계값 상수
-- `summary`: 전체 항목 카운터 (`scan_errors` 포함)
+- `summary`: 전체 항목 카운터 (`scan_errors`, `total_bytes`, `invalid_name_entries` 포함)
+  - `total_bytes`: 일반 파일의 `st_size`(겉보기 크기) 합계. 디렉토리·심볼릭링크·기타는
+    제외하고, sparse 파일은 겉보기 크기로, 하드링크는 경로마다 집계합니다
+    (`time_histograms` 한 종류의 `bytes` 합과 항상 같습니다). 0이어도 항상 출력됩니다.
+  - `invalid_name_entries`: 스캔된 항목(`total_entries`에 집계된 항목) 중 **자기 이름**
+    (`readdir`의 `d_name`, 마지막 경로 구성요소)이 엄격한 UTF-8이 아닌 항목 수.
+    전체 경로가 아니라 자기 이름만 보므로, 이름이 깨진 디렉토리의 하위 항목은
+    (자기 이름이 정상이면) 집계되지 않습니다. 스캔 루트 자체의 이름은 판정하지 않습니다.
+    판정은 Unicode 표 3-7 기준(overlong·surrogate·U+10FFFF 초과·잘린 시퀀스 거부)으로
+    Python `bytes.decode("utf-8")`와 같습니다. 카운터일 뿐 `broken_paths`/
+    `broken_paths_total`에는 영향이 없습니다. 0이어도 항상 출력됩니다.
 - `file_size_histogram`: 파일 크기 버킷 개수 (파일 수; `count` 필드)
 - `time_histograms`: atime/mtime/ctime 용량 버킷 (파일 크기 byte 합계; `bytes` 필드; 파일만)
 - `broken_paths_total`: 손상 항목 전체 개수 (정확한 값)
@@ -107,7 +120,9 @@ mpirun -np <N> dscan --directory <path> --output <file> [options]
     "total_directories": 13000,
     "total_symlinks": 400,
     "total_other": 56,
-    "scan_errors": 0
+    "scan_errors": 0,
+    "total_bytes": 81920000,
+    "invalid_name_entries": 0
   },
   "file_size_histogram": [
     {
