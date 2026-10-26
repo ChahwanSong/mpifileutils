@@ -4027,6 +4027,53 @@ static int nsync_open_dst_root(const char* dst_root)
     return open(dst_root, O_PATH | O_DIRECTORY | O_CLOEXEC);
 }
 
+/* mkdir -p for the destination root itself. These components are the
+ * caller-given target path -- at or above the root -- and are resolved
+ * normally, exactly as the original path-based code did when the first
+ * MKDIR/COPY created a new destination; only components *below* the root are
+ * walked with O_NOFOLLOW. EEXIST is fine (another destination rank may create
+ * it concurrently); a non-directory in the way makes the following open fail. */
+static int nsync_mkdir_root_path(const char* path, mode_t mode)
+{
+    if (path == NULL || *path == '\0') {
+        errno = ENOENT;
+        return -1;
+    }
+    char* copy = MFU_STRDUP(path);
+    int rc = 0;
+    for (char* p = copy + 1; ; p++) {
+        if (*p != '/' && *p != '\0') {
+            continue;
+        }
+        char saved = *p;
+        *p = '\0';
+        if (mkdir(copy, mode) != 0 && errno != EEXIST) {
+            rc = -1;
+        }
+        *p = saved;
+        if (rc != 0 || saved == '\0') {
+            break;
+        }
+    }
+    mfu_free(&copy);
+    return rc;
+}
+
+/* Open the destination root, creating it (and any missing ancestors) first when
+ * it does not exist yet -- syncing into a new destination directory is the
+ * normal case. Only the execute phase calls this (never a dry run). */
+static int nsync_open_or_create_dst_root(const char* dst_root)
+{
+    int fd = nsync_open_dst_root(dst_root);
+    if (fd >= 0 || errno != ENOENT) {
+        return fd;
+    }
+    if (nsync_mkdir_root_path(dst_root, (mode_t)0777) != 0) {
+        return -1;
+    }
+    return nsync_open_dst_root(dst_root);
+}
+
 /* Open the directory that contains relpath's final component, descending one
  * component at a time from root_fd and refusing to follow any symlink. With
  * create != 0 each missing intermediate directory is created with dir_mode.
@@ -5840,10 +5887,11 @@ static void nsync_destination_execute_actions(
         return;
     }
 
-    /* Open the destination root once; all destination ops resolve relative to it
-     * and refuse to follow symlinks below it. On failure keep going so the MPI
-     * copy protocol stays matched -- every op below then fails closed. */
-    int root_fd = nsync_open_dst_root(dst_root);
+    /* Open the destination root once (creating it when the destination is new --
+     * the root's own MKDIR "." is skipped below); all destination ops resolve
+     * relative to it and refuse to follow symlinks below it. On failure keep going
+     * so the MPI copy protocol stays matched -- every op below then fails closed. */
+    int root_fd = nsync_open_or_create_dst_root(dst_root);
     if (root_fd < 0) {
         MFU_LOG(MFU_LOG_ERR, "Cannot open destination root `%s`: %s", dst_root, strerror(errno));
     }
