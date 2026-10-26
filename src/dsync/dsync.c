@@ -260,7 +260,8 @@ static void print_usage(void)
     printf("      --open-noatime      - open files with O_NOATIME\n");
     printf("      --link-dest <DIR>   - hardlink to files in DIR when unchanged\n");
     printf("  -S, --sparse            - create sparse files when possible\n");
-    printf("      --chown <USER:GROUP> - set owner/group of target items (name or numeric id; needs privilege)\n");
+    printf("      --chown <USER:GROUP> - set owner/group of target items (name or numeric id; needs privilege;\n");
+    printf("                             clears setuid/setgid on regular files, like chown(2))\n");
     printf("      --chmod <SPEC>      - set permission bits on target items\n");
     printf("                            (octal e.g. 0750, or D<oct>,F<oct> for dirs/files; symlinks unchanged)\n");
     printf("      --progress <N>      - print progress every N seconds\n");
@@ -3722,6 +3723,16 @@ int main(int argc, char **argv)
                     mfu_flist_file_set_mode(flist_src, ov_idx,
                         (ov_old & (uint64_t)S_IFMT) | (uint64_t)(ov_perm & 07777));
                 }
+            }
+            /* An ownership override drops the set-user-ID / set-group-ID bits
+             * of a regular file -- the rule chown(2) itself applies -- so a
+             * --chown sync never produces a setuid/setgid executable owned by
+             * the override uid/gid; otherwise the permission copy after chown
+             * would restore the bits the kernel cleared. Directories keep
+             * S_ISGID (group inheritance, not escalation). */
+            if ((options.chown_set_uid || options.chown_set_gid) && ov_type == MFU_TYPE_FILE) {
+                uint64_t ov_mode = mfu_flist_file_get_mode(flist_src, ov_idx);
+                mfu_flist_file_set_mode(flist_src, ov_idx, ov_mode & ~(uint64_t)(S_ISUID | S_ISGID));
             }
         }
     }

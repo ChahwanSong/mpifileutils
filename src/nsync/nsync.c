@@ -497,7 +497,8 @@ static void nsync_usage(void)
     printf("      --role-mode <MODE>     - role assignment mode: auto or map\n");
     printf("      --role-map <SPEC>      - explicit role map (used with --role-mode map)\n");
     printf("      --trace                - print detailed per-rank stage traces (debug)\n");
-    printf("      --chown <USER:GROUP>   - set owner/group of target items (name or numeric id; needs privilege)\n");
+    printf("      --chown <USER:GROUP>   - set owner/group of target items (name or numeric id; needs privilege;\n");
+    printf("                               clears setuid/setgid on regular files, like chown(2))\n");
     printf("      --chmod <SPEC>         - set permission bits on target items\n");
     printf("                               (octal e.g. 0750, or D<oct>,F<oct> for dirs/files; symlinks unchanged)\n");
     printf("  -q, --quiet                - quiet output\n");
@@ -2151,6 +2152,15 @@ static int nsync_scan_emit_path(
                 uint32_t perm = is_dir ? opts->chmod_dir : opts->chmod_file;
                 rec.mode = (rec.mode & (uint64_t)S_IFMT) | (uint64_t)(perm & 07777);
             }
+        }
+        /* An ownership override drops the set-user-ID / set-group-ID bits of a
+         * regular file -- the rule chown(2) itself applies -- so a --chown sync
+         * never produces a setuid/setgid executable owned by the override
+         * uid/gid (the source owner chose those bits, not the new owner).
+         * Without this the later chmod would restore bits the kernel cleared on
+         * chown. Directories keep S_ISGID (group inheritance, not escalation). */
+        if ((opts->chown_set_uid || opts->chown_set_gid) && rec.type == MFU_TYPE_FILE) {
+            rec.mode &= ~(uint64_t)(S_ISUID | S_ISGID);
         }
     }
     rec.size = (uint64_t)st->st_size;
