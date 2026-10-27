@@ -320,4 +320,35 @@ if want T34; then cc -shared -fPIC -o $W/shim.so /work/tests/shim-enospc.c -ldl 
   done
 fi
 
+# ---------- --open-noatime: 소스 atime 보존(소유자·root), 남의 파일은 그냥 읽어 복사 ----------
+atime_of() { stat -c %X "$1"; }
+mk_at() { mkdir -p $1/src $1/dst; for i in 1 2 3; do echo a$i > $1/src/f$i; done; touch -a -d 2001-01-01 $1/src/f*; chmod 755 $1 $1/src; }
+OLD=$(date -d 2001-01-01 +%s)
+if want T35; then
+  B=$(fresh T35a); mk_at $B; ns $R11 $B/src $B/dst
+  [ $RC = 0 ] && [ "$(atime_of $B/src/f1)" != "$OLD" ] && ok T35-control-atime-updated || { ko T35-control-atime-updated "rc=$RC atime=$(atime_of $B/src/f1)"; }
+  B=$(fresh T35b); mk_at $B; ns $R11 --open-noatime $B/src $B/dst
+  [ $RC = 0 ] && [ "$(atime_of $B/src/f1)" = "$OLD" ] && [ "$(nfiles $B/dst)" = 3 ] && grep -q "open-noatime=1" $LOG && ok T35-root-keeps-atime || { ko T35-root-keeps-atime "rc=$RC atime=$(atime_of $B/src/f1)"; logtail 4; }
+  B=$(fresh T35c); mk_at $B; chown -R tuser:tuser $B; touch -a -d 2001-01-01 $B/src/f*; ns_user tuser $R11 --open-noatime $B/src $B/dst
+  [ $RC = 0 ] && [ "$(atime_of $B/src/f1)" = "$OLD" ] && ok T35-owner-keeps-atime || { ko T35-owner-keeps-atime "rc=$RC atime=$(atime_of $B/src/f1)"; logtail 4; }
+  B=$(fresh T35d); mk_at $B; chown tuser $B $B/dst; ns_user tuser $R11 --open-noatime $B/src $B/dst
+  [ $RC = 0 ] && [ "$(nfiles $B/dst)" = 3 ] && grep -q "3 source file(s) not owned by this run were read without O_NOATIME" $LOG \
+    && ok T35-not-owner-still-copies || { ko T35-not-owner-still-copies "rc=$RC files=$(nfiles $B/dst)"; logtail 6; }
+fi
+
+# ---------- --direct: nsync 에서는 받기만 하고 쓰지 않는다(정렬 안 된 크기도 그대로 복사) ----------
+if want T36; then B=$(fresh T36); mkdir -p $B/src; head -c 12345 /dev/urandom > $B/src/odd; head -c 1048577 /dev/urandom > $B/src/big; echo t > $B/src/tiny
+  ns $R21 --direct $B/src $B/dst
+  [ $RC = 0 ] && [ "$(treesum $B/src)" = "$(treesum $B/dst)" ] && grep -q "\-\-direct has no effect in nsync" $LOG && ok T36-direct-is-accepted-noop || { ko T36-direct-is-accepted-noop "rc=$RC"; logtail 6; }
+fi
+
+# ---------- dsync --open-noatime: root 는 atime 보존, 비 root 의 남의 파일은 그냥 읽어 복사 ----------
+if want T37; then
+  B=$(fresh T37a); mk_at $B; ds 2 --open-noatime $B/src $B/dst
+  [ $RC = 0 ] && [ "$(atime_of $B/src/f1)" = "$OLD" ] && [ "$(treesum $B/src)" = "$(treesum $B/dst)" ] && ok T37-dsync-root-keeps-atime || { ko T37-dsync-root-keeps-atime "rc=$RC"; logtail 4; }
+  B=$(fresh T37b); mk_at $B; chown tuser $B $B/dst
+  LOG=$W/last.log; runuser -u tuser -- env HOME=/tmp timeout 300 mpirun -np 2 $BIN/dsync --open-noatime $B/src $B/dst >$LOG 2>&1; RC=$?
+  [ "$(treesum $B/src)" = "$(treesum $B/dst)" ] && ! grep -q "Failed to open input file" $LOG && ok T37-dsync-not-owner-still-copies || { ko T37-dsync-not-owner-still-copies "rc=$RC"; grep -m3 -E "ERROR" $LOG; }
+fi
+
 echo "==== PASS=$PASS FAIL=$FAIL ${FAILED[*]}"

@@ -23,6 +23,6 @@ for BIN in /opt/mfu-base/bin /opt/mpifileutils/bin; do
     t0=$(date +%s.%N)
     timeout 1800 mpirun -np $np $BIN/nsync --role-mode map --role-map $ROLES $opt $SRC $W/dst > $W/log 2>&1; rc=$?
     t1=$(date +%s.%N)
-    echo "$(basename $(dirname $BIN)) resync opts='$opt' rc=$rc seconds=$(echo "$t1 - $t0" | bc) $(grep -o 'Type-change pre-pass.*' $W/log)" | tee -a $OUT
+    echo "$(basename $(dirname $BIN)) resync opts='$opt' rc=$rc seconds=$(awk "BEGIN{printf \"%.3f\", $t1 - $t0}") $(grep -o 'Type-change pre-pass.*' $W/log)" | tee -a $OUT
   done
 done

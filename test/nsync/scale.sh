@@ -20,5 +20,5 @@ EOF
   t0=$(date +%s.%N)
   timeout 1800 mpirun -np $np $BIN/nsync --role-mode map --role-map $ROLES -q $W/src $W/dst >/dev/null 2>&1; rc=$?
   t1=$(date +%s.%N)
-  echo "$(basename $(dirname $BIN)) roles=$ROLES N=$N rc=$rc seconds=$(echo "$t1 - $t0" | bc)" | tee -a $OUT
+  echo "$(basename $(dirname $BIN)) roles=$ROLES N=$N rc=$rc seconds=$(awk "BEGIN{printf \"%.3f\", $t1 - $t0}")" | tee -a $OUT
 done

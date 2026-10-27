@@ -1,6 +1,6 @@
 # nsync / dsync regression harness
 
-Local tests for the nsync and dsync changes on this branch (85 checks pass at c4dbf20). They run in a
+Local tests for the nsync and dsync changes on this branch (92 checks pass). They run in a
 development container with the same toolchain as the DMS job image's build stage. No CMakeLists.txt here:
 the build does not pick this directory up.
 
@@ -19,7 +19,7 @@ the new checks should fail there.
 ## Run
 
 ```sh
-docker exec -e REPS=3 mfu-dev bash /work/tests/run.sh           # all cases (T01-T34); REPS repeats the racy ones
+docker exec -e REPS=3 mfu-dev bash /work/tests/run.sh           # all cases (T01-T37); REPS repeats the racy ones
 docker exec mfu-dev bash /work/tests/run.sh T23 T24             # by prefix
 docker exec -e SIZES="20000 40000" mfu-dev bash /work/tests/scale.sh   # small-file copy time
 docker exec mfu-dev bash /work/tests/perf2.sh                   # unchanged resync + type-change pre-pass cost
@@ -30,6 +30,8 @@ docker run --rm --tmpfs /mnt/small:rw,size=4m -v "$PWD/test/nsync":/work/tests:r
 T33 nearly fills /dev/shm (needs `--shm-size 1g`). T34 compiles `shim-enospc.c` (ENOSPC injected into
 mkdirat) inside the container. Case comments in run.sh are in Korean.
 
-Note: the build has no `_GNU_SOURCE`, so `O_PATH`, `O_NOATIME` and `O_DIRECT` are not defined in nsync.c
-(`--direct` / `--open-noatime` do nothing; turning `_GNU_SOURCE` on would make `--direct` fail on
-unaligned I/O).
+Note: nsync.c defines `_GNU_SOURCE` itself (the build is `-std=gnu99` only); `--direct` is accepted and
+ignored, `--open-noatime` reads source files O_NOATIME (retried without it on EPERM).
+
+The binaries load libmfu.so from the install prefix, so a baseline under /opt/mfu-base/bin still runs the
+new common library: compare dsync behaviour against a separately installed prefix.
