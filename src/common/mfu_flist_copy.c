@@ -746,6 +746,13 @@ static int mfu_copy_set_metadata(
         for (idx = 0; idx < size; idx++) {
             /* TODO: skip file if it's not readable */
 
+            /* a FIFO, socket or device is not copied (see mfu_flist_copy),
+             * so there is nothing at its destination name to stamp */
+            mfu_filetype item_type = mfu_flist_file_get_type(list, idx);
+            if (item_type != MFU_TYPE_DIR && item_type != MFU_TYPE_FILE && item_type != MFU_TYPE_LINK) {
+                continue;
+            }
+
             /* get source name of item */
             const char* name = mfu_flist_file_get_name(list, idx);
 
@@ -2467,6 +2474,25 @@ int mfu_flist_copy(
         MFU_LOG(MFU_LOG_INFO, "Copying to %s", copy_opts->dest_path);
     }
     mfu_flist_print_summary(src_cp_list);
+
+    /* FIFOs, sockets and devices are not copied (nothing creates them below);
+     * say so once instead of leaving only the failed metadata calls on names
+     * that were never created */
+    uint64_t special_local = 0;
+    uint64_t special_all = 0;
+    uint64_t special_idx;
+    uint64_t special_size = mfu_flist_size(src_cp_list);
+    for (special_idx = 0; special_idx < special_size; special_idx++) {
+        mfu_filetype t = mfu_flist_file_get_type(src_cp_list, special_idx);
+        if (t != MFU_TYPE_DIR && t != MFU_TYPE_FILE && t != MFU_TYPE_LINK) {
+            special_local++;
+        }
+    }
+    MPI_Allreduce(&special_local, &special_all, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    if (special_all > 0 && rank == 0) {
+        MFU_LOG(MFU_LOG_WARN, "Skipped %llu special file(s) in the source (FIFO, socket or device): not copied",
+            (unsigned long long) special_all);
+    }
 
     /* TODO: consider file system striping params here */
     /* hard code some configurables for now */

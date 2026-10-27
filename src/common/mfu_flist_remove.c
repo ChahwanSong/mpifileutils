@@ -32,6 +32,10 @@ uint64_t remove_count_total;
 /* remove progress request */
 mfu_progress* rmprog;
 
+/* number of items this process failed to remove (an item already gone,
+ * ENOENT, counts as removed) */
+static uint64_t remove_failed;
+
 /* prints progress messages while deleting items */
 static void remove_progress_fn(const uint64_t* vals, int count, int complete, int ranks, double secs)
 {
@@ -71,6 +75,7 @@ static void remove_type(char type, const char* name, mfu_file_t* mfu_file)
         if (rc != 0 && errno != ENOENT) {
             MFU_LOG(MFU_LOG_ERR, "Failed to rmdir `%s' (errno=%d %s)",
                     name, errno, strerror(errno));
+            remove_failed++;
         }
     }
     else if (type == 'f') {
@@ -78,6 +83,7 @@ static void remove_type(char type, const char* name, mfu_file_t* mfu_file)
         if (rc != 0 && errno != ENOENT) {
             MFU_LOG(MFU_LOG_ERR, "Failed to unlink `%s' (errno=%d %s)",
                     name, errno, strerror(errno));
+            remove_failed++;
         }
     }
     else if (type == 'u') {
@@ -85,12 +91,14 @@ static void remove_type(char type, const char* name, mfu_file_t* mfu_file)
         if (rc != 0 && errno != ENOENT) {
             MFU_LOG(MFU_LOG_ERR, "Failed to remove `%s' (errno=%d %s)",
                     name, errno, strerror(errno));
+            remove_failed++;
         }
     }
     else {
         /* print error */
         MFU_LOG(MFU_LOG_ERR, "Unknown type=%c name=%s",
                 type, name);
+        remove_failed++;
     }
 
     return;
@@ -502,10 +510,14 @@ static void remove_by_algo(mfu_remove_algos algo, mfu_flist flist, uint64_t* cou
 
 /* removes list of items, sets write bits on directories from
  * top-to-bottom, then removes items one level at a time starting
- * from the deepest */
-void mfu_flist_unlink(mfu_flist flist, bool traceless, mfu_file_t* mfu_file)
+ * from the deepest; returns 0 if every item is gone, -1 (on every rank)
+ * if any item could not be removed */
+int mfu_flist_unlink(mfu_flist flist, bool traceless, mfu_file_t* mfu_file)
 {
     uint64_t idx;
+
+    /* count failures of this call only */
+    remove_failed = 0;
 
     /* allow override algorithm choice via environment variable */
     mfu_remove_algos algo = select_algo();
@@ -725,21 +737,32 @@ void mfu_flist_unlink(mfu_flist flist, bool traceless, mfu_file_t* mfu_file)
     MPI_Barrier(MPI_COMM_WORLD);
     double end_remove = MPI_Wtime();
 
+    /* "Removed N items" counts the items that are gone, not the attempts:
+     * a failed rmdir/unlink (permission, non-empty directory, ...) is in the
+     * list but still on disk. The failures get their own line at error level,
+     * so --quiet keeps it. */
+    uint64_t all_failed = 0;
+    MPI_Allreduce(&remove_failed, &all_failed, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    uint64_t all_count = mfu_flist_global_size(flist);
+    uint64_t all_removed = (all_failed < all_count) ? all_count - all_failed : 0;
+
     /* report remove count, time, and rate */
     if (mfu_debug_level >= MFU_LOG_VERBOSE && mfu_rank == 0) {
-        uint64_t all_count = mfu_flist_global_size(flist);
         double time_diff = end_remove - start_remove;
         double rate = 0.0;
         if (time_diff > 0.0) {
-            rate = ((double)all_count) / time_diff;
+            rate = ((double)all_removed) / time_diff;
         }
         MFU_LOG(MFU_LOG_INFO, "Removed %lu items in %.3lf seconds (%.3lf items/sec)",
-            all_count, time_diff, rate
+            all_removed, time_diff, rate
         );
+    }
+    if (all_failed > 0 && mfu_rank == 0) {
+        MFU_LOG(MFU_LOG_ERR, "Remove failed for %lu of %lu items", all_failed, all_count);
     }
 
     /* wait for summary to be printed */
     MPI_Barrier(MPI_COMM_WORLD);
 
-    return;
+    return (all_failed > 0) ? -1 : 0;
 }

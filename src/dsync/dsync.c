@@ -1685,13 +1685,16 @@ static int dsync_sync_files(
         if (rank == 0) {
             MFU_LOG(MFU_LOG_INFO, "Deleting items from destination");
         }
-        mfu_flist_unlink(dst_remove_list, 0, mfu_dst_file);
+        /* an extra destination item left behind fails the run */
+        if (mfu_flist_unlink(dst_remove_list, 0, mfu_dst_file) != 0) {
+            rc = -1;
+        }
     }
 
     /* A type change only works if the stale destination entry is really gone:
      * without --delete a non-empty directory cannot be removed (its children are
-     * not in the remove list), and mfu_flist_unlink neither reports that nor
-     * counts it -- its "Removed N items" counts attempts. Copying the source item
+     * not in the remove list), and mfu_flist_unlink reports only that some
+     * item survived, not which. Copying the source item
      * then fails, and the copy's metadata pass would still stamp the source
      * file's mode/owner/times onto the surviving directory (e.g. 0644: nobody
      * but root can enter it any more). So check every type-changed entry, keep
@@ -3857,7 +3860,9 @@ int main(int argc, char **argv)
         MFU_LOG(log_level, "Destination parent directory is not writable `%s' (errno=%d %s)",
                 dest_parent_str, errno, strerror(errno));
         if (!options.dry_run) {
+            /* nothing was copied: never exit 0 */
             mfu_free(&dest_parent_str);
+            rc = 1;
             goto ERROR;
         }
     }

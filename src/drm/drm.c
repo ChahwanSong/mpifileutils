@@ -361,8 +361,10 @@ daos_setup_done:
          * this is useful if the user is trying to get a regex right */
         mfu_flist_print(srclist);
     } else {
-        /* remove files */
-        mfu_flist_unlink(srclist, traceless, mfu_file);
+        /* remove files, a run that leaves items behind fails */
+        if (mfu_flist_unlink(srclist, traceless, mfu_file) != 0) {
+            rc = 1;
+        }
     }
 
     /* write data to cache file */

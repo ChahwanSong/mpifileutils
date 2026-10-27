@@ -546,8 +546,9 @@ void mfu_flist_metadata_apply(
 );
 
 /* unlink all items in flist,
- * if traceless=1, restore timestamps on parent directories after unlinking children */
-void mfu_flist_unlink(mfu_flist flist, bool traceless, mfu_file_t* mfu_file);
+ * if traceless=1, restore timestamps on parent directories after unlinking children,
+ * returns 0 if every item is gone, -1 (on every rank) if any item could not be removed */
+int mfu_flist_unlink(mfu_flist flist, bool traceless, mfu_file_t* mfu_file);
 
 typedef struct {
     uid_t uid;      /* new user id for item's owner, -1 for no change */

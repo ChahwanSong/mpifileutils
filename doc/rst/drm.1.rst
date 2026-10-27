@@ -15,6 +15,11 @@ contents.
 drm is a tool for removing files recursively in parallel.
 drm behaves like `rm -rf`, but it is faster.
 
+The final ``Removed N items`` line counts the items that are gone. If any
+item could not be removed (permission, a directory that is not empty, ...)
+drm prints ``Remove failed for F of T items`` at error level and exits with
+a non-zero code. An item that is already gone counts as removed.
+
 .. note::
 
     DO NOT USE SHELL REGEX!!!
