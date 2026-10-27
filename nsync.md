@@ -212,6 +212,8 @@ destination은 `pwrite()`로 offset write를 수행합니다.
 | `-D, --delete` | destination 초과 파일 삭제 | `only-dst` 경로에 `REMOVE` 생성 |
 | `-c, --contents` | 파일 내용 비교 | SHA256 digest 계산/비교 |
 | `--bufsize SIZE` | I/O 버퍼 크기 | copy/digest read chunk 크기 |
+| `--open-noatime` | source 파일의 접근 시각을 바꾸지 않고 읽음 | 복사·`--contents` 읽기를 `O_NOATIME`으로 연다. 커널이 소유자(또는 CAP_FOWNER)에게만 허용하므로 실행 사용자 소유가 아닌 파일은 `EPERM` 뒤 그냥 다시 열어 복사한다(GNU tar·cp와 같음, 그 수는 끝에 `--open-noatime: N source file(s) not owned …`). destination 쓰기에는 쓰지 않는다 |
+| `-s, --direct` | 호환용(효과 없음) | 받기만 하고 `O_DIRECT`로 열지 않는다 — nsync의 프레임 I/O는 정렬되지 않은 버퍼·길이라 `O_DIRECT`면 깨진다. 주면 `--direct has no effect in nsync` 한 줄 |
 | `--imbalance-threshold R` | batch imbalance ratio 임계값 | 진단 경고 출력 기준, 기본값 `3.0` |
 | `--role-mode auto|map` | 역할 결정 방식 | 자동 탐지 또는 명시 맵 |
 | `--role-map SPEC` | 역할 맵 | 예: `0-1:src,2-3:dst` |
@@ -358,9 +360,9 @@ mpirun -np 2 nsync \
   - 같은 source/destination pair 내부에서는 file transfer를 직렬화
   - large-file rebalance는 greedy byte balancing이며, topology-aware/network-aware scheduling은 아직 없음
   - extreme hash skew에 대한 자동 adaptive split(2차 해시 분할)은 미구현
-  - 빌드에 `_GNU_SOURCE`가 없어(`-std=gnu99`만) `O_PATH`·`O_NOATIME`·`O_DIRECT`가 정의되지 않는다. 그래서
-    `--direct`·`--open-noatime`은 이 빌드에서 아무 효과가 없고, 경로 걷기의 디렉터리 fd는 `O_PATH` 대신 읽기 전용으로 열린다
-    (조상 디렉터리에 읽기 권한이 필요). `_GNU_SOURCE`를 켜면 `O_DIRECT`가 정렬되지 않은 버퍼·길이로 쓰여 깨지므로 그대로 둔다.
+  - `--direct`는 호환용으로 받기만 한다(`O_DIRECT` 미사용 — 정렬 I/O 미구현). 빌드가 `-std=gnu99`만이라 nsync.c 맨 위에서
+    `_GNU_SOURCE`를 정의한다(2026-10-27 전에는 없어서 `O_NOATIME`·`O_PATH`가 정의되지 않았고 `--open-noatime`이 무효,
+    경로 걷기의 디렉터리 fd가 읽기 전용이었다 — 이제 `O_PATH`라 조상 디렉터리에 검색 권한만 있으면 된다).
 
 ## 11) 기존 대비 무엇이 바뀌었나
 

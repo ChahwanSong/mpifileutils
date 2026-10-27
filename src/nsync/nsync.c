@@ -12,6 +12,12 @@
  * - metadata finalize (mode/uid/gid/mtime) on destination
  */
 
+/* O_NOATIME (--open-noatime) and O_PATH come from the GNU feature set; the
+ * build uses -std=gnu99 only, which does not define it. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -536,8 +542,9 @@ static void nsync_usage(void)
     printf("  -D, --delete               - delete extraneous files from target\n");
     printf("  -c, --contents             - compare file contents instead of size+mtime\n");
     printf("      --ignore-symlinks      - ignore symlink entries during scan/compare/apply\n");
-    printf("  -s, --direct               - open files with O_DIRECT\n");
-    printf("      --open-noatime         - open files with O_NOATIME\n");
+    printf("  -s, --direct               - accepted for compatibility; nsync does not use O_DIRECT\n");
+    printf("      --open-noatime         - read source files with O_NOATIME (their access time is kept;\n");
+    printf("                               files the run does not own are read without it)\n");
     printf("      --bufsize <SIZE>       - I/O buffer size in bytes (default " MFU_BUFFER_SIZE_STR ")\n");
     printf("      --imbalance-threshold <R>\n");
     printf("                             - batch imbalance ratio threshold (default 3.0)\n");
@@ -2282,6 +2289,8 @@ typedef struct {
 #define NSYNC_RESOLVE_BENEATH     0x08ULL
 
 static int nsync_openat2_off = 0;   /* the kernel has no openat2: walk instead */
+static int nsync_openat2_ok = 0;    /* openat2 has worked here at least once */
+static uint64_t nsync_noatime_fallbacks = 0;   /* --open-noatime refused (not the owner): read without */
 
 /* no empty, "." or ".." component (what the component walk accepts) */
 static int nsync_relpath_is_plain(const char* p)
@@ -2323,6 +2332,7 @@ static int nsync_openat2_beneath(int dirfd, const char* relpath, int flags, mode
         for (int tries = 0; tries < 4; tries++) {
             long fd = syscall(NSYNC_SYS_OPENAT2, dirfd, relpath, &how, sizeof(how));
             if (fd >= 0) {
+                nsync_openat2_ok = 1;
                 return (int)fd;
             }
             if (errno == EAGAIN || errno == EINTR) {
@@ -2331,6 +2341,9 @@ static int nsync_openat2_beneath(int dirfd, const char* relpath, int flags, mode
             if (errno == ENOSYS || errno == E2BIG) {
                 nsync_openat2_off = 1;
                 return -2;
+            }
+            if (errno == EPERM && nsync_openat2_ok) {
+                return -1;   /* a real answer, e.g. O_NOATIME on a file we do not own */
             }
             if (errno == EPERM || errno == EINVAL) {
                 return -2;   /* seccomp, or a flag the walk reports the same way */
@@ -2419,7 +2432,13 @@ static size_t nsync_effective_bufsize(uint64_t requested)
  * the way. Only regular files are read: a FIFO would block the open (and the
  * whole run) waiting for a writer, a device would be read forever -- they fail
  * with ENOTSUP instead (the destination reports the item). O_NONBLOCK keeps the
- * open itself from blocking and is cleared again. st_out gets the fstat. */
+ * open itself from blocking and is cleared again. st_out gets the fstat.
+ *
+ * --open-noatime: reading the source leaves its access time alone (O_NOATIME).
+ * The kernel allows that only to the file's owner (or CAP_FOWNER): for anyone
+ * else's file the open fails with EPERM and is simply retried without it, as
+ * GNU tar and cp do -- the file is still copied, its atime then updated by the
+ * filesystem's usual rule. --direct is accepted but not used (see the usage). */
 static int nsync_open_readonly_at(int dirfd, const char* relpath, const nsync_options_t* opts,
                                   struct stat* st_out)
 {
@@ -2429,14 +2448,18 @@ static int nsync_open_readonly_at(int dirfd, const char* relpath, const nsync_op
         keep |= O_NOATIME;
 #endif
     }
-    if (opts->direct) {
-#ifdef O_DIRECT
-        keep |= O_DIRECT;
-#endif
-    }
-    int flags = O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC | keep;
-    int fd = (dirfd == AT_FDCWD) ? open(relpath, flags | O_NOFOLLOW)
+    int fd = -1;
+    while (1) {
+        int flags = O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC | keep;
+        fd = (dirfd == AT_FDCWD) ? open(relpath, flags | O_NOFOLLOW)
                                  : nsync_open_beneath(dirfd, relpath, flags);
+        if (fd < 0 && errno == EPERM && keep != 0) {
+            keep = 0;   /* not ours to open O_NOATIME: read it the normal way */
+            nsync_noatime_fallbacks++;
+            continue;
+        }
+        break;
+    }
     if (fd < 0) {
         return -1;
     }
@@ -4968,18 +4991,9 @@ static int nsync_open_dst_file_at(int root_fd, const char* relpath, mode_t mode,
     if (parent < 0) {
         return -1;
     }
-    int keep = 0;   /* status flags that stay set after O_NONBLOCK is cleared */
-    if (opts->open_noatime) {
-#ifdef O_NOATIME
-        keep |= O_NOATIME;
-#endif
-    }
-    if (opts->direct) {
-#ifdef O_DIRECT
-        keep |= O_DIRECT;
-#endif
-    }
-    int flags = O_WRONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY | keep;
+    (void)opts;     /* --open-noatime is about reading the source; --direct is not used */
+    int keep = 0;   /* no status flag stays set after O_NONBLOCK is cleared */
+    int flags = O_WRONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY;
     mode_t create_mode = (mode & (mode_t)0700) | (mode_t)0600;
     int fd = openat(parent, base, flags | O_CREAT | O_EXCL, create_mode);
     if (fd >= 0) {
@@ -9145,6 +9159,9 @@ int main(int argc, char** argv)
             goto cleanup;
         }
     }
+    if (rank == opts.log_rank && opts.direct) {
+        MFU_LOG(MFU_LOG_INFO, "--direct has no effect in nsync (accepted for compatibility; files are not opened O_DIRECT)");
+    }
     if (rank == opts.log_rank && (opts.chown_set_uid || opts.chown_set_gid || opts.chmod_set)) {
         MFU_LOG(MFU_LOG_INFO, "Override active: chown(uid=%s,gid=%s) chmod(dir=%s,file=%s)",
                 opts.chown_set_uid ? "set" : "keep", opts.chown_set_gid ? "set" : "keep",
@@ -9709,6 +9726,8 @@ int main(int argc, char** argv)
 
     uint64_t global_not_attempted = 0;
     MPI_Allreduce(&nsync_batch_stop.not_attempted, &global_not_attempted, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    uint64_t global_noatime_fallbacks = 0;
+    MPI_Allreduce(&nsync_noatime_fallbacks, &global_noatime_fallbacks, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
 
     /* failed-item list: collective, printed by the log rank before the summary
      * block (so the parsed summary lines are the last of their kind) */
@@ -9721,9 +9740,10 @@ int main(int argc, char** argv)
         MFU_LOG(MFU_LOG_INFO, "Requested target: %s", dst_path);
         MFU_LOG(MFU_LOG_INFO,
             "Options: dryrun=%d batch-files=%" PRIu64
-            " delete=%d contents=%d role-mode=%s imbalance-threshold=%.2f max-errors=%" PRIu64,
+            " delete=%d contents=%d role-mode=%s imbalance-threshold=%.2f max-errors=%" PRIu64
+            " open-noatime=%d",
             opts.dryrun, opts.batch_files, opts.delete, opts.contents, role_mode, opts.imbalance_threshold,
-            opts.max_errors);
+            opts.max_errors, opts.open_noatime);
         if (opts.role_map != NULL) {
             MFU_LOG(MFU_LOG_INFO, "Role map: %s", opts.role_map);
         }
@@ -9760,6 +9780,11 @@ int main(int argc, char** argv)
                     "A directory that is replaced by a non-directory must be empty unless --delete is given; "
                     "non-empty ones are left alone and reported as failed");
             }
+        }
+        if (global_noatime_fallbacks > 0) {
+            MFU_LOG(MFU_LOG_INFO,
+                "--open-noatime: %" PRIu64 " source file(s) not owned by this run were read without O_NOATIME",
+                global_noatime_fallbacks);
         }
         if (global_action_counts.skipped_special > 0) {
             MFU_LOG(MFU_LOG_WARN,
