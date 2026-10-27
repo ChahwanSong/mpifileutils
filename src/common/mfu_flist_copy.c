@@ -178,13 +178,25 @@ static int mfu_copy_open_file(
     /* open the new file, this sets mfu_file->fd/obj */
     if (read_flag) {
         int flags = O_RDONLY;
-        if (copy_opts->open_noatime) {
-            flags |= O_NOATIME;
-        }
         if (copy_opts->direct) {
             flags |= O_DIRECT;
         }
-        mfu_file_open(file, flags, mfu_file);
+        if (copy_opts->open_noatime && mfu_file->type == POSIX) {
+            /* O_NOATIME is allowed only to the file's owner (or CAP_FOWNER): for
+             * anyone else's file the open fails with EPERM -- read it without,
+             * as GNU tar and cp do, instead of failing the copy. One plain
+             * attempt first: mfu_open retries with sleeps, which an EPERM never
+             * outlives. */
+            mfu_file->fd = open(file, flags | O_NOATIME);
+            if (mfu_file->fd < 0) {
+                mfu_file_open(file, flags | ((errno == EPERM) ? 0 : O_NOATIME), mfu_file);
+            }
+        } else {
+            if (copy_opts->open_noatime) {
+                flags |= O_NOATIME;
+            }
+            mfu_file_open(file, flags, mfu_file);
+        }
     } else {
         int flags = O_WRONLY | O_CREAT;
         if (copy_opts->direct) {
