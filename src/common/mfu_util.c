@@ -706,6 +706,30 @@ void mfu_stat_set_ctimes (struct stat* sb, uint64_t secs, uint64_t nsecs)
 #endif
 }
 
+/* Open for the compare with O_NOATIME when asked. O_NOATIME is allowed only to
+ * the file's owner (or CAP_FOWNER): for anyone else's file the open fails with
+ * EPERM -- open it the usual way instead, as GNU tar and cp do, so the compare
+ * (and dsync --contents) does not fail on files the run does not own. One
+ * plain attempt first: mfu_open retries with sleeps, which an EPERM never
+ * outlives. */
+static int mfu_compare_open(const char* name, int flags, int noatime, mfu_file_t* mfu_file)
+{
+    if (noatime && mfu_file->type == POSIX) {
+        mfu_file->fd = open(name, flags | O_NOATIME);
+        if (mfu_file->fd >= 0) {
+            return 0;
+        }
+        if (errno != EPERM) {
+            flags |= O_NOATIME;
+        }
+        return mfu_file_open(name, flags, mfu_file);
+    }
+    if (noatime) {
+        flags |= O_NOATIME;
+    }
+    return mfu_file_open(name, flags, mfu_file);
+}
+
 /* compares contents of two files and optionally overwrite dest with source,
  * returns -1 on error, 0 if equal, 1 if different */
 int mfu_compare_contents(
@@ -738,15 +762,12 @@ int mfu_compare_contents(
 
     /* open source as read only, with optional O_DIRECT */
     int src_flags = O_RDONLY;
-    if (noatime) {
-        src_flags |= O_NOATIME;
-    }
     if (direct) {
         src_flags |= O_DIRECT;
     }
 
-    /* open source file */
-    int src_rc = mfu_file_open(src_name, src_flags, mfu_src_file);
+    /* open source file (O_NOATIME when asked, see mfu_compare_open) */
+    int src_rc = mfu_compare_open(src_name, src_flags, noatime, mfu_src_file);
     if (src_rc != 0) {
         /* log error if there is an open failure on the src side */
         MFU_LOG(MFU_LOG_ERR, "Failed to open source file `%s' (errno=%d %s)",
@@ -760,15 +781,12 @@ int mfu_compare_contents(
     if (overwrite) {
         dst_flags = O_RDWR;
     }
-    if (noatime) {
-        dst_flags |= O_NOATIME;
-    }
     if (direct) {
         dst_flags |= O_DIRECT;
     }
 
-    /* open destination file */
-    int dst_rc = mfu_file_open(dst_name, dst_flags, mfu_dst_file);
+    /* open destination file (O_NOATIME when asked, see mfu_compare_open) */
+    int dst_rc = mfu_compare_open(dst_name, dst_flags, noatime, mfu_dst_file);
     if (dst_rc != 0) {
         /* log error if there is an open failure on the dst side */
         MFU_LOG(MFU_LOG_ERR, "Failed to open destination file `%s' (errno=%d %s)",
