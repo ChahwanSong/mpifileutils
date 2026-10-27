@@ -114,21 +114,26 @@
 4. source rank는 요청을 queue하고 source-side credit 안에서 파일 전송 시작
 5. 파일 데이터는 `file_id + offset + payload/logical length + flags` 프레임으로 송수신
 6. destination rank는 `pwrite()` 기반으로 offset write, sparse hole frame은 실제 write 없이 건너뜀
-7. 삭제/디렉토리/링크/메타 업데이트를 타입별 순서로 적용
+7. 삭제/디렉토리/링크/메타 업데이트를 타입별 순서로 적용 — 모든 destination rank가 자기 타입 교체 `REMOVE`를 끝낸 뒤
+   `dst_comm` barrier를 지나야 어떤 rank도 생성(`MKDIR`/`SYMLINK`/`COPY`)을 시작한다. `--delete`의 destination 전용
+   `REMOVE`는 barrier 뒤, 그 rank의 복사 앞에 돈다(§13.2)
 8. 배치 모드에서는 디렉토리 remove/meta를 deferred 리스트에 모아 final pass에서 정리
+9. 실패한 항목은 항목당 1건으로 세고 경로·errno와 함께 기록한다(§13.4)
 
 ### 4.5 배치 처리
 
-1. `--batch-files N`으로 batch count 계산
+1. `--batch-files N`으로 batch count 계산 (`0` = 배칭 끔, 기본값과 같음)
 2. spool 기반 1회 스캔 후 batch load 처리
-3. 배치별 planner/execute를 순차 처리
+3. 배치가 2개 이상이면 첫 배치 전에 타입 교체 선처리(§13.1)
+4. 배치별 planner/execute를 순차 처리 — `--max-errors`·꽉 찬 destination이면 남은 배치를 버린다(§13.4)
 
 ### 4.6 종료/요약
 
 1. 전역 reduce로 compare/action/error 집계
-2. 실행 요약 로그 출력
-3. 메타데이터 best-effort/실패 통계 출력
-4. `scan error` 또는 `exec error`가 있으면 non-zero 종료
+2. 실패 항목 목록(경로순, 최대 65,536건)을 요약 블록 **앞**에 출력(§13.4)
+3. 실행 요약 로그 출력
+4. 메타데이터 best-effort/실패 통계 출력
+5. `scan error` 또는 `exec error`가 있으면 non-zero 종료
 
 ## 5) 통신/프로토콜 디테일
 
@@ -155,7 +160,12 @@
 - `logical length`
 - `flags`
 
-`flags`는 `EOF/HOLE/ERROR`를 표현합니다.
+`flags`는 `EOF/HOLE/ERROR`를 표현합니다. `EOF|ERROR` 프레임의 `logical length`(EOF에서는 쓰지 않는 칸)에는
+source 쪽 읽기 실패의 errno가 실린다 — destination이 그 항목을 경로·errno와 함께 한 번 기록한다.
+
+REQ의 `file_id` bit 63은 **취소**다(§13.3): destination이 쓰지 않을 항목(교체가 거부됐거나 destination 파일을 못 연 경우,
+`--max-errors`·꽉 찬 destination으로 멈춘 뒤)은 REQ를 보내되 이 비트를 세우고, source는 파일을 열거나 읽지 않고
+`ECANCELED`로 바로 답한다. source가 기다리는 REQ 수(=자기 COPY 수)는 그대로 맞는다.
 
 - data frame:
   `payload length == logical length`
@@ -197,7 +207,8 @@ destination은 `pwrite()`로 offset write를 수행합니다.
 | 옵션 | 설명 | 구현상 동작 |
 |---|---|---|
 | `--dryrun` | 변경 없이 계획만 출력 | planner까지 수행, execute 스킵 |
-| `-b, --batch-files N` | 배치 단위 처리 | 메모리 상한 제어 + spool 기반 배치 로드 |
+| `-b, --batch-files N` | 배치 단위 처리 (`0` = 배칭 끔, 기본) | 메모리 상한 제어 + spool 기반 배치 로드 |
+| `--max-errors N` | 실패 항목 N건이면 중단 (기본 `65000`, `0` = 끝까지) | 배치 사이(전체 실패) + 배치 안(rank별 몫, 실행 실패만), §13.4 |
 | `-D, --delete` | destination 초과 파일 삭제 | `only-dst` 경로에 `REMOVE` 생성 |
 | `-c, --contents` | 파일 내용 비교 | SHA256 digest 계산/비교 |
 | `--bufsize SIZE` | I/O 버퍼 크기 | copy/digest read chunk 크기 |
@@ -347,6 +358,9 @@ mpirun -np 2 nsync \
   - 같은 source/destination pair 내부에서는 file transfer를 직렬화
   - large-file rebalance는 greedy byte balancing이며, topology-aware/network-aware scheduling은 아직 없음
   - extreme hash skew에 대한 자동 adaptive split(2차 해시 분할)은 미구현
+  - 빌드에 `_GNU_SOURCE`가 없어(`-std=gnu99`만) `O_PATH`·`O_NOATIME`·`O_DIRECT`가 정의되지 않는다. 그래서
+    `--direct`·`--open-noatime`은 이 빌드에서 아무 효과가 없고, 경로 걷기의 디렉터리 fd는 `O_PATH` 대신 읽기 전용으로 열린다
+    (조상 디렉터리에 읽기 권한이 필요). `_GNU_SOURCE`를 켜면 `O_DIRECT`가 정렬되지 않은 버퍼·길이로 쓰여 깨지므로 그대로 둔다.
 
 ## 11) 기존 대비 무엇이 바뀌었나
 
@@ -406,3 +420,106 @@ mpirun -np 2 nsync --role-mode map --role-map 0:src,1:dst \
 ```
 
 > 참고: auto role 모드에서는 destination 디렉토리가 미리 존재해야 역할 판별이 된다(일반 nsync 사용법과 동일).
+
+## 13) 타입 교체·실패 처리 (2026-10-27)
+
+### 13.1 비디렉터리 → 디렉터리 (심링크·파일·FIFO가 있던 자리에 source 디렉터리)
+
+- 배치는 경로마다 자기 전체 경로의 해시로 정해진다. 그래서 `d`를 디렉터리로 바꾸는 `REMOVE+MKDIR`(그 `d`의 배치)보다
+  `d/…` 자식의 복사(다른 배치)가 먼저 돌 수 있고, 자식은 O_NOFOLLOW 걷기에서 남은 심링크·파일을 만나 실패한다.
+- **선처리**(배치 2개 이상, `--dryrun` 아님): source 디렉터리 목록(배치 재분할 때 함께 기록 — 추가 읽기 없음)을 각 경로의
+  부모를 스캔한 destination rank에 보내고, 그 rank는 스캔 때 본 비디렉터리를 담은 블룸 필터(16 MiB)에 걸린 경로만
+  확인해 `unlink + mkdir 0700`으로 바꾼다. 모든 rank가 barrier를 지난 뒤 첫 배치가 시작된다. 경로와 함께 source 디렉터리의
+  메타(모드·소유·시각, `--chown/--chmod` 반영)를 보내고, 바꾼 자리는 그 메타를 지연 디렉터리 메타로 등록한다 — 그래서 실행이
+  그 경로의 배치 전에 멈춰도 root 0700 빈 자리가 아니라 source 메타를 가진 (빈) 디렉터리로 남는다. 그 경로의 배치가 돌면
+  `MKDIR`(EEXIST 디렉터리)이 같은 메타를 한 번 더 등록할 뿐이다. 변경이 없는 재동기화에서는 탐침이 거의 0이다
+  (로그 `Type-change pre-pass: source directories N, probed P, replaced R, failed F`).
+- 선처리의 교체 실패는 즉시 로그하지만 실패 항목으로는 **그 경로의 배치가 돌지 않았을 때만** 센다 — 배치가 돌면 그 배치의
+  `REMOVE`가 같은 항목을 만나 보고한다(항목 하나 = 실패 1건). 조기 중단 뒤에는 돌지 않은 배치 몫의 교체 수를
+  `Type-change pre-pass: N stale entries in batches that did not run were already replaced …` 줄로 따로 알린다
+  (`Planned actions` 줄에는 넣지 않는다 — 그 배치는 계획되지 않았다). 선처리의 `ENOSPC/EDQUOT/EROFS`는 첫 배치를 시작부터
+  멈추므로(그 경로의 `REMOVE`가 보고할 기회가 없다) 즉시 실패로 센다.
+- 배치가 1개면 선처리가 필요 없다: 한 rank 안에서는 `REMOVE < MKDIR < … < COPY` 순서이고, rank 사이는 §13.2 barrier.
+
+### 13.2 destination rank 사이 순서
+
+- 같은 배치에서도 `REMOVE`(경로 소유 rank)와 자식 생성(자식 경로 소유 rank)은 다른 rank일 수 있다.
+  모든 destination rank가 자기 타입 교체 `REMOVE`를 끝낸 뒤 `MPI_Barrier(dst_comm)`을 지나야 생성을 시작한다(배치당 1회).
+  copy REQ는 barrier 뒤에만 나가므로 source rank는 이 barrier에 끼지 않는다.
+- `--delete`의 destination 전용 `REMOVE`(그 경로와 아래에 생성할 것이 없다)는 barrier 앞에 두지 않는다 — 큰 하위 트리 삭제가
+  다른 rank의 생성·복사를 붙잡지 않는다. 그 rank의 복사보다는 먼저 돌아, 비운 공간을 복사가 쓴다. 꽉 찬 destination
+  (`ENOSPC/EDQUOT`)으로 인한 정지는 이 삭제를 멈추지 않는다(멈추면 `--delete` 실행이 꽉 찬 destination을 영영 비우지 못한다);
+  읽기 전용(`EROFS`)·`--max-errors` 몫 소진은 멈춘다. 배치가 여럿이면 정지 뒤 배치의 삭제는 돌지 않는다(다음 실행이 이어 간다).
+  타입 교체 `REMOVE`는 계획 단계에서 표시한다(`REMOVE`의 쓰지 않던 size 필드).
+- 큰 `COPY` 재배치(`NSYNC_LARGE_FILE_THRESHOLD`)는 타입 교체 `COPY`(바로 앞이 같은 경로의 `REMOVE`)를 옮기지 않는다.
+
+### 13.3 디렉터리 → 비디렉터리, 제거 규칙
+
+- **`--delete` 없이는 비어 있지 않은 디렉터리를 바꾸지 않는다**(rsync·dsync와 같음): 그 디렉터리는 그대로 두고
+  `replace-dir … Directory not empty` 실패 1건으로 보고하며, 같은 경로의 대체(`COPY`는 취소 REQ, `SYMLINK`)는 하지 않는다.
+  빈 디렉터리는 바꾼다. `--delete`면 하위까지 지우고 바꾼다.
+- `REMOVE`는 계획 시점의 destination 타입일 때만 지운다(그 사이 바뀐 항목 — 예: 선처리가 이미 디렉터리로 바꾼 `d` — 은 둔다).
+  부모가 비디렉터리(파일·심링크 — 따라가지 않음)이면 「트리 안에 없음」으로 끝난다.
+- 복사가 실패하면 그 전송이 직접 만든·자른 **일반 파일만** 지운다(이전에는 실패한 경로를 재귀 삭제했다).
+- 기존 파일은 열 때 자르지 않는다(`O_TRUNC` 없음). source가 스트림을 보내기 시작한 첫 프레임에서(프레임이 없는 빈 파일은
+  마무리 때) 자른다 — 그래서 source를 열거나 읽지 못한 `COPY`는 이전 사본을 그대로 남긴다(이전에는 자른 뒤 지웠다).
+  자르기 전에 기존 파일의 set-ID 비트와 새 모드가 주지 않는 접근을 뺀다(`old & new & 0777`, 필요할 때만 `fchmod`).
+
+### 13.4 실패 기록과 `--max-errors`
+
+- 항목 하나의 실패는 1건이다: 복사 실패는 destination rank가 단독으로 센다(source의 열기·읽기 실패는 RESP 상태·`EOF|ERROR`
+  errno로 넘어옴), 메타데이터 하위 연산 여러 개가 실패해도 1건, 무시 가능한 메타 오류(EPERM 등)는 세지 않는다.
+- rank당 앞 16건은 즉시 `Failed <op> \`path\`: <strerror> (errno N)`로, 실행 끝에는 log rank가 모은 전체 목록을 경로순으로
+  `Failed items: X (copy a, …); listed below: Y` 다음 줄마다 출력한다. 경로의 제어 문자·`\`·`:`·`=`는 `\xHH`로 쓴다
+  (파일 이름으로 `Planned actions:`·`copied-volume=` 같은 요약 줄을 흉내 낼 수 없게).
+- 기록 1건 = 512 B 고정 슬롯, 출력 줄도 512 B 이하. 메모리 32 MiB / 512 B = 65,536, 로그 32 MiB / 512 B = 65,536 →
+  `--max-errors` 기본 **65,000**. rank당 보관 상한과 log rank가 모으는 목록 상한도 65,536건(32 MiB)이다.
+- 판정:
+  - 배치 경계: 지금까지의 **모든** 실패(스캔 오류 포함) 누계가 N 이상이면 남은 배치를 버린다
+    (`Stopping after batch k/n: X failed item(s) (scan S, other E) reached --max-errors N`).
+  - 배치 안(DMS 기본은 배치 하나): destination rank마다 「남은 몫 ÷ destination rank 수(최소 1)」를 나눠 갖고, 이번 배치의
+    자기 **실행 실패**가 그 몫에 닿으면 새 작업을 시작하지 않는다(남은 `COPY`는 취소 REQ). 항목은 경로 해시로 rank에 고르게
+    퍼지므로 몫이 거의 같이 차서 합계 N 근처에서 멈추고, 넘어도 `max(N, destination rank 수)`를 넘지 않는다
+    (이전에는 rank마다 남은 예산 전체를 써서 「rank 수 × N」까지 갔다). 실패가 한 rank에 몰리면 그 rank가 일찍 멈출 수 있다.
+  - 스캔 오류는 배치 안 몫을 쓰지 않는다: 어떤 작업보다 먼저 일어나므로, 쓰게 하면 실패하지 않은 배치 전체가 시작도 못 하고
+    취소된다(이전에는 spool 모드에서만 그랬다 — `--batch-files 0`과 `1000000`이 같은 입력에서 다르게 돌았다). 두 모드가 같다.
+  - `ENOSPC/EDQUOT/EROFS`는 즉시 같은 방식으로 멈추고 그 배치 뒤 전체를 중단한다. 시도하지 않은 작업 수는
+    `Not attempted after a stop: N`으로 보인다(같은 경로의 `REMOVE` 실패로 막힌 작업은 이미 보고됐으므로 넣지 않는다).
+    실패가 1건이라도 있거나, 실패 없이도 멈춰서 시도하지 않은 작업이 남았으면 rc 1(`Execution stopped early: N action(s)
+    not attempted`).
+- rank당 보관 상한은 `max(N, 1024)`(최대 65,536)이다 — 작은 N에서도 멈추는 순간 진행 중이던 실패까지 목록에 남는다.
+  log rank는 자기 기록 배열을 늘려 그 자리에 모은다(`MPI_IN_PLACE`) — 자기 것 + 사본으로 64 MiB가 되지 않는다.
+  보관 메모리는 rank마다 따로다(노드당 rank 수 × 최대 32 MiB).
+- source 스캔에 오류가 있으면(읽을 수 없는 하위 트리, 목록 도중 오류) 그 실행에서는 `--delete`를 끈다
+  (dsync와 같음 — 안 보인 source 항목의 destination 사본이 「destination 전용」으로 지워지지 않게).
+- source의 FIFO·소켓·장치는 계획 단계에서 **건너뛴다**: 아무 작업도 만들지 않고, 그 이름의 destination 항목은 `--delete`여도
+  그대로 둔다(source에 그 이름의 항목이 있으므로). rsync(`--specials` 없음)처럼 실패로 세지 않고 rank당 앞 16건을
+  `Skipping \`path\`: a FIFO, socket or device in the source is not copied`로, 끝에 `Skipped N special file(s) …`로 알린다.
+  이전에는 `REMOVE+COPY`로 계획돼 destination 파일을 지운 뒤 복사가 `ENOTSUP`으로 실패했다(그 전에는 FIFO 열기에서 무한 대기).
+
+### 13.5 복사 루프 비용
+
+- destination은 source별 큐에서 「source당 진행 중 실전송 1건」만 훑고, `file_id = COPY 인덱스 + 1`로 O(1) 조회한다.
+  source는 credit 크기의 전송 풀과 destination 수 크기의 대기 큐만 훑는다. 이전에는 배치의 COPY 수에 비례하는 배열을
+  매 반복 전부 훑어 한 배치 안에서 O(n²)이었다(작은 파일 2만 개·dst 1: 12.5 s → 1.1 s, 4만 개: 67.8 s → 1.6 s).
+- 수신 슬롯은 「source 수 × 파이프라인 깊이(4)」개다 — source당 실전송이 1건이라 그 이상은 메모리만 잡는다(이전에는
+  credit 8배를 더 곱해 bufsize 4 MiB·source 2이면 destination rank당 256 MiB를 미리 잡았다 → 32 MiB). source별 수신 중 프레임
+  수를 세어 전송 마무리 판정도 O(1)이다.
+- 목적지 부모 디렉터리는 `openat2` 한 번(없으면 「열기 먼저, 없을 때만 mkdir」 걷기 — 단계당 1 syscall), 메타는 전송 fd로
+  적용한다(경로를 다시 걷지 않는다). 스캔은 디렉터리 fd 기준 `fstatat`이라 항목마다 전체 경로를 다시 해석하지 않는다.
+
+### 13.6 경로 안전 — 어떤 심링크도 따라가지 않는다
+
+- 스캔·source 읽기·destination 쓰기는 모두 root fd 아래에서 경로를 푼다. Linux 5.6+면 `openat2(RESOLVE_BENEATH |
+  RESOLVE_NO_SYMLINKS)` 한 번으로 커널이 모든 심링크와 탈출을 거부하고, `openat2`가 없거나 막혀 있으면(ENOSYS, seccomp)
+  구성 요소마다 `O_NOFOLLOW`로 걷는다. root 경로 자체는 호출자가 정한 것이라 한 번 보통으로 푼다(root가 심링크인 경우의
+  정책은 아직 정하지 않았다 — 리뷰 #4).
+- 스캔은 디렉터리를 root fd 아래에서 열어(`fdopendir`) 항목을 그 fd 기준으로 `fstatat`·`readlinkat`·`openat`(--contents)
+  한다. 부모를 나열한 뒤 그 디렉터리가 심링크로 바뀌면 거기서 거부된다(이전에는 `opendir(전체 경로)`로 링크 너머를 나열했다).
+- source 파일은 source root fd 아래에서 연다. 스캔과 읽기 사이에 디렉터리가 심링크로 바뀌어도 root 실행이 링크 너머
+  (예: `/etc`)의 파일을 destination으로 복사하지 않는다 — 그 항목은 `ELOOP` 복사 실패로 보고된다.
+- destination 파일은 `O_NONBLOCK|O_NOCTTY`로 열고 일반 파일이 아니면 `ENOTSUP`으로 거부한다 — 그 이름에 끼어든 FIFO가 실행
+  전체를 멈추지 않는다. 새 파일은 `O_EXCL`로 **소유자 비트만**(`(mode & 0700) | 0600`, set-ID 없음) 만들고, 데이터를 다 쓴 뒤
+  close 전에 fd로 소유자 → 모드 → 시각 순으로 적용한다 — root 실행이 쓰는 동안 root 소유 setuid 파일이 생기는 틈이 없다.
+- 소유자를 줄 수 없으면(비 root의 chown EPERM 등) set-ID 비트를 뺀다(cp -p와 같음): 실제 소유자·그룹이 의도와 다르면
+  S_ISUID/S_ISGID 없이 `chmod`한다. 디렉터리는 S_ISGID(그룹 상속)를 유지한다.

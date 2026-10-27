@@ -58,6 +58,8 @@ typedef enum {
     NSYNC_HASH_DOMAIN_PLANNER = 0x504c4e52U, /* PLNR */
     NSYNC_HASH_DOMAIN_SRC     = 0x5352434fU, /* SRCO */
     NSYNC_HASH_DOMAIN_DST     = 0x4453544fU, /* DSTO */
+    NSYNC_HASH_DOMAIN_BLOOM1  = 0x424c4d31U, /* BLM1 */
+    NSYNC_HASH_DOMAIN_BLOOM2  = 0x424c4d32U, /* BLM2 */
 } nsync_hash_domain_t;
 
 typedef struct {
@@ -87,7 +89,17 @@ typedef struct {
     int chmod_file_set;
     uint32_t chmod_dir;
     uint32_t chmod_file;
+    /* --max-errors: stop once this many items failed (0 = never stop early).
+     * Default NSYNC_DEFAULT_MAX_ERRORS. See nsync_batch_stop for the rule. */
+    uint64_t max_errors;
 } nsync_options_t;
+
+/* One failed item is kept as a fixed NSYNC_FAIL_RECORD_BYTES record (op, errno,
+ * relpath clipped to fit) and printed as one log line of at most that size. The
+ * default --max-errors keeps both the in-memory records and the logged failure
+ * list within 32 MiB: 32 MiB / 512 B = 65,536, rounded down to 65,000. */
+#define NSYNC_FAIL_RECORD_BYTES 512
+#define NSYNC_DEFAULT_MAX_ERRORS 65000ULL
 
 /* ---- helpers for --chown / --chmod (destination owner/mode override) ---- */
 
@@ -346,7 +358,16 @@ typedef struct {
     uint64_t symlink_update;
     uint64_t meta_update;
     uint64_t skipped_only_dst;
+    /* type changes (also counted in remove + the create above): a non-directory
+     * replaced by a directory, and a directory replaced by a non-directory */
+    uint64_t type_to_dir;
+    uint64_t type_from_dir;
+    /* FIFOs, sockets and devices in the source: no action at all (kept off the
+     * "Planned actions" line -- nothing is done for them) */
+    uint64_t skipped_special;
 } nsync_action_counts_t;
+
+enum { NSYNC_ACTION_COUNTS_N = 9 };
 
 typedef struct {
     uint64_t chown_ignored;
@@ -380,6 +401,15 @@ typedef struct {
     uint64_t raw_bytes_written;
     uint64_t records_written;
     uint64_t bytes_written;
+    /* source directory relpaths (u32 length + bytes), written while the raw
+     * spool is repartitioned into batches -- input of the type-change pre-pass */
+    char* dirs_path;
+    FILE* dirs_fp;
+    uint64_t dirs_written;
+    /* set by main when a type-change pre-pass may run (not for --dryrun):
+     * collect source directories and destination non-directories */
+    int collect_type_change;
+    uint64_t dst_nondirs;
 } nsync_batch_spool_t;
 
 typedef struct {
@@ -433,6 +463,7 @@ typedef struct {
     int end_sent;
     int completed;
     int failed;
+    int fail_errno;   /* sent to the destination in the END|ERROR frame */
     nsync_copy_send_slot_t slots[NSYNC_COPY_PIPELINE_DEPTH];
 } nsync_source_transfer_t;
 
@@ -460,6 +491,14 @@ typedef struct {
     int end_received;
     int transfer_error;
     int open_error;
+    int created;      /* this transfer created the destination file (O_EXCL) */
+    int sized;        /* the file was cut / sized for the new content */
+    int truncated;    /* an existing file's old content was cut */
+    mode_t old_mode;  /* an existing file's mode when it was opened */
+    uint64_t write_end;   /* highest offset written + 1 */
+    int cancelled;    /* REQ asked the source not to stream (nothing will be written) */
+    int blocked;      /* failure already reported by the item's REMOVE: do not count again */
+    int fail_errno;   /* first errno that explains a failure (local or from the source) */
     uint64_t file_id;
     int src_rank;
     int fd;
@@ -467,6 +506,13 @@ typedef struct {
     char* dst_fullpath;
     const nsync_action_record_t* action;
 } nsync_destination_transfer_t;
+
+/* REQ file id bit: the destination will not write this item (its replacement
+ * was refused, or the destination file could not be opened). The source answers
+ * ECANCELED at once instead of reading and streaming a file that would only be
+ * thrown away; the REQ itself is still sent so the source's count of expected
+ * requests stays matched. Real ids count up from 1 and never reach this bit. */
+#define NSYNC_COPY_REQ_CANCEL (1ULL << 63)
 
 static const unsigned char NSYNC_SHA256_EMPTY[SHA256_DIGEST_LENGTH] = {
     0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
@@ -486,6 +532,7 @@ static void nsync_usage(void)
     printf("Options:\n");
     printf("      --dryrun               - show differences, do not modify destination\n");
     printf("  -b, --batch-files <N>      - process entries in batches of approximately N items\n");
+    printf("                               (0 = one batch, no batching; the default)\n");
     printf("  -D, --delete               - delete extraneous files from target\n");
     printf("  -c, --contents             - compare file contents instead of size+mtime\n");
     printf("      --ignore-symlinks      - ignore symlink entries during scan/compare/apply\n");
@@ -501,6 +548,12 @@ static void nsync_usage(void)
     printf("                               clears setuid/setgid on regular files, like chown(2))\n");
     printf("      --chmod <SPEC>         - set permission bits on target items\n");
     printf("                               (octal e.g. 0750, or D<oct>,F<oct> for dirs/files; symlinks unchanged)\n");
+    printf("      --max-errors <N>       - stop once N items have failed (default 65000; 0 = never stop early).\n");
+    printf("                               Between batches every failure counts (scan errors too); inside a\n");
+    printf("                               batch each destination rank stops at its share of what is left\n");
+    printf("                               (left / destination ranks, at least 1) of failed actions.\n");
+    printf("                               A full or read-only destination (ENOSPC/EDQUOT/EROFS) always stops.\n");
+    printf("                               Any failure gives rc 1; failed items are listed at the end.\n");
     printf("  -q, --quiet                - quiet output\n");
     printf("  -h, --help                 - print usage\n");
     printf("\n");
@@ -508,6 +561,352 @@ static void nsync_usage(void)
     printf("(disabled only with -q).\n");
     printf("\n");
     fflush(stdout);
+}
+
+/* ---- per-item failure records (--max-errors) ----
+ *
+ * Every failed item is counted once, on the rank that owns its outcome (copy
+ * failures on the destination rank, even when the source side failed), and kept
+ * as a fixed-size record. The first NSYNC_FAIL_IMMEDIATE failures of each rank are
+ * also logged at once, so a run that dies still shows why. At the end the log rank
+ * gathers the records and prints them sorted by path, before the summary block.
+ *
+ * Logged paths are escaped: control bytes, '\\', ':' and '=' become \xHH, so a
+ * file name cannot fake a summary line such as "Planned actions: copy=N" that
+ * callers (DMS) parse from the same output. */
+
+typedef enum {
+    NSYNC_FAIL_SCAN = 0,   /* lstat/opendir/readlink/digest while scanning */
+    NSYNC_FAIL_TYPE,       /* pre-pass: replacing a non-directory with a directory */
+    NSYNC_FAIL_REPLACE,    /* a non-empty directory is not replaced without --delete */
+    NSYNC_FAIL_REMOVE,
+    NSYNC_FAIL_MKDIR,
+    NSYNC_FAIL_SYMLINK,
+    NSYNC_FAIL_COPY,
+    NSYNC_FAIL_META,
+    NSYNC_FAIL_OP_COUNT
+} nsync_fail_op_t;
+
+static const char* const nsync_fail_op_names[NSYNC_FAIL_OP_COUNT] = {
+    "scan", "type-change", "replace-dir", "remove", "mkdir", "symlink", "copy", "metadata"
+};
+
+typedef struct {
+    uint32_t op;
+    int32_t err;
+    char relpath[NSYNC_FAIL_RECORD_BYTES - 2 * sizeof(int32_t)];
+} nsync_fail_record_t;
+
+enum {
+    NSYNC_FAIL_IMMEDIATE = 16,
+    /* 32 MiB of records: the most any rank keeps, and the most the log rank lists. */
+    NSYNC_FAIL_STORE_MAX = (32 * 1024 * 1024) / NSYNC_FAIL_RECORD_BYTES,
+};
+
+static struct {
+    nsync_fail_record_t* records;
+    uint64_t count;       /* records kept on this rank */
+    uint64_t capacity;    /* allocated slots */
+    uint64_t cap;         /* most records this rank keeps */
+    uint64_t total;       /* failures noted on this rank (kept or not) */
+    uint64_t by_op[NSYNC_FAIL_OP_COUNT];
+} nsync_fail_log = { NULL, 0, 0, NSYNC_FAIL_STORE_MAX, 0, {0} };
+
+/* Stopping. --max-errors is checked collectively between batches, against
+ * every failure so far (scan errors included). One batch can hold a million
+ * items (the DMS default), so inside a batch each destination rank also stops
+ * starting new work on its own once its failed actions in this batch reach its
+ * share of what is left: left / destination ranks, at least 1. Items are spread
+ * over the destination ranks by a hash of their path, so the shares fill up
+ * evenly and the run stops near N failures in total, never far above
+ * (at most max(N, destination ranks)). Scan errors do not use up this share:
+ * they happen before any action, and would otherwise cancel a whole batch
+ * whose actions have not failed. A rank also stops at once after
+ * ENOSPC/EDQUOT/EROFS -- every further write would fail the same way, after
+ * the source had read and sent the data. Remaining COPYs then go out as
+ * cancelled requests (the source does not read them), and the run stops after
+ * this batch. */
+static struct {
+    uint64_t budget;          /* failures this rank may add in the current batch */
+    uint64_t base;            /* nsync_fail_log.total when the batch started */
+    int stopped;
+    uint64_t not_attempted;   /* actions skipped after a stop (whole run) */
+} nsync_batch_stop = { UINT64_MAX, 0, 0, 0 };
+static int nsync_fatal_errno = 0;   /* first ENOSPC/EDQUOT/EROFS on this rank */
+
+/* Escape a path for one log line; never writes more than out_size bytes
+ * (NUL included) and marks a clipped result with "...". */
+static void nsync_escape_path(const char* in, char* out, size_t out_size)
+{
+    if (out_size == 0) {
+        return;
+    }
+    size_t o = 0;
+    const unsigned char* p = (const unsigned char*)(in != NULL ? in : "");
+    for (; *p != '\0'; p++) {
+        unsigned char ch = *p;
+        int esc = (ch < 0x20 || ch == 0x7f || ch == '\\' || ch == ':' || ch == '=');
+        size_t need = esc ? 4 : 1;
+        if (o + need + 4 > out_size) {  /* keep room for "..." + NUL */
+            if (o + 4 <= out_size) {
+                memcpy(out + o, "...", 3);
+                o += 3;
+            }
+            break;
+        }
+        if (esc) {
+            static const char hex[] = "0123456789abcdef";
+            out[o++] = '\\';
+            out[o++] = 'x';
+            out[o++] = hex[ch >> 4];
+            out[o++] = hex[ch & 0xf];
+        } else {
+            out[o++] = (char)ch;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Keep relpath in a fixed slot: whole when it fits, else head + "..." + tail. */
+static void nsync_fail_clip_path(const char* relpath, char* out, size_t out_size)
+{
+    size_t len = (relpath != NULL) ? strlen(relpath) : 0;
+    if (len < out_size) {
+        memcpy(out, relpath != NULL ? relpath : "", len);
+        out[len] = '\0';
+        return;
+    }
+    size_t head = (out_size - 4) / 2;
+    size_t tail = out_size - 4 - head;
+    memcpy(out, relpath, head);
+    memcpy(out + head, "...", 3);
+    memcpy(out + head + 3, relpath + len - tail, tail);
+    out[out_size - 1] = '\0';
+}
+
+/* Each rank keeps up to N records (at least 1024, at most 32 MiB of them):
+ * failures in flight when a stop is decided still get listed. */
+static void nsync_fail_log_configure(uint64_t max_errors)
+{
+    uint64_t cap = (max_errors < 1024) ? 1024 : max_errors;
+    nsync_fail_log.cap = (max_errors == 0 || cap > (uint64_t)NSYNC_FAIL_STORE_MAX)
+        ? (uint64_t)NSYNC_FAIL_STORE_MAX : cap;
+}
+
+/* Note one failed item. relpath is the path below the source/destination root;
+ * err is the errno that describes it (0 when unknown). */
+static void nsync_fail_note(nsync_fail_op_t op, const char* relpath, int err)
+{
+    if ((int)op < 0 || op >= NSYNC_FAIL_OP_COUNT) {
+        op = NSYNC_FAIL_COPY;
+    }
+    nsync_fail_log.total++;
+    nsync_fail_log.by_op[op]++;
+    if (nsync_fatal_errno == 0 && (err == ENOSPC || err == EDQUOT || err == EROFS)) {
+        nsync_fatal_errno = err;
+    }
+
+    if (nsync_fail_log.total <= NSYNC_FAIL_IMMEDIATE) {
+        char shown[NSYNC_FAIL_RECORD_BYTES];
+        nsync_escape_path(relpath, shown, sizeof(shown) - 128);
+        MFU_LOG(MFU_LOG_WARN, "Failed %s `%s`: %s (errno %d)",
+                nsync_fail_op_names[op], shown, err != 0 ? strerror(err) : "unknown error", err);
+    }
+
+    if (nsync_fail_log.count >= nsync_fail_log.cap) {
+        return;
+    }
+    if (nsync_fail_log.count == nsync_fail_log.capacity) {
+        uint64_t grow = (nsync_fail_log.capacity == 0) ? 64 : nsync_fail_log.capacity * 2;
+        if (grow > nsync_fail_log.cap) {
+            grow = nsync_fail_log.cap;
+        }
+        nsync_fail_record_t* bigger = (nsync_fail_record_t*)realloc(
+            nsync_fail_log.records, (size_t)grow * sizeof(nsync_fail_record_t));
+        if (bigger == NULL) {
+            return;  /* still counted in total; just not listed */
+        }
+        nsync_fail_log.records = bigger;
+        nsync_fail_log.capacity = grow;
+    }
+    nsync_fail_record_t* rec = &nsync_fail_log.records[nsync_fail_log.count++];
+    rec->op = (uint32_t)op;
+    rec->err = (int32_t)err;
+    nsync_fail_clip_path(relpath, rec->relpath, sizeof(rec->relpath));
+}
+
+static void nsync_batch_stop_begin(uint64_t budget)
+{
+    nsync_batch_stop.budget = budget;
+    nsync_batch_stop.base = nsync_fail_log.total;
+    nsync_batch_stop.stopped = 0;
+}
+
+/* A dst-only delete frees space: a full destination (ENOSPC/EDQUOT) does not
+ * stop it -- otherwise a --delete run into a full destination could never clean
+ * it up -- but a read-only one or a used-up --max-errors share does. */
+static int nsync_batch_stop_delete_now(void)
+{
+    return nsync_fatal_errno == EROFS ||
+           nsync_fail_log.total - nsync_batch_stop.base >= nsync_batch_stop.budget;
+}
+
+/* sticky within a batch: once true, nothing new is started on this rank */
+static int nsync_batch_stop_now(void)
+{
+    if (!nsync_batch_stop.stopped &&
+        (nsync_fatal_errno != 0 || nsync_fail_log.total - nsync_batch_stop.base >= nsync_batch_stop.budget))
+    {
+        nsync_batch_stop.stopped = 1;
+    }
+    return nsync_batch_stop.stopped;
+}
+
+static int nsync_fail_record_cmp(const void* a, const void* b)
+{
+    const nsync_fail_record_t* ra = (const nsync_fail_record_t*)a;
+    const nsync_fail_record_t* rb = (const nsync_fail_record_t*)b;
+    int cmp = strcmp(ra->relpath, rb->relpath);
+    if (cmp != 0) {
+        return cmp;
+    }
+    return (ra->op < rb->op) ? -1 : (ra->op > rb->op) ? 1 : 0;
+}
+
+typedef struct {
+    uint64_t kept;
+    int rank;
+} nsync_fail_holder_t;
+
+static int nsync_fail_holder_cmp(const void* a, const void* b)
+{
+    const nsync_fail_holder_t* ha = (const nsync_fail_holder_t*)a;
+    const nsync_fail_holder_t* hb = (const nsync_fail_holder_t*)b;
+    if (ha->kept != hb->kept) {
+        return (ha->kept < hb->kept) ? -1 : 1;
+    }
+    return (ha->rank < hb->rank) ? -1 : (ha->rank > hb->rank) ? 1 : 0;
+}
+
+/* Print the failed items of the whole run on the log rank, sorted by path.
+ * Collective over MPI_COMM_WORLD (every rank calls it once, quiet or not).
+ * At most NSYNC_FAIL_STORE_MAX records (32 MiB) are gathered: every rank gets
+ * an equal share of that budget, and shares a rank cannot use go to the others. */
+static void nsync_fail_report(const nsync_options_t* opts)
+{
+    if (opts->quiet) {
+        return;   /* nothing would be printed; opts are the same on every rank */
+    }
+    int rank = 0;
+    int ranks = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+
+    uint64_t local[2 + NSYNC_FAIL_OP_COUNT];
+    uint64_t global[2 + NSYNC_FAIL_OP_COUNT];
+    local[0] = nsync_fail_log.total;
+    local[1] = nsync_fail_log.count;
+    for (int i = 0; i < NSYNC_FAIL_OP_COUNT; i++) {
+        local[2 + i] = nsync_fail_log.by_op[i];
+    }
+    MPI_Allreduce(local, global, 2 + NSYNC_FAIL_OP_COUNT, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    if (global[0] == 0) {
+        return;   /* same answer on every rank */
+    }
+
+    uint64_t* kept = (uint64_t*)MFU_MALLOC((size_t)ranks * sizeof(uint64_t));
+    MPI_Allgather(&nsync_fail_log.count, 1, MPI_UINT64_T, kept, 1, MPI_UINT64_T, MPI_COMM_WORLD);
+
+    /* water-fill the budget: smallest holders first, each gets at most an
+     * equal share of what is left; identical arithmetic on every rank */
+    nsync_fail_holder_t* order = (nsync_fail_holder_t*)MFU_MALLOC((size_t)ranks * sizeof(nsync_fail_holder_t));
+    uint64_t* share = (uint64_t*)MFU_MALLOC((size_t)ranks * sizeof(uint64_t));
+    for (int r = 0; r < ranks; r++) {
+        order[r].kept = kept[r];
+        order[r].rank = r;
+    }
+    qsort(order, (size_t)ranks, sizeof(nsync_fail_holder_t), nsync_fail_holder_cmp);
+    uint64_t budget = (uint64_t)NSYNC_FAIL_STORE_MAX;
+    for (int i = 0; i < ranks; i++) {
+        int r = order[i].rank;
+        uint64_t fair = budget / (uint64_t)(ranks - i);
+        share[r] = (kept[r] < fair) ? kept[r] : fair;
+        budget -= share[r];
+    }
+
+    /* the log rank's own records come first, in place: its array grows to the
+     * listed total and the others' shares land behind them (MPI_IN_PLACE), so
+     * the log rank holds at most 32 MiB of records, not its own plus a copy */
+    int* counts = (int*)MFU_MALLOC((size_t)ranks * sizeof(int));
+    int* displs = (int*)MFU_MALLOC((size_t)ranks * sizeof(int));
+    uint64_t listed = share[opts->log_rank];
+    for (int r = 0; r < ranks; r++) {
+        counts[r] = (int)(share[r] * sizeof(nsync_fail_record_t));   /* <= 32 MiB in total */
+        if (r == opts->log_rank) {
+            displs[r] = 0;
+        } else {
+            displs[r] = (int)(listed * sizeof(nsync_fail_record_t));
+            listed += share[r];
+        }
+    }
+
+    nsync_fail_record_t* all = NULL;
+    if (rank == opts->log_rank && listed > 0) {
+        if (listed > nsync_fail_log.capacity) {
+            nsync_fail_record_t* bigger = (nsync_fail_record_t*)realloc(
+                nsync_fail_log.records, (size_t)listed * sizeof(nsync_fail_record_t));
+            if (bigger == NULL) {
+                MFU_ABORT(-1, "nsync: out of memory for the failed-item list");
+            }
+            nsync_fail_log.records = bigger;
+            nsync_fail_log.capacity = listed;
+        }
+        all = nsync_fail_log.records;
+    }
+    char dummy = 0;
+    const void* sendbuf = (nsync_fail_log.records != NULL) ? (const void*)nsync_fail_log.records : (const void*)&dummy;
+    if (rank == opts->log_rank) {
+        MPI_Gatherv(MPI_IN_PLACE, counts[rank], MPI_BYTE,
+                    (all != NULL) ? (void*)all : (void*)&dummy, counts, displs, MPI_BYTE,
+                    opts->log_rank, MPI_COMM_WORLD);
+    } else {
+        MPI_Gatherv(sendbuf, counts[rank], MPI_BYTE,
+                    NULL, NULL, NULL, MPI_BYTE, opts->log_rank, MPI_COMM_WORLD);
+    }
+
+    if (rank == opts->log_rank) {
+        char kinds[256];
+        size_t used = 0;
+        kinds[0] = '\0';
+        for (int i = 0; i < NSYNC_FAIL_OP_COUNT; i++) {
+            if (global[2 + i] > 0 && used < sizeof(kinds)) {
+                int n = snprintf(kinds + used, sizeof(kinds) - used, "%s%s %" PRIu64,
+                                 (used > 0) ? ", " : "", nsync_fail_op_names[i], global[2 + i]);
+                if (n > 0) {
+                    used += (size_t)n;
+                }
+            }
+        }
+        MFU_LOG(MFU_LOG_ERR, "Failed items: %" PRIu64 " (%s); listed below: %" PRIu64 "%s",
+                global[0], kinds, listed,
+                (listed < global[0]) ? " (the rest are counted only)" : "");
+        if (all != NULL) {
+            qsort(all, (size_t)listed, sizeof(nsync_fail_record_t), nsync_fail_record_cmp);
+            for (uint64_t i = 0; i < listed; i++) {
+                char shown[NSYNC_FAIL_RECORD_BYTES];
+                nsync_escape_path(all[i].relpath, shown, sizeof(shown) - 128);
+                uint32_t op = (all[i].op < NSYNC_FAIL_OP_COUNT) ? all[i].op : (uint32_t)NSYNC_FAIL_COPY;
+                MFU_LOG(MFU_LOG_INFO, "  failed %s `%s`: %s (errno %d)", nsync_fail_op_names[op], shown,
+                        (all[i].err != 0) ? strerror(all[i].err) : "unknown error", (int)all[i].err);
+            }
+        }
+    }
+
+    mfu_free(&counts);
+    mfu_free(&displs);
+    mfu_free(&share);
+    mfu_free(&order);
+    mfu_free(&kept);
 }
 
 static void nsync_role_info_init(nsync_role_info_t* info)
@@ -1838,17 +2237,154 @@ static char* nsync_child_relpath(const char* parent_rel, const char* name)
     return child;
 }
 
-static char* nsync_readlink_target(const char* path, int* status)
+/* ---- resolving a path below an anchor fd without following any symlink ----
+ *
+ * The scan, the source reads and the destination writes all resolve relpaths
+ * below a root fd and never follow a symlink below it: a path swapped for a
+ * symlink between the scan and the read would otherwise let a root run read or
+ * write wherever the link points. openat2(2) does it in one call with
+ * RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS (Linux 5.6+); where it is missing (ENOSYS,
+ * or a seccomp filter) the same rule is applied one component at a time with
+ * O_NOFOLLOW (nsync_open_parent_at). */
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+/* Traversal fds (the root anchor and each intermediate directory) are opened
+ * O_PATH so that, exactly like kernel path resolution and the original
+ * path-string syscalls, only search (x) permission is needed on ancestor
+ * directories -- never read (r). An O_PATH dir fd is still a valid dirfd for the
+ * *at syscalls below. O_PATH|O_DIRECTORY|O_NOFOLLOW on a symlink component fails
+ * with ENOTDIR (the directory requirement is not met), so symlinks stay refused.
+ * Where O_PATH is unavailable it degrades to a plain read-only dir fd (correct,
+ * just stricter on ancestor permissions). */
+#ifndef O_PATH
+#define O_PATH 0
+#endif
+#define NSYNC_DIR_TRAVERSE_FLAGS (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+
+#if defined(__linux__)
+#include <sys/syscall.h>
+#if defined(SYS_openat2)
+#define NSYNC_SYS_OPENAT2 SYS_openat2
+#elif defined(__NR_openat2)
+#define NSYNC_SYS_OPENAT2 __NR_openat2
+#endif
+#endif
+
+typedef struct {
+    uint64_t flags;
+    uint64_t mode;
+    uint64_t resolve;
+} nsync_open_how_t;   /* struct open_how, linux/openat2.h */
+
+#define NSYNC_RESOLVE_NO_SYMLINKS 0x04ULL
+#define NSYNC_RESOLVE_BENEATH     0x08ULL
+
+static int nsync_openat2_off = 0;   /* the kernel has no openat2: walk instead */
+
+/* no empty, "." or ".." component (what the component walk accepts) */
+static int nsync_relpath_is_plain(const char* p)
+{
+    if (*p == '/' || *p == '\0') {
+        return 0;
+    }
+    while (*p != '\0') {
+        const char* end = strchr(p, '/');
+        size_t len = (end != NULL) ? (size_t)(end - p) : strlen(p);
+        if (len == 0 || (len == 1 && p[0] == '.') || (len == 2 && p[0] == '.' && p[1] == '.')) {
+            return 0;
+        }
+        if (end == NULL) {
+            break;
+        }
+        p = end + 1;
+    }
+    return 1;
+}
+
+static int nsync_open_parent_at(int root_fd, const char* relpath,
+                                int create, mode_t dir_mode, char** base_out);
+
+/* openat2 below dirfd. Returns the fd, -1 with errno when the kernel refused
+ * the path itself (ENOENT, ELOOP for a symlink, EXDEV for an escape, ...), or
+ * -2 when openat2 cannot decide and the component walk must. */
+static int nsync_openat2_beneath(int dirfd, const char* relpath, int flags, mode_t mode)
+{
+#ifdef NSYNC_SYS_OPENAT2
+    if (!nsync_openat2_off) {
+        nsync_open_how_t how;
+        memset(&how, 0, sizeof(how));
+        /* RESOLVE_NO_SYMLINKS also refuses a final symlink; O_NOFOLLOW would
+         * instead return an O_PATH fd for the link itself */
+        how.flags = (uint64_t)(unsigned int)((flags & ~O_NOFOLLOW) | O_CLOEXEC);
+        how.mode = (flags & O_CREAT) ? (uint64_t)mode : 0;
+        how.resolve = NSYNC_RESOLVE_BENEATH | NSYNC_RESOLVE_NO_SYMLINKS;
+        for (int tries = 0; tries < 4; tries++) {
+            long fd = syscall(NSYNC_SYS_OPENAT2, dirfd, relpath, &how, sizeof(how));
+            if (fd >= 0) {
+                return (int)fd;
+            }
+            if (errno == EAGAIN || errno == EINTR) {
+                continue;   /* a rename raced the lookup */
+            }
+            if (errno == ENOSYS || errno == E2BIG) {
+                nsync_openat2_off = 1;
+                return -2;
+            }
+            if (errno == EPERM || errno == EINVAL) {
+                return -2;   /* seccomp, or a flag the walk reports the same way */
+            }
+            return -1;
+        }
+        return -2;
+    }
+#endif
+    (void)dirfd;
+    (void)relpath;
+    (void)flags;
+    (void)mode;
+    return -2;
+}
+
+/* Open relpath below dirfd without following a symlink in any component (the
+ * final one included) and without leaving dirfd. No O_CREAT. "." is dirfd. */
+static int nsync_open_beneath(int dirfd, const char* relpath, int flags)
+{
+    if (strcmp(relpath, ".") == 0) {
+        return openat(dirfd, ".", flags | O_CLOEXEC);
+    }
+    int fd = nsync_openat2_beneath(dirfd, relpath, flags, 0);
+    if (fd != -2) {
+        return fd;
+    }
+    char* base = NULL;
+    int parent = nsync_open_parent_at(dirfd, relpath, 0, 0, &base);
+    if (parent < 0) {
+        return -1;
+    }
+    fd = openat(parent, base, flags | O_NOFOLLOW | O_CLOEXEC);
+    int err = errno;
+    close(parent);
+    mfu_free(&base);
+    errno = err;
+    return fd;
+}
+
+/* readlinkat(dirfd, name): dirfd AT_FDCWD with a full path for the root */
+static char* nsync_readlink_target(int dirfd, const char* name, int* status)
 {
     *status = 0;
 
     size_t bufsize = 256;
     while (bufsize < (size_t)INT_MAX) {
         char* buf = (char*)MFU_MALLOC(bufsize);
-        ssize_t nread = readlink(path, buf, bufsize - 1);
+        ssize_t nread = readlinkat(dirfd, name, buf, bufsize - 1);
         if (nread < 0) {
+            int err = errno;
             mfu_free(&buf);
             *status = -1;
+            errno = err;
             return NULL;
         }
 
@@ -1862,6 +2398,7 @@ static char* nsync_readlink_target(const char* path, int* status)
     }
 
     *status = -1;
+    errno = ENAMETOOLONG;
     return NULL;
 }
 
@@ -1877,29 +2414,59 @@ static size_t nsync_effective_bufsize(uint64_t requested)
     return bufsize;
 }
 
-static int nsync_open_readonly(const char* path, const nsync_options_t* opts)
+/* Open a source file for reading, relpath below dirfd (or, with dirfd
+ * AT_FDCWD, the given path itself: a file root), never following a symlink on
+ * the way. Only regular files are read: a FIFO would block the open (and the
+ * whole run) waiting for a writer, a device would be read forever -- they fail
+ * with ENOTSUP instead (the destination reports the item). O_NONBLOCK keeps the
+ * open itself from blocking and is cleared again. st_out gets the fstat. */
+static int nsync_open_readonly_at(int dirfd, const char* relpath, const nsync_options_t* opts,
+                                  struct stat* st_out)
 {
-    int flags = O_RDONLY;
+    int keep = 0;   /* status flags that stay set after O_NONBLOCK is cleared */
     if (opts->open_noatime) {
 #ifdef O_NOATIME
-        flags |= O_NOATIME;
+        keep |= O_NOATIME;
 #endif
     }
     if (opts->direct) {
 #ifdef O_DIRECT
-        flags |= O_DIRECT;
+        keep |= O_DIRECT;
 #endif
     }
-    return open(path, flags);
+    int flags = O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC | keep;
+    int fd = (dirfd == AT_FDCWD) ? open(relpath, flags | O_NOFOLLOW)
+                                 : nsync_open_beneath(dirfd, relpath, flags);
+    if (fd < 0) {
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        errno = ENOTSUP;
+        return -1;
+    }
+    (void)fcntl(fd, F_SETFL, keep);   /* F_SETFL only touches the status flags */
+    if (st_out != NULL) {
+        *st_out = st;
+    }
+    return fd;
 }
 
 static int nsync_compute_sha256_file(
-    const char* fullpath,
+    int dirfd,
+    const char* name,
     size_t bufsize,
     const nsync_options_t* opts,
     unsigned char digest[SHA256_DIGEST_LENGTH])
 {
-    int fd = nsync_open_readonly(fullpath, opts);
+    int fd = nsync_open_readonly_at(dirfd, name, opts, NULL);
     if (fd < 0) {
         return -1;
     }
@@ -1985,6 +2552,8 @@ typedef struct {
 typedef struct {
     nsync_role_t side;
     const char* root;
+    int root_fd;       /* the root directory, opened once; every listing is below it */
+    int root_errno;    /* why root_fd could not be opened */
     MPI_Comm comm;
     int comm_rank;
     int comm_size;
@@ -2075,6 +2644,7 @@ static int nsync_scan_role_context_init(
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->side = role_info->role;
+    ctx->root_fd = -1;
 
     if (role_info->role == NSYNC_ROLE_SRC) {
         ctx->root = src_path;
@@ -2100,9 +2670,12 @@ static int nsync_owner_index_in_group(const char* relpath, int ranks)
     return nsync_hash_bucket(relpath, ranks, NSYNC_HASH_DOMAIN_SCAN);
 }
 
+/* dirfd + name locate the entry for readlink / digest reads: the listed
+ * directory and the entry's name, or AT_FDCWD and the root path itself. */
 static int nsync_scan_emit_path(
     const nsync_options_t* opts,
-    const char* fullpath,
+    int dirfd,
+    const char* name,
     const char* relpath,
     const struct stat* st,
     nsync_role_t side,
@@ -2174,10 +2747,15 @@ static int nsync_scan_emit_path(
 
     if (rec.type == MFU_TYPE_LINK) {
         int link_status = 0;
-        rec.link_target = nsync_readlink_target(fullpath, &link_status);
+        rec.link_target = nsync_readlink_target(dirfd, name, &link_status);
         if (link_status != 0) {
+            /* Unknown target: leave the item out. Planning it with an empty
+             * target would replace a good destination link and then fail. */
+            int err = (errno != 0) ? errno : EIO;
             (*scan_errors)++;
-            rec.link_target = MFU_STRDUP("");
+            nsync_fail_note(NSYNC_FAIL_SCAN, relpath, err);
+            nsync_meta_record_free(&rec);
+            return 0;
         }
     }
 
@@ -2186,10 +2764,12 @@ static int nsync_scan_emit_path(
             memcpy(rec.digest, NSYNC_SHA256_EMPTY, SHA256_DIGEST_LENGTH);
             rec.digest_valid = 1;
         } else {
-            if (nsync_compute_sha256_file(fullpath, digest_bufsize, opts, rec.digest) == 0) {
+            if (nsync_compute_sha256_file(dirfd, name, digest_bufsize, opts, rec.digest) == 0) {
                 rec.digest_valid = 1;
             } else {
+                int err = (errno != 0) ? errno : EIO;
                 (*scan_errors)++;
+                nsync_fail_note(NSYNC_FAIL_SCAN, relpath, err);
             }
         }
     }
@@ -2210,14 +2790,22 @@ static int nsync_scan_emit_path(
     return 0;
 }
 
-static size_t nsync_dir_task_pack_size(const char* relpath)
+/* A task is a relpath, optionally followed by its NUL and `tail` bytes of
+ * binary payload (the type-change pre-pass sends a directory's metadata so);
+ * the receiver gets the same bytes, NUL-terminated as a whole. */
+static size_t nsync_dir_task_wire_len(const char* relpath, size_t tail)
 {
-    return 4 + strlen(relpath);
+    return strlen(relpath) + ((tail > 0) ? 1 + tail : 0);
 }
 
-static size_t nsync_dir_task_pack(char* buf, const char* relpath)
+static size_t nsync_dir_task_pack_size(const char* relpath, size_t tail)
 {
-    uint32_t path_len = (uint32_t)strlen(relpath);
+    return 4 + nsync_dir_task_wire_len(relpath, tail);
+}
+
+static size_t nsync_dir_task_pack(char* buf, const char* relpath, size_t tail)
+{
+    uint32_t path_len = (uint32_t)nsync_dir_task_wire_len(relpath, tail);
     char* ptr = buf;
     mfu_pack_uint32(&ptr, path_len);
     memcpy(ptr, relpath, (size_t)path_len);
@@ -2269,7 +2857,8 @@ static int nsync_dir_task_unpack_payload(const char* payload, size_t payload_siz
 static int nsync_dir_task_exchange(
     const nsync_scan_role_ctx_t* ctx,
     nsync_dir_task_vec_t* send_tasks,
-    nsync_dir_task_vec_t* recv_tasks)
+    nsync_dir_task_vec_t* recv_tasks,
+    size_t tail)
 {
     int comm_size = ctx->comm_size;
     MPI_Comm comm = ctx->comm;
@@ -2291,7 +2880,7 @@ static int nsync_dir_task_exchange(
     for (int i = 0; i < comm_size; i++) {
         for (uint64_t j = 0; j < send_tasks[i].size; j++) {
             uint64_t wire_bytes = 0;
-            if (nsync_frame_wire_bytes(nsync_dir_task_pack_size(send_tasks[i].paths[j]), &wire_bytes) != 0 ||
+            if (nsync_frame_wire_bytes(nsync_dir_task_pack_size(send_tasks[i].paths[j], tail), &wire_bytes) != 0 ||
                 UINT64_MAX - send_counts[i] < wire_bytes)
             {
                 local_error = 1;
@@ -2338,7 +2927,7 @@ static int nsync_dir_task_exchange(
         uint64_t offset = send_displs[i];
         for (uint64_t j = 0; j < send_tasks[i].size; j++) {
             const char* relpath = send_tasks[i].paths[j];
-            size_t payload_bytes = nsync_dir_task_pack_size(relpath);
+            size_t payload_bytes = nsync_dir_task_pack_size(relpath, tail);
             uint64_t wire_bytes = 0;
             if (nsync_frame_wire_bytes(payload_bytes, &wire_bytes) != 0 ||
                 UINT64_MAX - offset < wire_bytes ||
@@ -2355,7 +2944,7 @@ static int nsync_dir_task_exchange(
             }
 
             char* ptr = send_buf + write_offset;
-            size_t packed = nsync_dir_task_pack(ptr + sizeof(uint32_t), relpath);
+            size_t packed = nsync_dir_task_pack(ptr + sizeof(uint32_t), relpath, tail);
             size_t framed = nsync_frame_pack(ptr, ptr + sizeof(uint32_t), packed);
             if (packed != payload_bytes || (uint64_t)framed != wire_bytes) {
                 local_error = 1;
@@ -2408,27 +2997,54 @@ static void nsync_scan_process_directory(
     nsync_dir_task_vec_t* next_remote,
     int* local_fatal)
 {
-    char* fullpath = nsync_build_full_path(ctx->root, relpath);
-    DIR* dir = opendir(fullpath);
+    /* Listed through an fd opened below the root without following any
+     * symlink, and every entry stat'ed relative to it: a directory swapped for
+     * a symlink after its parent was listed is refused here instead of being
+     * listed (and later read) wherever the link points. */
+    int dfd = (ctx->root_fd >= 0) ? nsync_open_beneath(ctx->root_fd, relpath, O_RDONLY | O_DIRECTORY) : -1;
+    DIR* dir = NULL;
+    if (dfd >= 0) {
+        dir = fdopendir(dfd);
+        if (dir == NULL) {
+            int err = errno;
+            close(dfd);
+            errno = err;
+        }
+    } else if (ctx->root_fd < 0) {
+        errno = (ctx->root_errno != 0) ? ctx->root_errno : EBADF;
+    }
     if (dir == NULL) {
+        int err = errno;
         (*scan_errors)++;
-        mfu_free(&fullpath);
+        nsync_fail_note(NSYNC_FAIL_SCAN, relpath, err);
         return;
     }
 
     struct dirent* dent;
-    while ((dent = readdir(dir)) != NULL) {
+    while (1) {
+        errno = 0;
+        dent = readdir(dir);
+        if (dent == NULL) {
+            if (errno != 0) {
+                /* the listing stopped early: the rest of this directory is
+                 * unknown, which is a scan error (not an empty directory) */
+                int err = errno;
+                (*scan_errors)++;
+                nsync_fail_note(NSYNC_FAIL_SCAN, relpath, err);
+            }
+            break;
+        }
         const char* name = dent->d_name;
         if ((strcmp(name, ".") == 0) || (strcmp(name, "..") == 0)) {
             continue;
         }
 
         char* child_rel = nsync_child_relpath(relpath, name);
-        char* child_fullpath = nsync_build_full_path(ctx->root, child_rel);
         struct stat st;
-        if (lstat(child_fullpath, &st) != 0) {
+        if (fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            int err = errno;
             (*scan_errors)++;
-            mfu_free(&child_fullpath);
+            nsync_fail_note(NSYNC_FAIL_SCAN, child_rel, err);
             mfu_free(&child_rel);
             continue;
         }
@@ -2438,11 +3054,10 @@ static void nsync_scan_process_directory(
         }
 
         if (nsync_scan_emit_path(
-                opts, child_fullpath, child_rel, &st, ctx->side,
+                opts, dfd, name, child_rel, &st, ctx->side,
                 out, scan_errors, filter, digest_bufsize, dirs_only, emit_fn, emit_arg) != 0)
         {
             *local_fatal = 1;
-            mfu_free(&child_fullpath);
             mfu_free(&child_rel);
             break;
         }
@@ -2459,18 +3074,15 @@ static void nsync_scan_process_directory(
             if (push_rc != 0) {
                 *local_fatal = 1;
                 mfu_free(&child_rel);
-                mfu_free(&child_fullpath);
                 break;
             }
             child_rel = NULL;
         }
 
-        mfu_free(&child_fullpath);
         mfu_free(&child_rel);
     }
 
-    closedir(dir);
-    mfu_free(&fullpath);
+    closedir(dir);   /* closes dfd */
 }
 
 /* Scan one directory frontier at a time inside the role communicator so each
@@ -2502,6 +3114,12 @@ static void nsync_scan_role_path_filtered(
 
     size_t digest_bufsize = nsync_effective_bufsize(opts->bufsize);
 
+    /* The root is resolved by path once (it is the caller's choice; a symlink
+     * at the root is reported as such by the lstat below and not listed), then
+     * every directory is opened below this fd. */
+    ctx.root_fd = open(ctx.root, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    ctx.root_errno = (ctx.root_fd < 0) ? errno : 0;
+
     nsync_dir_task_vec_t frontier;
     nsync_dir_task_vec_init(&frontier);
 
@@ -2512,8 +3130,10 @@ static void nsync_scan_role_path_filtered(
         struct stat st;
         if (lstat(root_fullpath, &st) != 0) {
             /* Missing destination root means an empty target tree on first sync. */
-            if (!(ctx.side == NSYNC_ROLE_DST && errno == ENOENT)) {
+            int err = errno;
+            if (!(ctx.side == NSYNC_ROLE_DST && err == ENOENT)) {
                 (*scan_errors)++;
+                nsync_fail_note(NSYNC_FAIL_SCAN, ".", err);
             }
         } else {
             if (item_count != NULL) {
@@ -2521,7 +3141,7 @@ static void nsync_scan_role_path_filtered(
             }
 
             if (nsync_scan_emit_path(
-                    opts, root_fullpath, ".", &st, ctx.side,
+                    opts, AT_FDCWD, root_fullpath, ".", &st, ctx.side,
                     out, scan_errors, filter, digest_bufsize, dirs_only, emit_fn, emit_arg) != 0)
             {
                 local_fatal = 1;
@@ -2539,6 +3159,9 @@ static void nsync_scan_role_path_filtered(
     if (global_fatal != 0) {
         (*scan_errors)++;
         nsync_dir_task_vec_free(&frontier);
+        if (ctx.root_fd >= 0) {
+            close(ctx.root_fd);
+        }
         return;
     }
 
@@ -2575,7 +3198,7 @@ static void nsync_scan_role_path_filtered(
             nsync_dir_task_vec_t received_remote;
             nsync_dir_task_vec_init(&received_remote);
 
-            if (nsync_dir_task_exchange(&ctx, next_remote, &received_remote) != 0 ||
+            if (nsync_dir_task_exchange(&ctx, next_remote, &received_remote, 0) != 0 ||
                 nsync_dir_task_vec_append_take_all(&next_local, &received_remote) != 0)
             {
                 global_fatal = 1;
@@ -2601,6 +3224,9 @@ static void nsync_scan_role_path_filtered(
     }
 
     nsync_dir_task_vec_free(&frontier);
+    if (ctx.root_fd >= 0) {
+        close(ctx.root_fd);
+    }
 }
 
 static uint64_t nsync_compute_batch_count(
@@ -2816,6 +3442,7 @@ static void nsync_batch_spool_init(nsync_batch_spool_t* spool)
     memset(spool, 0, sizeof(*spool));
     spool->max_open_fds = 64;
     spool->raw_fd = -1;
+    spool->dirs_fp = NULL;
     spool->io_error = 0;
 }
 
@@ -3101,15 +3728,87 @@ static int nsync_batch_spool_append_raw_record(nsync_batch_spool_t* spool, const
     return rc;
 }
 
+/* Destination non-directories seen by this rank's part of the destination scan
+ * (a Bloom filter: no false negatives). The type-change pre-pass sends a source
+ * directory X to the destination rank that scanned parent(X) -- the rank that
+ * saw X's own record -- which probes X on disk only when the filter says X may
+ * be a non-directory. Without it, every source directory would cost a stat on
+ * every incremental sync, even when nothing changed type. 16 MiB, 4 hashes:
+ * ~0.5% false probes at 10 M non-directories per rank. */
+enum { NSYNC_BLOOM_BYTES = 16 * 1024 * 1024, NSYNC_BLOOM_HASHES = 4 };
+
+/* the packed mode, uid, gid, size, mtime, mtime_nsec, atime, atime_nsec of a
+ * metadata record (nsync_meta_pack), carried with each pre-pass directory */
+#define NSYNC_PREPASS_META_BYTES ((size_t)(8 * 8))
+static struct {
+    uint64_t* bits;
+    uint64_t mask;   /* bit count - 1 (power of two) */
+} nsync_dst_nondirs = { NULL, 0 };
+
+static void nsync_bloom_hashes(const char* key, size_t len, uint32_t* h1, uint32_t* h2)
+{
+    *h1 = nsync_hash_bytes_with_domain(key, len, NSYNC_HASH_DOMAIN_BLOOM1);
+    *h2 = nsync_hash_bytes_with_domain(key, len, NSYNC_HASH_DOMAIN_BLOOM2) | 1U;
+}
+
+static void nsync_bloom_add(const char* key)
+{
+    if (nsync_dst_nondirs.bits == NULL) {
+        nsync_dst_nondirs.bits = (uint64_t*)MFU_MALLOC(NSYNC_BLOOM_BYTES);
+        memset(nsync_dst_nondirs.bits, 0, NSYNC_BLOOM_BYTES);
+        nsync_dst_nondirs.mask = (uint64_t)NSYNC_BLOOM_BYTES * 8 - 1;
+    }
+    uint32_t h1 = 0;
+    uint32_t h2 = 0;
+    nsync_bloom_hashes(key, strlen(key), &h1, &h2);
+    for (uint32_t i = 0; i < NSYNC_BLOOM_HASHES; i++) {
+        uint64_t bit = ((uint64_t)h1 + (uint64_t)i * (uint64_t)h2) & nsync_dst_nondirs.mask;
+        nsync_dst_nondirs.bits[bit >> 6] |= (1ULL << (bit & 63));
+    }
+}
+
+static int nsync_bloom_maybe(const char* key)
+{
+    if (nsync_dst_nondirs.bits == NULL) {
+        return 0;
+    }
+    uint32_t h1 = 0;
+    uint32_t h2 = 0;
+    nsync_bloom_hashes(key, strlen(key), &h1, &h2);
+    for (uint32_t i = 0; i < NSYNC_BLOOM_HASHES; i++) {
+        uint64_t bit = ((uint64_t)h1 + (uint64_t)i * (uint64_t)h2) & nsync_dst_nondirs.mask;
+        if ((nsync_dst_nondirs.bits[bit >> 6] & (1ULL << (bit & 63))) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void nsync_bloom_free(void)
+{
+    mfu_free(&nsync_dst_nondirs.bits);
+    nsync_dst_nondirs.mask = 0;
+}
+
 static int nsync_batch_spool_scan_emit(const nsync_meta_record_t* rec, void* emit_arg)
 {
     nsync_batch_spool_t* spool = (nsync_batch_spool_t*)emit_arg;
+    if (spool->collect_type_change && rec->side == NSYNC_ROLE_DST && rec->type != MFU_TYPE_DIR &&
+        strcmp(rec->relpath, ".") != 0)
+    {
+        nsync_bloom_add(rec->relpath);
+        spool->dst_nondirs++;
+    }
     return nsync_batch_spool_append_raw_record(spool, rec);
 }
 
 static int nsync_batch_spool_repartition_raw(nsync_batch_spool_t* spool)
 {
     if (!spool->raw_has_data) {
+        if (spool->dirs_fp != NULL) {
+            fclose(spool->dirs_fp);
+            spool->dirs_fp = NULL;
+        }
         return 0;
     }
 
@@ -3169,11 +3868,44 @@ static int nsync_batch_spool_repartition_raw(nsync_batch_spool_t* spool)
             break;
         }
 
+        /* Source directories feed the type-change pre-pass (more than one batch
+         * only -- this pass reads every record anyway, so it costs no extra read):
+         * the relpath, then the record's packed mode/uid/gid/size/times (already
+         * --chown/--chmod adjusted), which a replacement directory is stamped with. */
+        if (spool->dirs_fp != NULL && rec_len >= 8 + NSYNC_PREPASS_META_BYTES &&
+            !(relpath_len == 1 && relpath[0] == '.'))
+        {
+            const char* hdr = packed;
+            uint32_t side = 0;
+            uint32_t type = 0;
+            mfu_unpack_uint32(&hdr, &side);
+            mfu_unpack_uint32(&hdr, &type);
+            if (side == (uint32_t)NSYNC_ROLE_SRC && type == (uint32_t)MFU_TYPE_DIR) {
+                if (fwrite(&relpath_len, sizeof(relpath_len), 1, spool->dirs_fp) != 1 ||
+                    fwrite(relpath, 1, (size_t)relpath_len, spool->dirs_fp) != (size_t)relpath_len ||
+                    fwrite(hdr, 1, NSYNC_PREPASS_META_BYTES, spool->dirs_fp) != NSYNC_PREPASS_META_BYTES)
+                {
+                    mfu_free(&packed);
+                    rc = -1;
+                    spool->io_error = 1;
+                    break;
+                }
+                spool->dirs_written++;
+            }
+        }
+
         mfu_free(&packed);
     }
 
     close(fd);
     nsync_batch_spool_close_open_fds(spool);
+    if (spool->dirs_fp != NULL) {
+        if (fclose(spool->dirs_fp) != 0) {
+            rc = -1;
+            spool->io_error = 1;
+        }
+        spool->dirs_fp = NULL;
+    }
 
     return (rc == 0 && !spool->io_error) ? 0 : -1;
 }
@@ -3207,6 +3939,27 @@ static int nsync_batch_spool_finalize(nsync_batch_spool_t* spool, uint64_t batch
     }
 
     spool->batch_index_mode = 1;
+
+    /* More than one batch: the type-change pre-pass needs the source
+     * directories, and the repartition below reads every record anyway. */
+    if (spool->collect_type_change) {
+        char dirs_path[PATH_MAX];
+        if (snprintf(dirs_path, sizeof(dirs_path), "%s/scan-dirs.bin", spool->dir) >= (int)sizeof(dirs_path)) {
+            spool->io_error = 1;
+            return -1;
+        }
+        spool->dirs_path = MFU_STRDUP(dirs_path);
+        int dfd = open(spool->dirs_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        spool->dirs_fp = (dfd >= 0) ? fdopen(dfd, "w") : NULL;
+        if (spool->dirs_fp == NULL) {
+            if (dfd >= 0) {
+                close(dfd);
+            }
+            spool->io_error = 1;
+            return -1;
+        }
+        setvbuf(spool->dirs_fp, NULL, _IOFBF, 1 << 20);
+    }
     return nsync_batch_spool_repartition_raw(spool);
 }
 
@@ -3437,9 +4190,17 @@ static void nsync_batch_spool_cleanup(nsync_batch_spool_t* spool)
     nsync_batch_spool_close_raw_fd(spool);
     nsync_batch_spool_close_open_fds(spool);
 
+    if (spool->dirs_fp != NULL) {
+        fclose(spool->dirs_fp);
+        spool->dirs_fp = NULL;
+    }
+
     if (spool->dir != NULL) {
         if (spool->raw_path != NULL) {
             unlink(spool->raw_path);
+        }
+        if (spool->dirs_path != NULL) {
+            unlink(spool->dirs_path);
         }
         if (spool->batch_has_data != NULL) {
             size_t count = (size_t)spool->batch_count;
@@ -3460,7 +4221,10 @@ static void nsync_batch_spool_cleanup(nsync_batch_spool_t* spool)
     mfu_free(&spool->batch_fds);
     mfu_free(&spool->batch_has_data);
     mfu_free(&spool->raw_path);
+    mfu_free(&spool->dirs_path);
     mfu_free(&spool->dir);
+    spool->dirs_written = 0;
+    spool->dst_nondirs = 0;
     spool->batch_count = 0;
     spool->include_digest = 0;
     spool->batch_index_mode = 0;
@@ -3940,11 +4704,23 @@ static int nsync_relpath_depth(const char* relpath)
     return depth;
 }
 
+/* A REMOVE's size field is otherwise unused: it marks the REMOVE half of a
+ * type change, which must finish (on every destination rank) before anything
+ * is created. A dst-only REMOVE (--delete) has nothing created at or below its
+ * path, so it runs after the barrier instead of holding every rank up -- but
+ * before this rank's copies, so the space it frees is there for them. */
+#define NSYNC_REMOVE_TYPE_CHANGE 1ULL
+
+static int nsync_remove_is_type_change(const nsync_action_record_t* action)
+{
+    return action->type == NSYNC_ACTION_REMOVE && action->size == NSYNC_REMOVE_TYPE_CHANGE;
+}
+
 static int nsync_action_exec_priority(const nsync_action_record_t* action)
 {
     switch (action->type) {
     case NSYNC_ACTION_REMOVE:
-        return 0;
+        return nsync_remove_is_type_change(action) ? 0 : 5;
     case NSYNC_ACTION_MKDIR:
         return 1;
     case NSYNC_ACTION_SYMLINK_UPDATE:
@@ -3970,7 +4746,7 @@ static int nsync_action_exec_sort(const void* a, const void* b)
 
     int da = nsync_relpath_depth(aa->relpath);
     int db = nsync_relpath_depth(bb->relpath);
-    if (aa->type == NSYNC_ACTION_REMOVE) {
+    if (aa->type == NSYNC_ACTION_REMOVE) {   /* deepest first */
         if (da != db) {
             return db - da;
         }
@@ -4004,23 +4780,6 @@ static int nsync_action_exec_sort(const void* a, const void* b)
  * any copy begins (dsync_sync_files: delete list, then copy list). nsync's
  * per-rank, per-batch pipeline has no such global barrier, so it must refuse to
  * follow symlinks at the filesystem layer instead. */
-
-#ifndef O_CLOEXEC
-#define O_CLOEXEC 0
-#endif
-
-/* Traversal fds (the root anchor and each intermediate directory) are opened
- * O_PATH so that, exactly like kernel path resolution and the original
- * path-string syscalls, only search (x) permission is needed on ancestor
- * directories -- never read (r). An O_PATH dir fd is still a valid dirfd for the
- * *at syscalls below. O_PATH|O_DIRECTORY|O_NOFOLLOW on a symlink component fails
- * with ENOTDIR (the directory requirement is not met), so symlinks stay refused.
- * Where O_PATH is unavailable it degrades to a plain read-only dir fd (correct,
- * just stricter on ancestor permissions). */
-#ifndef O_PATH
-#define O_PATH 0
-#endif
-#define NSYNC_DIR_TRAVERSE_FLAGS (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
 
 /* Open a directory fd for the destination root. The root path is resolved
  * normally (a mount point or managed-root symlink above the tree is fine).
@@ -4104,6 +4863,29 @@ static int nsync_open_parent_at(int root_fd, const char* relpath,
         return -1;
     }
 
+    /* One openat2 for the whole parent when the kernel has it; the walk below
+     * is the fallback, and also creates missing parents. */
+    const char* slash = strrchr(relpath, '/');
+    if (slash != NULL && slash[1] != '\0' && strcmp(slash + 1, ".") != 0 && strcmp(slash + 1, "..") != 0 &&
+        !nsync_openat2_off && nsync_relpath_is_plain(relpath))
+    {
+        char* parent_rel = MFU_STRDUP(relpath);
+        parent_rel[slash - relpath] = '\0';
+        int fd = nsync_openat2_beneath(root_fd, parent_rel, O_PATH | O_DIRECTORY, 0);
+        int err = errno;
+        mfu_free(&parent_rel);
+        if (fd >= 0) {
+            *base_out = MFU_STRDUP(slash + 1);
+            return fd;
+        }
+        if (fd == -1 && !(create && err == ENOENT)) {
+            /* a symlink component: ENOTDIR, as the walk reports it (callers
+             * read it as "not in the tree"); EXDEV, ENOENT, ...: fail closed */
+            errno = (err == ELOOP) ? ENOTDIR : err;
+            return -1;
+        }
+    }
+
     char* work = MFU_STRDUP(relpath);
     int cur = dup(root_fd);
     if (cur < 0) {
@@ -4127,12 +4909,17 @@ static int nsync_open_parent_at(int root_fd, const char* relpath,
             base = comp;   /* final component: its parent is `cur` */
             break;
         }
-        if (create && mkdirat(cur, comp, dir_mode) != 0 && errno != EEXIST) {
-            err = errno;
-            rc = -1;
-            break;
-        }
+        /* open first: mkdir only for a missing component (one syscall per
+         * level in the common case, two only where something is created) */
         int child = openat(cur, comp, NSYNC_DIR_TRAVERSE_FLAGS);
+        if (child < 0 && create && errno == ENOENT) {
+            if (mkdirat(cur, comp, dir_mode) != 0 && errno != EEXIST) {
+                err = errno;
+                rc = -1;
+                break;
+            }
+            child = openat(cur, comp, NSYNC_DIR_TRAVERSE_FLAGS);
+        }
         if (child < 0) {
             err = errno;   /* ENOTDIR/ELOOP (symlink), ENOENT, ... -> fail closed */
             rc = -1;
@@ -4159,31 +4946,68 @@ static int nsync_open_parent_at(int root_fd, const char* relpath,
     return cur;
 }
 
-/* Open (O_CREAT|O_TRUNC) a destination regular file. No parent component below
- * the root and not the final component itself may be a symlink (O_NOFOLLOW on
- * the final open rejects an existing symlink with ELOOP). */
+/* Open a destination regular file for writing. No parent component below the
+ * root and not the final component itself may be a symlink (O_NOFOLLOW on the
+ * final open rejects an existing symlink with ELOOP).
+ *
+ *  - A new file is created O_EXCL with the owner bits only (*created = 1): no
+ *    group/other access and no set-ID bit while the content is written as
+ *    whoever runs the copy; the real owner and mode are set through the fd
+ *    when the data is complete.
+ *  - An existing file is opened WITHOUT truncating it (*created = 0, its stat
+ *    in *st_out): the old copy is cut only when the first data arrives, so a
+ *    source that cannot be read leaves it intact.
+ *  - O_NONBLOCK keeps a FIFO raced into that name from blocking the open (and
+ *    the run); anything but a regular file is refused with ENOTSUP. */
 static int nsync_open_dst_file_at(int root_fd, const char* relpath, mode_t mode,
-                                  const nsync_options_t* opts)
+                                  const nsync_options_t* opts, int* created, struct stat* st_out)
 {
+    *created = 0;
     char* base = NULL;
     int parent = nsync_open_parent_at(root_fd, relpath, 1, (mode_t)0777, &base);
     if (parent < 0) {
         return -1;
     }
-    int flags = O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC;
+    int keep = 0;   /* status flags that stay set after O_NONBLOCK is cleared */
     if (opts->open_noatime) {
 #ifdef O_NOATIME
-        flags |= O_NOATIME;
+        keep |= O_NOATIME;
 #endif
     }
     if (opts->direct) {
 #ifdef O_DIRECT
-        flags |= O_DIRECT;
+        keep |= O_DIRECT;
 #endif
     }
-    int fd = openat(parent, base, flags, mode);
+    int flags = O_WRONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY | keep;
+    mode_t create_mode = (mode & (mode_t)0700) | (mode_t)0600;
+    int fd = openat(parent, base, flags | O_CREAT | O_EXCL, create_mode);
+    if (fd >= 0) {
+        *created = 1;
+    } else if (errno == EEXIST) {
+        fd = openat(parent, base, flags);
+    }
+    int err = errno;
     close(parent);
     mfu_free(&base);
+    if (fd < 0) {
+        errno = err;
+        return -1;
+    }
+    if (!*created) {
+        if (fstat(fd, st_out) != 0) {
+            err = errno;
+            close(fd);
+            errno = err;
+            return -1;
+        }
+        if (!S_ISREG(st_out->st_mode)) {
+            close(fd);
+            errno = ENOTSUP;
+            return -1;
+        }
+    }
+    (void)fcntl(fd, F_SETFL, keep);   /* F_SETFL only touches the status flags */
     return fd;
 }
 
@@ -4226,7 +5050,7 @@ static int nsync_remove_entry_at(int pfd, const char* name)
     if (S_ISDIR(st.st_mode)) {
         int cfd = openat(pfd, name, O_DIRECTORY | O_NOFOLLOW | O_RDONLY | O_CLOEXEC);
         if (cfd < 0) {
-            return -1;
+            return (errno == ENOENT) ? 0 : -1;   /* removed meanwhile (another rank) */
         }
         DIR* d = fdopendir(cfd);
         if (d == NULL) {
@@ -4262,27 +5086,78 @@ static int nsync_remove_entry_at(int pfd, const char* name)
     return 0;
 }
 
-/* Remove relpath from the destination tree without following symlinks. A
- * missing entry -- or a missing parent -- is treated as success; a symlink
- * parent component (ELOOP) is reported as an error. */
-static int nsync_remove_at(int root_fd, const char* relpath)
+typedef enum {
+    NSYNC_RM_DONE = 0,   /* removed */
+    NSYNC_RM_ABSENT,     /* nothing at relpath inside the tree */
+    NSYNC_RM_CHANGED,    /* present, but no longer the planned type: left alone */
+    NSYNC_RM_FAILED,     /* errno says why (ENOTEMPTY: a directory that still has entries) */
+} nsync_rm_result_t;
+
+/* Remove `name` in pfd without following a symlink.
+ * expect_ifmt != 0: only an entry of that type (S_IFMT bits) is removed -- the
+ * type the planner saw. Anything else changed after the scan and is left alone.
+ * recursive: a directory goes with everything in it (--delete); otherwise only
+ * an empty directory is removed. */
+static nsync_rm_result_t nsync_remove_entry_typed(int pfd, const char* name, mode_t expect_ifmt, int recursive)
+{
+    struct stat st;
+    if (fstatat(pfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        return (errno == ENOENT) ? NSYNC_RM_ABSENT : NSYNC_RM_FAILED;
+    }
+    if (expect_ifmt != 0 && (st.st_mode & S_IFMT) != expect_ifmt) {
+        return NSYNC_RM_CHANGED;
+    }
+    if (S_ISDIR(st.st_mode) && recursive) {
+        return (nsync_remove_entry_at(pfd, name) == 0) ? NSYNC_RM_DONE : NSYNC_RM_FAILED;
+    }
+    if (unlinkat(pfd, name, S_ISDIR(st.st_mode) ? AT_REMOVEDIR : 0) != 0) {
+        return (errno == ENOENT) ? NSYNC_RM_ABSENT : NSYNC_RM_FAILED;
+    }
+    return NSYNC_RM_DONE;
+}
+
+/* Remove relpath from the destination tree without following symlinks (see
+ * nsync_remove_entry_typed). A missing parent, or an ancestor that is not a
+ * directory (a file, or a symlink -- never followed), means relpath is not in
+ * the tree: nothing to remove. That is the normal case for the dst-only
+ * children of a directory that --delete already replaced with a file. */
+static nsync_rm_result_t nsync_remove_typed_at(int root_fd, const char* relpath, mode_t expect_ifmt, int recursive)
 {
     if (root_fd < 0) {
-        return -1;   /* unusable destination root is an error, not "nothing to remove" */
+        errno = EBADF;   /* unusable destination root is an error, not "nothing to remove" */
+        return NSYNC_RM_FAILED;
     }
     char* base = NULL;
     int parent = nsync_open_parent_at(root_fd, relpath, 0, 0, &base);
     if (parent < 0) {
-        /* a genuinely-absent parent path means there is nothing to remove;
-         * a symlink parent (ENOTDIR/ELOOP) or other error is reported. */
-        return (errno == ENOENT) ? 0 : -1;
+        return (errno == ENOENT || errno == ENOTDIR) ? NSYNC_RM_ABSENT : NSYNC_RM_FAILED;
     }
-    int rc = nsync_remove_entry_at(parent, base);
-    int saved = errno;   /* preserve ENOTEMPTY etc. for the batched-remove retry */
+    nsync_rm_result_t res = nsync_remove_entry_typed(parent, base, expect_ifmt, recursive);
+    int saved = errno;   /* keep ENOTEMPTY etc. for the caller */
     close(parent);
     mfu_free(&base);
     errno = saved;
-    return rc;
+    return res;
+}
+
+static int nsync_errno_not_empty(int err)
+{
+    return (err == ENOTEMPTY || err == EEXIST);   /* rmdir(2) may report either */
+}
+
+/* Ignorable metadata skips (EPERM and friends, e.g. chown on a non-root run)
+ * can hit every item: log the first few per rank, the summary counts them all. */
+static void nsync_meta_skip_log(const char* what, const char* path, const char* reason)
+{
+    static uint64_t logged = 0;
+    if (logged >= NSYNC_FAIL_IMMEDIATE) {
+        return;
+    }
+    logged++;
+    char shown[NSYNC_FAIL_RECORD_BYTES];
+    nsync_escape_path(path, shown, sizeof(shown) - 128);
+    MFU_LOG(MFU_LOG_WARN, "Skipping %s update for `%s`: %s%s", what, shown, reason,
+            (logged == NSYNC_FAIL_IMMEDIATE) ? " (further skips on this rank are only counted)" : "");
 }
 
 static int nsync_metadata_errno_ignorable(int err)
@@ -4305,6 +5180,9 @@ static void nsync_apply_metadata(
         return;
     }
 
+    /* One failed item, however many of chown/chmod/utimes failed: the first
+     * hard errno is reported, the per-call stats keep the details. */
+    int item_err = 0;
     uid_t uid = (uid_t)action->uid;
     gid_t gid = (gid_t)action->gid;
     int chown_rc = nofollow ? lchown(path, uid, gid) : chown(path, uid, gid);
@@ -4314,13 +5192,12 @@ static void nsync_apply_metadata(
             if (meta_stats != NULL) {
                 meta_stats->chown_ignored++;
             }
-            MFU_LOG(MFU_LOG_WARN, "Skipping owner update for `%s`: %s", path, strerror(chown_err));
+            nsync_meta_skip_log("owner", ".", strerror(chown_err));
         } else {
             if (meta_stats != NULL) {
                 meta_stats->chown_failed++;
             }
-            (*local_errors)++;
-            MFU_LOG(MFU_LOG_WARN, "Failed owner update for `%s`: %s", path, strerror(chown_err));
+            item_err = chown_err;
         }
     }
 
@@ -4332,13 +5209,14 @@ static void nsync_apply_metadata(
                 if (meta_stats != NULL) {
                     meta_stats->chmod_ignored++;
                 }
-                MFU_LOG(MFU_LOG_WARN, "Skipping mode update for `%s`: %s", path, strerror(chmod_err));
+                nsync_meta_skip_log("mode", ".", strerror(chmod_err));
             } else {
                 if (meta_stats != NULL) {
                     meta_stats->chmod_failed++;
                 }
-                (*local_errors)++;
-                MFU_LOG(MFU_LOG_WARN, "Failed mode update for `%s`: %s", path, strerror(chmod_err));
+                if (item_err == 0) {
+                    item_err = chmod_err;
+                }
             }
         }
     }
@@ -4358,14 +5236,20 @@ static void nsync_apply_metadata(
             if (meta_stats != NULL) {
                 meta_stats->utime_failed++;
             }
-            (*local_errors)++;
-            MFU_LOG(MFU_LOG_WARN, "Failed metadata timestamp update for `%s`: %s", path, strerror(utime_err));
+            if (item_err == 0) {
+                item_err = utime_err;
+            }
         } else {
             if (meta_stats != NULL) {
                 meta_stats->utime_ignored++;
             }
-            MFU_LOG(MFU_LOG_WARN, "Skipping metadata timestamp update for `%s`: %s", path, strerror(utime_err));
+            nsync_meta_skip_log("timestamp", ".", strerror(utime_err));
         }
+    }
+
+    if (item_err != 0) {
+        (*local_errors)++;
+        nsync_fail_note(NSYNC_FAIL_META, ".", item_err);   /* this helper is only used for the root */
     }
 }
 
@@ -4401,10 +5285,15 @@ static void nsync_apply_metadata_at(
         parent = nsync_open_parent_at(root_fd, relpath, 0, 0, &base);
     }
     if (parent < 0) {
+        int err = errno;
         (*local_errors)++;
-        MFU_LOG(MFU_LOG_WARN, "Failed metadata update for `%s`: %s", relpath, strerror(errno));
+        nsync_fail_note(NSYNC_FAIL_META, relpath, err);
         return;
     }
+
+    /* One failed item, however many of chown/chmod/utimes failed (first hard
+     * errno reported; the per-call stats keep the details). */
+    int item_err = 0;
 
     /* Never follow the final component. chown/utimes take AT_SYMLINK_NOFOLLOW
      * unconditionally: for a real file/dir it is a no-op, and if `base` was
@@ -4420,13 +5309,12 @@ static void nsync_apply_metadata_at(
             if (meta_stats != NULL) {
                 meta_stats->chown_ignored++;
             }
-            MFU_LOG(MFU_LOG_WARN, "Skipping owner update for `%s`: %s", relpath, strerror(chown_err));
+            nsync_meta_skip_log("owner", relpath, strerror(chown_err));
         } else {
             if (meta_stats != NULL) {
                 meta_stats->chown_failed++;
             }
-            (*local_errors)++;
-            MFU_LOG(MFU_LOG_WARN, "Failed owner update for `%s`: %s", relpath, strerror(chown_err));
+            item_err = chown_err;
         }
     }
 
@@ -4442,29 +5330,44 @@ static void nsync_apply_metadata_at(
         int efd = openat(parent, base, O_PATH | O_NOFOLLOW | O_CLOEXEC);
         struct stat est;
         if (efd < 0) {
-            if (nsync_metadata_errno_ignorable(errno)) {
+            int open_err = errno;
+            if (nsync_metadata_errno_ignorable(open_err)) {
                 if (meta_stats != NULL) meta_stats->chmod_ignored++;
             } else {
                 if (meta_stats != NULL) meta_stats->chmod_failed++;
-                (*local_errors)++;
-                MFU_LOG(MFU_LOG_WARN, "Failed mode update for `%s`: %s", relpath, strerror(errno));
+                if (item_err == 0) {
+                    item_err = open_err;
+                }
             }
         } else if (fstat(efd, &est) != 0 || S_ISLNK(est.st_mode)) {
             /* vanished or raced into a symlink: skip chmod, never follow it */
             if (meta_stats != NULL) meta_stats->chmod_ignored++;
-            MFU_LOG(MFU_LOG_WARN, "Skipping mode update for `%s`: not a regular file or directory", relpath);
+            nsync_meta_skip_log("mode", relpath, "not a regular file or directory");
         } else {
+            /* a set-ID bit only goes with the owner it was meant for: when the
+             * chown above could not give the entry that owner/group, the bit is
+             * dropped (cp -p does the same). Directories keep S_ISGID (group
+             * inheritance, not escalation). */
+            if (!S_ISDIR(est.st_mode)) {
+                if (est.st_uid != uid) {
+                    perms &= ~(mode_t)S_ISUID;
+                }
+                if (est.st_gid != gid) {
+                    perms &= ~(mode_t)S_ISGID;
+                }
+            }
             char procpath[64];
             snprintf(procpath, sizeof(procpath), "/proc/self/fd/%d", efd);
             if (fchmodat(AT_FDCWD, procpath, perms, 0) != 0) {
                 int chmod_err = errno;
                 if (nsync_metadata_errno_ignorable(chmod_err)) {
                     if (meta_stats != NULL) meta_stats->chmod_ignored++;
-                    MFU_LOG(MFU_LOG_WARN, "Skipping mode update for `%s`: %s", relpath, strerror(chmod_err));
+                    nsync_meta_skip_log("mode", relpath, strerror(chmod_err));
                 } else {
                     if (meta_stats != NULL) meta_stats->chmod_failed++;
-                    (*local_errors)++;
-                    MFU_LOG(MFU_LOG_WARN, "Failed mode update for `%s`: %s", relpath, strerror(chmod_err));
+                    if (item_err == 0) {
+                        item_err = chmod_err;
+                    }
                 }
             }
         }
@@ -4487,23 +5390,104 @@ static void nsync_apply_metadata_at(
             if (meta_stats != NULL) {
                 meta_stats->utime_failed++;
             }
-            (*local_errors)++;
-            MFU_LOG(MFU_LOG_WARN, "Failed metadata timestamp update for `%s`: %s", relpath, strerror(utime_err));
+            if (item_err == 0) {
+                item_err = utime_err;
+            }
         } else {
             if (meta_stats != NULL) {
                 meta_stats->utime_ignored++;
             }
-            MFU_LOG(MFU_LOG_WARN, "Skipping metadata timestamp update for `%s`: %s", relpath, strerror(utime_err));
+            nsync_meta_skip_log("timestamp", relpath, strerror(utime_err));
         }
     }
 
     close(parent);
     mfu_free(&base);
+
+    if (item_err != 0) {
+        (*local_errors)++;
+        nsync_fail_note(NSYNC_FAIL_META, relpath, item_err);
+    }
+}
+
+/* Owner, mode and times of a just-written file, through its fd (the COPY path).
+ * Same accounting as nsync_apply_metadata_at; returns the first hard errno
+ * (0 when only ignorable skips happened) for the caller to note once. */
+static int nsync_apply_metadata_fd(int fd, const nsync_action_record_t* action,
+                                   nsync_meta_apply_stats_t* meta_stats)
+{
+    const char* relpath = action->relpath;
+    int item_err = 0;
+    uid_t uid = (uid_t)action->uid;
+    gid_t gid = (gid_t)action->gid;
+    mode_t perms = (mode_t)(action->mode & 07777u);
+
+    if (fchown(fd, uid, gid) != 0) {
+        int chown_err = errno;
+        if (nsync_metadata_errno_ignorable(chown_err)) {
+            if (meta_stats != NULL) {
+                meta_stats->chown_ignored++;
+            }
+            nsync_meta_skip_log("owner", relpath, strerror(chown_err));
+        } else {
+            if (meta_stats != NULL) {
+                meta_stats->chown_failed++;
+            }
+            item_err = chown_err;
+        }
+        /* not the intended owner/group: no set-ID bit for whoever it is now */
+        struct stat st;
+        int have = (fstat(fd, &st) == 0);
+        if (!have || st.st_uid != uid) {
+            perms &= ~(mode_t)S_ISUID;
+        }
+        if (!have || st.st_gid != gid) {
+            perms &= ~(mode_t)S_ISGID;
+        }
+    }
+
+    if (fchmod(fd, perms) != 0) {
+        int chmod_err = errno;
+        if (nsync_metadata_errno_ignorable(chmod_err)) {
+            if (meta_stats != NULL) meta_stats->chmod_ignored++;
+            nsync_meta_skip_log("mode", relpath, strerror(chmod_err));
+        } else {
+            if (meta_stats != NULL) meta_stats->chmod_failed++;
+            if (item_err == 0) {
+                item_err = chmod_err;
+            }
+        }
+    }
+
+    struct timespec times[2];
+    times[0].tv_sec = (time_t)action->atime;
+    times[0].tv_nsec = (action->atime_nsec <= 999999999ULL) ? (long)action->atime_nsec : 0L;
+    times[1].tv_sec = (time_t)action->mtime;
+    times[1].tv_nsec = (action->mtime_nsec <= 999999999ULL) ? (long)action->mtime_nsec : 0L;
+    if (futimens(fd, times) != 0) {
+        int utime_err = errno;
+        if (nsync_metadata_errno_ignorable(utime_err)) {
+            if (meta_stats != NULL) {
+                meta_stats->utime_ignored++;
+            }
+            nsync_meta_skip_log("timestamp", relpath, strerror(utime_err));
+        } else {
+            if (meta_stats != NULL) {
+                meta_stats->utime_failed++;
+            }
+            if (item_err == 0) {
+                item_err = utime_err;
+            }
+        }
+    }
+    return item_err;
 }
 
 /* Create (or replace) a destination symlink without following a symlink in any
- * component below the root. Any pre-existing entry at relpath is removed first
- * (as a link, not descended). Returns 0 on success, -1 if anything errored. */
+ * component below the root. A pre-existing entry at relpath is removed first
+ * (a link as a link, never descended); a directory only when it is empty unless
+ * --delete -- the same rule as a REMOVE. Returns 0 on success, -1 on failure
+ * (counted and noted once). */
 static int nsync_symlink_at(
     int root_fd,
     const char* relpath,
@@ -4515,23 +5499,35 @@ static int nsync_symlink_at(
     char* base = NULL;
     int parent = nsync_open_parent_at(root_fd, relpath, 1, (mode_t)0777, &base);
     if (parent < 0) {
+        int err = errno;
         (*local_errors)++;
+        nsync_fail_note(NSYNC_FAIL_SYMLINK, relpath, err);
         return -1;
     }
 
-    int errors_before = *local_errors;
-    if (nsync_remove_entry_at(parent, base) != 0) {
-        (*local_errors)++;
-    }
-    if (action->link_target == NULL || symlinkat(action->link_target, parent, base) != 0) {
-        (*local_errors)++;
+    int err = 0;
+    nsync_fail_op_t fail_op = NSYNC_FAIL_SYMLINK;
+    if (nsync_remove_entry_typed(parent, base, 0, opts->delete) == NSYNC_RM_FAILED) {
+        err = errno;
+        if (nsync_errno_not_empty(err)) {
+            fail_op = NSYNC_FAIL_REPLACE;
+        }
+    } else if (action->link_target == NULL) {
+        err = EINVAL;
+    } else if (symlinkat(action->link_target, parent, base) != 0) {
+        err = errno;
     }
     close(parent);
     mfu_free(&base);
 
-    if (*local_errors == errors_before) {
-        nsync_apply_metadata_at(root_fd, relpath, action, 1, opts, local_errors, meta_stats);
+    if (err != 0) {
+        (*local_errors)++;
+        nsync_fail_note(fail_op, relpath, err);
+        return -1;
     }
+
+    int errors_before = *local_errors;
+    nsync_apply_metadata_at(root_fd, relpath, action, 1, opts, local_errors, meta_stats);
     return (*local_errors == errors_before) ? 0 : -1;
 }
 
@@ -4800,19 +5796,23 @@ static void nsync_copy_send_slot_free(nsync_copy_send_slot_t* slot)
     slot->req = MPI_REQUEST_NULL;
 }
 
+/* A read-side failure ends the transfer with an END|ERROR frame that carries
+ * err. It is not counted here: the destination counts the item once and logs
+ * it with its path (one failed item = one error, wherever it failed). */
 static void nsync_source_transfer_mark_failed(
     nsync_source_transfer_t* transfer,
-    int* local_errors)
+    int err)
 {
     if (!transfer->failed) {
-        (*local_errors)++;
+        transfer->fail_errno = (err != 0) ? err : EIO;
     }
     transfer->failed = 1;
 }
 
 static int nsync_source_transfer_init(
     nsync_source_transfer_t* transfer,
-    const char* src_root,
+    int src_root_fd,
+    int src_root_errno,
     const nsync_action_record_t* action,
     uint64_t file_id,
     int dst_rank,
@@ -4824,15 +5824,17 @@ static int nsync_source_transfer_init(
     transfer->dst_rank = dst_rank;
     transfer->file_size = action->size;
 
-    char* src_fullpath = nsync_build_full_path(src_root, action->relpath);
-    transfer->fd = nsync_open_readonly(src_fullpath, opts);
-    mfu_free(&src_fullpath);
+    if (src_root_fd < 0) {
+        return (src_root_errno != 0) ? src_root_errno : EBADF;
+    }
+    /* below the source root, no symlink followed anywhere (see nsync_open_beneath) */
+    struct stat st;
+    transfer->fd = nsync_open_readonly_at(src_root_fd, action->relpath, opts, &st);
     if (transfer->fd < 0) {
-        return errno;
+        return (errno != 0) ? errno : EIO;
     }
 
-    struct stat st;
-    if (fstat(transfer->fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+    if (st.st_size > 0) {
         uint64_t allocated_bytes = (uint64_t)st.st_blocks * 512ULL;
         if (allocated_bytes < transfer->file_size) {
             transfer->zero_hole_fallback = 1;
@@ -4882,32 +5884,6 @@ static int nsync_source_transfer_has_busy_slots(const nsync_source_transfer_t* t
     return 0;
 }
 
-static int nsync_source_active_transfer_count(
-    const nsync_source_transfer_t* transfers,
-    uint64_t count)
-{
-    int active = 0;
-    for (uint64_t i = 0; i < count; i++) {
-        if (transfers[i].active) {
-            active++;
-        }
-    }
-    return active;
-}
-
-static int nsync_source_has_active_transfer_for_dst(
-    const nsync_source_transfer_t* transfers,
-    uint64_t count,
-    int dst_rank)
-{
-    for (uint64_t i = 0; i < count; i++) {
-        if (transfers[i].active && transfers[i].dst_rank == dst_rank) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static int nsync_source_transfer_prepare_next_message(
     nsync_source_transfer_t* transfer,
     nsync_copy_send_slot_t* slot,
@@ -4915,6 +5891,7 @@ static int nsync_source_transfer_prepare_next_message(
     int* local_errors)
 {
     (void)opts;
+    (void)local_errors;   /* read failures are counted by the destination */
 
     if (transfer->end_sent) {
         return 0;
@@ -4925,15 +5902,19 @@ static int nsync_source_transfer_prepare_next_message(
     while (1) {
         if (transfer->failed || transfer->next_offset >= transfer->file_size) {
             uint32_t flags = NSYNC_COPY_FRAME_FLAG_END;
+            uint32_t end_errno = 0;
             if (transfer->failed) {
                 flags |= NSYNC_COPY_FRAME_FLAG_ERROR;
+                /* an END frame carries no data; its logical length (never used
+                 * for END) tells the destination why the source failed */
+                end_errno = (uint32_t)transfer->fail_errno;
             }
             slot->bytes = nsync_copy_frame_pack(
                 slot->wire_buf,
                 transfer->file_id,
                 transfer->next_offset,
                 flags,
-                0,
+                end_errno,
                 NULL,
                 0);
             transfer->end_sent = 1;
@@ -4945,13 +5926,13 @@ static int nsync_source_transfer_prepare_next_message(
             size_t read_size = (size_t)nsync_min_u64(remaining, (uint64_t)bufsize);
             off_t read_off = 0;
             if (nsync_u64_to_offt_checked(transfer->next_offset, &read_off) != 0) {
-                nsync_source_transfer_mark_failed(transfer, local_errors);
+                nsync_source_transfer_mark_failed(transfer, EOVERFLOW);
                 continue;
             }
 
             ssize_t nread = pread(transfer->fd, slot->wire_buf + header_size, read_size, read_off);
             if (nread <= 0) {
-                nsync_source_transfer_mark_failed(transfer, local_errors);
+                nsync_source_transfer_mark_failed(transfer, (nread < 0) ? errno : EIO);  /* 0: the file shrank */
                 continue;
             }
 
@@ -4971,7 +5952,7 @@ static int nsync_source_transfer_prepare_next_message(
 #if defined(SEEK_DATA) && defined(SEEK_HOLE)
             off_t current_off = 0;
             if (nsync_u64_to_offt_checked(transfer->next_offset, &current_off) != 0) {
-                nsync_source_transfer_mark_failed(transfer, local_errors);
+                nsync_source_transfer_mark_failed(transfer, EOVERFLOW);
                 continue;
             }
 
@@ -4996,7 +5977,7 @@ static int nsync_source_transfer_prepare_next_message(
                     transfer->sparse_seek_mode = 0;
                     continue;
                 }
-                nsync_source_transfer_mark_failed(transfer, local_errors);
+                nsync_source_transfer_mark_failed(transfer, errno);
                 continue;
             }
 
@@ -5022,7 +6003,7 @@ static int nsync_source_transfer_prepare_next_message(
                     transfer->sparse_seek_mode = 0;
                     continue;
                 }
-                nsync_source_transfer_mark_failed(transfer, local_errors);
+                nsync_source_transfer_mark_failed(transfer, errno);
                 continue;
             }
 
@@ -5038,13 +6019,13 @@ static int nsync_source_transfer_prepare_next_message(
         size_t read_size = (size_t)nsync_min_u64(remaining, (uint64_t)bufsize);
         off_t read_off = 0;
         if (nsync_u64_to_offt_checked(transfer->next_offset, &read_off) != 0) {
-            nsync_source_transfer_mark_failed(transfer, local_errors);
+            nsync_source_transfer_mark_failed(transfer, EOVERFLOW);
             continue;
         }
 
         ssize_t nread = pread(transfer->fd, slot->wire_buf + header_size, read_size, read_off);
         if (nread <= 0) {
-            nsync_source_transfer_mark_failed(transfer, local_errors);
+            nsync_source_transfer_mark_failed(transfer, (nread < 0) ? errno : EIO);  /* 0: the file shrank */
             continue;
         }
 
@@ -5134,27 +6115,49 @@ static void nsync_source_copy_service(
     }
 
     nsync_trace_local(opts, "copy-src-service-start", expected, 0);
-
-    nsync_source_transfer_t* transfers = NULL;
-    nsync_source_request_t* pending = NULL;
-    if (expected > 0) {
-        transfers = (nsync_source_transfer_t*)calloc((size_t)expected, sizeof(*transfers));
-        pending = (nsync_source_request_t*)calloc((size_t)expected, sizeof(*pending));
+    if (expected == 0) {
+        return;
     }
-    if (expected > 0 && (transfers == NULL || pending == NULL)) {
+
+    int world_size = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    int file_credits = nsync_copy_file_credit_limit();
+    if (file_credits < 1) {
+        file_credits = 1;
+    }
+
+    /* At most file_credits transfers stream at once, and a destination keeps at
+     * most one real request outstanding per source (a cancelled request is
+     * answered at once, never queued), so two small pools replace the former
+     * per-COPY arrays: every scan below is O(credits + destinations), not
+     * O(expected) -- with a million COPYs in one batch those scans made the
+     * service quadratic. */
+    uint64_t pool = nsync_min_u64(expected, (uint64_t)file_credits);
+    uint64_t pend_cap = nsync_min_u64(expected, (uint64_t)world_size);
+    nsync_source_transfer_t* transfers = (nsync_source_transfer_t*)calloc((size_t)pool, sizeof(*transfers));
+    nsync_source_request_t* pending = (nsync_source_request_t*)calloc((size_t)pend_cap, sizeof(*pending));
+    unsigned char* dst_busy = (unsigned char*)calloc((size_t)world_size, sizeof(unsigned char));
+    if (transfers == NULL || pending == NULL || dst_busy == NULL) {
         free(transfers);
         free(pending);
+        free(dst_busy);
         (*local_errors)++;
         return;
     }
 
-    int file_credits = nsync_copy_file_credit_limit();
+    /* every source file is opened below this fd (the root path is resolved
+     * once, like the scan's); if it cannot be opened each request is answered
+     * with that errno, so the protocol stays matched */
+    int src_root_fd = open(src_root, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int src_root_errno = (src_root_fd < 0) ? errno : 0;
+
+    int active_count = 0;
     uint64_t received = 0;
     uint64_t completed = 0;
     while (completed < expected) {
         int made_progress = 0;
 
-        for (uint64_t i = 0; i < expected; i++) {
+        for (uint64_t i = 0; i < pool; i++) {
             nsync_source_transfer_t* transfer = &transfers[i];
             if (!transfer->active) {
                 continue;
@@ -5165,40 +6168,44 @@ static void nsync_source_copy_service(
             }
             if (transfer->completed) {
                 nsync_trace_local(opts, "copy-src-done", transfer->file_id, (uint64_t)transfer->dst_rank);
+                if (transfer->dst_rank >= 0 && transfer->dst_rank < world_size) {
+                    dst_busy[transfer->dst_rank] = 0;
+                }
                 nsync_source_transfer_free(transfer);
+                active_count--;
                 completed++;
                 made_progress = 1;
             }
         }
 
-        int active_count = nsync_source_active_transfer_count(transfers, expected);
-        for (uint64_t i = 0; i < expected && active_count < file_credits; i++) {
+        for (uint64_t i = 0; i < pend_cap && active_count < file_credits; i++) {
             nsync_source_request_t* req = &pending[i];
-            if (!req->active || nsync_source_has_active_transfer_for_dst(transfers, expected, req->dst_rank)) {
+            if (!req->active || dst_busy[req->dst_rank]) {
                 continue;
             }
 
-            uint64_t transfer_idx = expected;
-            for (uint64_t idx = 0; idx < expected; idx++) {
+            uint64_t transfer_idx = pool;
+            for (uint64_t idx = 0; idx < pool; idx++) {
                 if (!transfers[idx].active) {
                     transfer_idx = idx;
                     break;
                 }
             }
-            if (transfer_idx >= expected) {
+            if (transfer_idx >= pool) {
                 break;
             }
 
             int resp_status = nsync_source_transfer_init(
-                &transfers[transfer_idx], src_root, req->action, req->file_id, req->dst_rank, opts);
+                &transfers[transfer_idx], src_root_fd, src_root_errno,
+                req->action, req->file_id, req->dst_rank, opts);
             if (resp_status == 0) {
                 nsync_trace_local(opts, "copy-src-start", req->file_id, (uint64_t)req->dst_rank);
-            }
-            if (resp_status != 0) {
-                (*local_errors)++;
-                completed++;
-            } else {
                 active_count++;
+                dst_busy[req->dst_rank] = 1;
+            } else {
+                /* the destination counts and logs the item when it gets this
+                 * status (one failed item = one error) */
+                completed++;
             }
 
             char resp_buf[16];
@@ -5239,17 +6246,23 @@ static void nsync_source_copy_service(
                 if (bytes > 0 &&
                     nsync_copy_req_unpack(req_buf, (size_t)bytes, &file_id, &relpath) == 0)
                 {
+                    int cancel = (file_id & NSYNC_COPY_REQ_CANCEL) != 0;
+                    file_id &= ~NSYNC_COPY_REQ_CANCEL;
                     const nsync_action_record_t* action =
                         nsync_find_copy_action_sorted(src_actions, relpath);
-                    if (action != NULL) {
-                        uint64_t pending_idx = expected;
-                        for (uint64_t idx = 0; idx < expected; idx++) {
+                    if (action != NULL && cancel) {
+                        /* the destination will not write it: answer at once,
+                         * no source open, no stream, not an error here */
+                        resp_status = ECANCELED;
+                    } else if (action != NULL) {
+                        uint64_t pending_idx = pend_cap;
+                        for (uint64_t idx = 0; idx < pend_cap; idx++) {
                             if (!pending[idx].active) {
                                 pending_idx = idx;
                                 break;
                             }
                         }
-                        if (pending_idx < expected) {
+                        if (pending_idx < pend_cap) {
                             pending[pending_idx].active = 1;
                             pending[pending_idx].file_id = file_id;
                             pending[pending_idx].dst_rank = probe_status.MPI_SOURCE;
@@ -5288,7 +6301,7 @@ static void nsync_source_copy_service(
         }
 
         if (!made_progress) {
-            for (uint64_t i = 0; i < expected; i++) {
+            for (uint64_t i = 0; i < pool; i++) {
                 nsync_source_transfer_t* transfer = &transfers[i];
                 if (!transfer->active) {
                     continue;
@@ -5320,13 +6333,17 @@ static void nsync_source_copy_service(
         }
     }
 
-    for (uint64_t i = 0; i < expected; i++) {
+    for (uint64_t i = 0; i < pool; i++) {
         if (transfers[i].active) {
             nsync_source_transfer_free(&transfers[i]);
         }
     }
+    if (src_root_fd >= 0) {
+        close(src_root_fd);
+    }
     free(transfers);
     free(pending);
+    free(dst_busy);
 }
 
 static int nsync_copy_recv_slot_init(nsync_copy_recv_slot_t* slot, size_t bufsize)
@@ -5357,30 +6374,46 @@ static void nsync_copy_recv_slot_free(nsync_copy_recv_slot_t* slot)
     slot->req = MPI_REQUEST_NULL;
 }
 
-static int nsync_copy_recv_slots_busy_for_source(
-    const nsync_copy_recv_slot_t* slots,
-    uint64_t slot_count,
-    int src_rank)
-{
-    for (uint64_t i = 0; i < slot_count; i++) {
-        if (slots[i].busy && slots[i].src_rank == src_rank) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
+/* file ids are the COPY's index + 1 in this call (see the executor) */
 static nsync_destination_transfer_t* nsync_destination_find_transfer(
     nsync_destination_transfer_t* transfers,
     uint64_t count,
     uint64_t file_id)
 {
-    for (uint64_t i = 0; i < count; i++) {
-        if (transfers[i].active && transfers[i].file_id == file_id) {
-            return &transfers[i];
+    uint64_t id = file_id & ~NSYNC_COPY_REQ_CANCEL;
+    if (id == 0 || id > count) {
+        return NULL;
+    }
+    nsync_destination_transfer_t* transfer = &transfers[id - 1];
+    return (transfer->active && transfer->file_id == id) ? transfer : NULL;
+}
+
+/* Cut the destination file for the new content, once, when the source has
+ * started streaming (or, for a file without frames, at finalize). An emptied
+ * existing file then loses any set-ID bit and any access the new mode does not
+ * grant, before a byte of new content goes in, so that content is never more
+ * exposed than either the old or the new file. Returns 0 or an errno. */
+static int nsync_destination_prepare_write(nsync_destination_transfer_t* transfer)
+{
+    transfer->sized = 1;
+    off_t file_size = 0;
+    if (nsync_u64_to_offt_checked(transfer->action->size, &file_size) != 0) {
+        return EOVERFLOW;
+    }
+    if (!transfer->created) {
+        if (ftruncate(transfer->fd, 0) != 0) {
+            return errno;   /* nothing changed: the old copy stays as it was */
+        }
+        transfer->truncated = 1;
+        mode_t want = transfer->old_mode & (mode_t)transfer->action->mode & (mode_t)0777;
+        if ((transfer->old_mode & (mode_t)07777) != want) {
+            (void)fchmod(transfer->fd, want);   /* best effort: a non-root write clears set-ID anyway */
         }
     }
-    return NULL;
+    if (file_size > 0 && ftruncate(transfer->fd, file_size) != 0) {
+        return errno;
+    }
+    return 0;
 }
 
 static int nsync_destination_start_copy_transfer(
@@ -5390,8 +6423,10 @@ static int nsync_destination_start_copy_transfer(
     uint64_t file_id,
     nsync_destination_transfer_t* transfer,
     const nsync_options_t* opts,
+    int blocked,
     int* local_errors)
 {
+    (void)local_errors;   /* a failed item is counted once, in finalize */
     memset(transfer, 0, sizeof(*transfer));
     transfer->active = 1;
     transfer->file_id = file_id;
@@ -5401,33 +6436,36 @@ static int nsync_destination_start_copy_transfer(
     transfer->dst_fullpath = nsync_build_full_path(dst_root, action->relpath);
 
     mode_t mode = (mode_t)(action->mode & 07777u);
-    if (mode == 0) {
-        mode = (mode_t)0644;
-    }
 
-    /* Resolve parents and open the destination file without following any
-     * symlink below the root (nsync_open_dst_file_at creates missing parents). */
-    transfer->fd = nsync_open_dst_file_at(root_fd, action->relpath, mode, opts);
-    if (transfer->fd < 0) {
-        (*local_errors)++;
+    if (blocked) {
+        /* The REMOVE that had to clear this name failed (and was reported):
+         * there is nothing to write into. */
+        transfer->blocked = 1;
         transfer->open_error = 1;
-    }
-
-    if (transfer->fd >= 0) {
-        off_t file_size = 0;
-        if (nsync_u64_to_offt_checked(action->size, &file_size) != 0 ||
-            ftruncate(transfer->fd, file_size) != 0)
-        {
-            (*local_errors)++;
-            close(transfer->fd);
-            transfer->fd = -1;
+        transfer->cancelled = 1;
+    } else {
+        /* Resolve parents and open the destination file without following any
+         * symlink below the root (nsync_open_dst_file_at creates missing parents).
+         * Nothing is cut yet: see nsync_destination_prepare_write. */
+        struct stat st;
+        int created = 0;
+        transfer->fd = nsync_open_dst_file_at(root_fd, action->relpath, mode, opts, &created, &st);
+        if (transfer->fd < 0) {
+            transfer->fail_errno = errno;
             transfer->open_error = 1;
+            transfer->cancelled = 1;
+        } else {
+            transfer->created = created;
+            transfer->old_mode = created ? 0 : st.st_mode;
         }
     }
 
-    size_t req_bytes = nsync_copy_req_pack_size(file_id, action->relpath);
+    /* The REQ is always sent (the source waits for one per COPY it owns); a
+     * cancelled one only asks it not to stream. */
+    uint64_t wire_id = file_id | (transfer->cancelled ? NSYNC_COPY_REQ_CANCEL : 0ULL);
+    size_t req_bytes = nsync_copy_req_pack_size(wire_id, action->relpath);
     char* req_buf = (char*)MFU_MALLOC(req_bytes);
-    nsync_copy_req_pack(req_buf, file_id, action->relpath);
+    nsync_copy_req_pack(req_buf, wire_id, action->relpath);
     MPI_Send(req_buf, (int)req_bytes, MPI_BYTE, action->src_owner_world, NSYNC_MSG_COPY_REQ, MPI_COMM_WORLD);
     mfu_free(&req_buf);
     return 0;
@@ -5448,25 +6486,45 @@ static void nsync_destination_finalize_copy_transfer(
         success = 0;
     }
 
+    int meta_err = 0;
     if (transfer->fd >= 0) {
-        off_t file_size = 0;
-        if (success &&
-            (nsync_u64_to_offt_checked(transfer->action->size, &file_size) != 0 ||
-             ftruncate(transfer->fd, file_size) != 0))
-        {
-            (*local_errors)++;
-            success = 0;
+        if (success) {
+            /* a file that got no frame (empty) is cut here; a source that grew
+             * while it was read is cut back to the planned size */
+            int err = transfer->sized ? 0 : nsync_destination_prepare_write(transfer);
+            off_t file_size = 0;
+            if (err == 0 && transfer->write_end > transfer->action->size) {
+                if (nsync_u64_to_offt_checked(transfer->action->size, &file_size) != 0) {
+                    err = EOVERFLOW;
+                } else if (ftruncate(transfer->fd, file_size) != 0) {
+                    err = errno;
+                }
+            }
+            if (err != 0) {
+                transfer->fail_errno = err;
+                success = 0;
+            } else {
+                /* owner, then mode (chown clears set-ID bits), then times --
+                 * through the fd, before close: the file never carries its set-ID
+                 * bits under the wrong owner, and the name cannot be swapped */
+                meta_err = nsync_apply_metadata_fd(transfer->fd, transfer->action, meta_stats);
+            }
         }
 
         if (close(transfer->fd) != 0) {
-            (*local_errors)++;
+            if (transfer->fail_errno == 0) {
+                transfer->fail_errno = errno;
+            }
             success = 0;
         }
         transfer->fd = -1;
     }
 
     if (success) {
-        nsync_apply_metadata_at(root_fd, transfer->action->relpath, transfer->action, 0, opts, local_errors, meta_stats);
+        if (meta_err != 0) {
+            (*local_errors)++;
+            nsync_fail_note(NSYNC_FAIL_META, transfer->action->relpath, meta_err);
+        }
         if (done_actions != NULL) {
             (*done_actions)++;
         }
@@ -5477,7 +6535,20 @@ static void nsync_destination_finalize_copy_transfer(
             (*done_copy_bytes) += transfer->copied_bytes;
         }
     } else if (transfer->action != NULL) {
-        (void)nsync_remove_at(root_fd, transfer->action->relpath);
+        /* one failed item = one error, wherever it failed (source open/read
+         * failures arrive here as the RESP status or the END|ERROR errno) */
+        if (!transfer->blocked) {
+            (*local_errors)++;
+            nsync_fail_note(NSYNC_FAIL_COPY, transfer->action->relpath,
+                            (transfer->fail_errno != 0) ? transfer->fail_errno : EIO);
+        }
+        /* Remove only what this transfer created or cut -- a regular file. An
+         * existing copy the source never started to replace stays as it was;
+         * whatever else is at that name (a directory that was not replaced,
+         * something that appeared meanwhile) is left alone. */
+        if (transfer->created || transfer->truncated) {
+            (void)nsync_remove_typed_at(root_fd, transfer->action->relpath, S_IFREG, 0);
+        }
     }
 
     nsync_trace_local(opts, "copy-dst-finalize", transfer->file_id, (uint64_t)success);
@@ -5487,7 +6558,9 @@ static void nsync_destination_finalize_copy_transfer(
     transfer->active = 0;
 }
 
-static void nsync_destination_handle_copy_response(
+/* Returns the index of a cancelled transfer whose answer just arrived (it gets
+ * no frames, so the caller can finalize it now), else -1. */
+static int64_t nsync_destination_handle_copy_response(
     nsync_destination_transfer_t* transfers,
     uint64_t transfer_count,
     const nsync_options_t* opts,
@@ -5500,7 +6573,7 @@ static void nsync_destination_handle_copy_response(
     if (bytes <= 0) {
         MPI_Recv(NULL, 0, MPI_BYTE, status.MPI_SOURCE, NSYNC_MSG_COPY_RESP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         (*local_errors)++;
-        return;
+        return -1;
     }
 
     char* buf = (char*)MFU_MALLOC((size_t)bytes);
@@ -5511,7 +6584,7 @@ static void nsync_destination_handle_copy_response(
     if (nsync_copy_resp_unpack(buf, (size_t)bytes, &file_id, &resp_status) != 0) {
         mfu_free(&buf);
         (*local_errors)++;
-        return;
+        return -1;
     }
 
     nsync_destination_transfer_t* transfer =
@@ -5519,7 +6592,7 @@ static void nsync_destination_handle_copy_response(
     if (transfer == NULL) {
         mfu_free(&buf);
         (*local_errors)++;
-        return;
+        return -1;
     }
 
     transfer->response_received = 1;
@@ -5527,9 +6600,13 @@ static void nsync_destination_handle_copy_response(
     if (resp_status != 0) {
         transfer->response_error = 1;
         transfer->end_received = 1;
-        (*local_errors)++;
+        /* counted once in finalize; ECANCELED just acknowledges our cancel */
+        if (transfer->fail_errno == 0 && !(transfer->cancelled && resp_status == ECANCELED)) {
+            transfer->fail_errno = resp_status;
+        }
     }
     mfu_free(&buf);
+    return transfer->cancelled ? (int64_t)(transfer - transfers) : -1;
 }
 
 static void nsync_destination_handle_copy_frame(
@@ -5554,18 +6631,34 @@ static void nsync_destination_handle_copy_frame(
     }
 
     if (header.flags & NSYNC_COPY_FRAME_FLAG_ERROR) {
+        /* the source could not read the file; an END frame's logical length
+         * carries its errno (counted once in finalize) */
         transfer->transfer_error = 1;
-        (*local_errors)++;
+        if (transfer->fail_errno == 0) {
+            transfer->fail_errno = (header.logical_length != 0) ? (int)header.logical_length : EIO;
+        }
+    }
+
+    if (!transfer->sized && transfer->fd >= 0 && !transfer->open_error && !transfer->transfer_error) {
+        /* the source is streaming (it opened and read the file): now cut the old copy */
+        int err = nsync_destination_prepare_write(transfer);
+        if (err != 0) {
+            transfer->fail_errno = err;
+            transfer->transfer_error = 1;
+        }
     }
 
     if ((header.flags & NSYNC_COPY_FRAME_FLAG_HOLE) == 0 &&
         header.data_length > 0 &&
         transfer->fd >= 0 &&
-        !transfer->open_error)
+        !transfer->open_error &&
+        !transfer->transfer_error)   /* after a failed write the rest is only drained */
     {
         if (nsync_pwrite_all(transfer->fd, data, (size_t)header.data_length, header.offset) != 0) {
-            (*local_errors)++;
+            transfer->fail_errno = errno;
             transfer->transfer_error = 1;
+        } else if (header.offset + (uint64_t)header.data_length > transfer->write_end) {
+            transfer->write_end = header.offset + (uint64_t)header.data_length;
         }
     }
 
@@ -5579,18 +6672,72 @@ static void nsync_destination_handle_copy_frame(
     }
 }
 
+/* Relpaths whose REMOVE failed in one execution call (one rank, one batch):
+ * the replacement of the same name (MKDIR / SYMLINK / COPY) is not attempted,
+ * the failure is already reported once. A REMOVE and the create of the same
+ * relpath share the DSTO owner, and every REMOVE sorts before every create
+ * (nsync_action_exec_sort), so the set is complete before the first lookup. */
+typedef struct {
+    const char** paths;   /* borrowed from the action records */
+    uint64_t size;
+    uint64_t capacity;
+    int sorted;
+} nsync_blocked_set_t;
+
+static int nsync_blocked_cmp(const void* a, const void* b)
+{
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+static void nsync_blocked_add(nsync_blocked_set_t* set, const char* relpath)
+{
+    if (set->size == set->capacity) {
+        uint64_t grow = (set->capacity == 0) ? 16 : set->capacity * 2;
+        const char** bigger = (const char**)realloc((void*)set->paths, (size_t)grow * sizeof(*set->paths));
+        if (bigger == NULL) {
+            return;   /* the create then fails on its own and is reported again */
+        }
+        set->paths = bigger;
+        set->capacity = grow;
+    }
+    set->paths[set->size++] = relpath;
+    set->sorted = 0;
+}
+
+static int nsync_blocked_contains(nsync_blocked_set_t* set, const char* relpath)
+{
+    if (set == NULL || set->size == 0) {
+        return 0;
+    }
+    if (!set->sorted) {
+        qsort((void*)set->paths, (size_t)set->size, sizeof(*set->paths), nsync_blocked_cmp);
+        set->sorted = 1;
+    }
+    return bsearch(&relpath, (const void*)set->paths, (size_t)set->size, sizeof(*set->paths), nsync_blocked_cmp) != NULL;
+}
+
+static void nsync_blocked_free(nsync_blocked_set_t* set)
+{
+    free((void*)set->paths);
+    set->paths = NULL;
+    set->size = 0;
+    set->capacity = 0;
+}
+
 static void nsync_destination_execute_copy_actions(
     const char* dst_root,
     int root_fd,
     const nsync_action_ptr_vec_t* copy_actions,
     const nsync_options_t* opts,
+    nsync_blocked_set_t* blocked,
     int* local_errors,
     nsync_meta_apply_stats_t* meta_stats,
     uint64_t* done_actions,
     uint64_t* done_copy_files,
     uint64_t* done_copy_bytes)
 {
-    if (copy_actions->size == 0) {
+    uint64_t n = copy_actions->size;
+    if (n == 0) {
         return;
     }
 
@@ -5598,89 +6745,113 @@ static void nsync_destination_execute_copy_actions(
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     int file_credits = nsync_copy_file_credit_limit();
 
-    uint64_t unique_sources = 0;
-    int* seen_sources = (int*)calloc((size_t)world_size, sizeof(int));
-    if (seen_sources == NULL) {
-        (*local_errors)++;
-        return;
-    }
-    for (uint64_t i = 0; i < copy_actions->size; i++) {
-        int src_rank = copy_actions->records[i]->src_owner_world;
-        if (src_rank >= 0 && src_rank < world_size && !seen_sources[src_rank]) {
-            seen_sources[src_rank] = 1;
-            unique_sources++;
-        }
-    }
-    free(seen_sources);
-
-    uint64_t recv_slot_count = nsync_min_u64(
-        copy_actions->size,
-        unique_sources * (uint64_t)file_credits * (uint64_t)NSYNC_COPY_PIPELINE_DEPTH);
-    if (recv_slot_count == 0) {
-        recv_slot_count = 1;
-    }
-
-    size_t bufsize = nsync_effective_bufsize(opts->bufsize);
-    nsync_copy_recv_slot_t* recv_slots =
-        (nsync_copy_recv_slot_t*)calloc((size_t)recv_slot_count, sizeof(*recv_slots));
+    /* One real transfer per source at a time (the protocol's pacing), every
+     * source served from its own queue, file id = COPY index + 1 (O(1) lookup):
+     * each pass costs O(sources) instead of O(COPYs). Cancelled transfers (refused
+     * or unopenable destination) do not hold the source's slot -- the source
+     * answers them at once -- so they go out back to back. */
+    uint64_t* src_count = (uint64_t*)calloc((size_t)world_size + 1, sizeof(uint64_t));
+    uint64_t* src_off = (uint64_t*)calloc((size_t)world_size + 1, sizeof(uint64_t));
+    uint64_t* src_next = (uint64_t*)calloc((size_t)world_size + 1, sizeof(uint64_t));
+    int64_t* src_active = (int64_t*)malloc(((size_t)world_size + 1) * sizeof(int64_t));
+    int* sources = (int*)malloc(((size_t)world_size + 1) * sizeof(int));
+    uint64_t* src_list = (uint64_t*)malloc((size_t)n * sizeof(uint64_t));
+    uint64_t* ready = (uint64_t*)malloc((size_t)n * sizeof(uint64_t));
     nsync_destination_transfer_t* transfers =
-        (nsync_destination_transfer_t*)calloc((size_t)copy_actions->size, sizeof(*transfers));
-    int* per_source_active = (int*)calloc((size_t)world_size, sizeof(int));
-    unsigned char* launched = (unsigned char*)calloc((size_t)copy_actions->size, sizeof(unsigned char));
-    if (recv_slots == NULL || transfers == NULL || per_source_active == NULL || launched == NULL) {
-        (*local_errors)++;
-        free(recv_slots);
-        free(transfers);
-        free(per_source_active);
-        free(launched);
-        return;
-    }
-
-    int recv_init_error = 0;
-    for (uint64_t i = 0; i < recv_slot_count; i++) {
-        if (nsync_copy_recv_slot_init(&recv_slots[i], bufsize) != 0) {
-            (*local_errors)++;
-            recv_slot_count = i;
-            recv_init_error = 1;
-            break;
-        }
-    }
-    if (recv_init_error) {
-        for (uint64_t i = 0; i < recv_slot_count; i++) {
-            nsync_copy_recv_slot_free(&recv_slots[i]);
-        }
-        free(recv_slots);
-        free(transfers);
-        free(per_source_active);
-        free(launched);
-        return;
+        (nsync_destination_transfer_t*)calloc((size_t)n, sizeof(*transfers));
+    if (src_count == NULL || src_off == NULL || src_next == NULL || src_active == NULL || sources == NULL ||
+        src_list == NULL || ready == NULL || transfers == NULL)
+    {
+        MFU_ABORT(-1, "nsync: out of memory for %llu copy transfers", (unsigned long long)n);
     }
 
     uint64_t completed = 0;
-    uint64_t next_file_id = 1;
-    while (completed < copy_actions->size) {
+    for (uint64_t i = 0; i < n; i++) {
+        int src_rank = copy_actions->records[i]->src_owner_world;
+        if (src_rank >= 0 && src_rank < world_size) {
+            src_count[src_rank]++;
+        } else {
+            /* no source to ask: fail it here instead of waiting forever */
+            (*local_errors)++;
+            nsync_fail_note(NSYNC_FAIL_COPY, copy_actions->records[i]->relpath, EPROTO);
+            completed++;
+        }
+    }
+    int source_count = 0;
+    uint64_t running = 0;
+    for (int r = 0; r < world_size; r++) {
+        src_off[r] = running;
+        running += src_count[r];
+        src_active[r] = -1;
+        if (src_count[r] > 0) {
+            sources[source_count++] = r;
+        }
+    }
+    for (uint64_t i = 0; i < n; i++) {
+        int src_rank = copy_actions->records[i]->src_owner_world;
+        if (src_rank >= 0 && src_rank < world_size) {
+            src_list[src_off[src_rank] + src_next[src_rank]++] = i;
+        }
+    }
+    for (int r = 0; r < world_size; r++) {
+        src_next[r] = 0;
+    }
+
+    /* one real transfer per source at a time, each with at most PIPELINE_DEPTH
+     * frames in flight: more receive slots would only hold memory (frames past
+     * these wait in MPI's queue and are received, in order, as slots free) */
+    (void)file_credits;
+    uint64_t recv_slot_count = nsync_min_u64(
+        n, (uint64_t)source_count * (uint64_t)NSYNC_COPY_PIPELINE_DEPTH);
+    uint32_t* src_frames_busy = (uint32_t*)calloc((size_t)world_size + 1, sizeof(uint32_t));
+    if (src_frames_busy == NULL) {
+        MFU_ABORT(-1, "nsync: out of memory for copy receive state");
+    }
+    if (recv_slot_count == 0) {
+        recv_slot_count = 1;
+    }
+    size_t bufsize = nsync_effective_bufsize(opts->bufsize);
+    nsync_copy_recv_slot_t* recv_slots =
+        (nsync_copy_recv_slot_t*)calloc((size_t)recv_slot_count, sizeof(*recv_slots));
+    if (recv_slots == NULL) {
+        MFU_ABORT(-1, "nsync: out of memory for copy receive slots");
+    }
+    for (uint64_t i = 0; i < recv_slot_count; i++) {
+        if (nsync_copy_recv_slot_init(&recv_slots[i], bufsize) != 0) {
+            MFU_ABORT(-1, "nsync: out of memory for copy receive buffers");
+        }
+    }
+
+    uint64_t ready_len = 0;
+    while (completed < n) {
         int made_progress = 0;
 
-        for (uint64_t i = 0; i < copy_actions->size; i++) {
-            const nsync_action_record_t* action = copy_actions->records[i];
-            int src_rank = action->src_owner_world;
-            if (launched[i] || src_rank < 0 || src_rank >= world_size ||
-                per_source_active[src_rank] >= 1)
-            {
-                continue;
+        /* launch: the next COPY of every source that has no real transfer in
+         * flight; cancelled ones do not take the slot (bounded burst per pass) */
+        for (int k = 0; k < source_count; k++) {
+            int s = sources[k];
+            int burst = 0;
+            while (src_active[s] < 0 && src_next[s] < src_count[s] && burst < 64) {
+                uint64_t i = src_list[src_off[s] + src_next[s]];
+                src_next[s]++;
+                const nsync_action_record_t* action = copy_actions->records[i];
+                int refused = nsync_blocked_contains(blocked, action->relpath);
+                int skip = !refused && nsync_batch_stop_now();
+                if (skip) {
+                    nsync_batch_stop.not_attempted++;
+                }
+                /* "blocked" = cancel without counting a failure: a refused
+                 * replacement (already reported) or a stop (not attempted) */
+                (void)nsync_destination_start_copy_transfer(
+                    dst_root, root_fd, action, i + 1, &transfers[i], opts,
+                    skip || refused, local_errors);
+                nsync_trace_local(opts, "copy-dst-launch", i + 1, (uint64_t)s);
+                if (!transfers[i].cancelled) {
+                    src_active[s] = (int64_t)i;
+                }
+                burst++;
+                made_progress = 1;
             }
-
-            if (nsync_destination_start_copy_transfer(
-                    dst_root, root_fd, action, next_file_id, &transfers[i], opts, local_errors) != 0)
-            {
-                (*local_errors)++;
-                continue;
-            }
-            nsync_trace_local(opts, "copy-dst-launch", next_file_id, (uint64_t)src_rank);
-            launched[i] = 1;
-            per_source_active[src_rank]++;
-            next_file_id++;
-            made_progress = 1;
         }
 
         while (1) {
@@ -5690,7 +6861,10 @@ static void nsync_destination_execute_copy_actions(
             if (!flag) {
                 break;
             }
-            nsync_destination_handle_copy_response(transfers, copy_actions->size, opts, local_errors);
+            int64_t done = nsync_destination_handle_copy_response(transfers, n, opts, local_errors);
+            if (done >= 0) {
+                ready[ready_len++] = (uint64_t)done;
+            }
             made_progress = 1;
         }
 
@@ -5705,7 +6879,10 @@ static void nsync_destination_execute_copy_actions(
             if (complete) {
                 slot->busy = 0;
                 slot->req = MPI_REQUEST_NULL;
-                nsync_destination_handle_copy_frame(transfers, copy_actions->size, slot, opts, local_errors);
+                nsync_destination_handle_copy_frame(transfers, n, slot, opts, local_errors);
+                if (slot->src_rank >= 0 && slot->src_rank < world_size) {
+                    src_frames_busy[slot->src_rank]--;
+                }
                 slot->bytes = 0;
                 slot->src_rank = -1;
                 made_progress = 1;
@@ -5752,16 +6929,37 @@ static void nsync_destination_execute_copy_actions(
             slot->busy = 1;
             slot->bytes = (size_t)bytes;
             slot->src_rank = status.MPI_SOURCE;
+            if (slot->src_rank >= 0 && slot->src_rank < world_size) {
+                src_frames_busy[slot->src_rank]++;
+            }
             made_progress = 1;
             break;
         }
 
-        for (uint64_t i = 0; i < copy_actions->size; i++) {
-            nsync_destination_transfer_t* transfer = &transfers[i];
-            if (!transfer->active ||
-                !transfer->response_received ||
+        /* cancelled transfers whose answer arrived: nothing else will come */
+        while (ready_len > 0) {
+            nsync_destination_transfer_t* transfer = &transfers[ready[--ready_len]];
+            if (!transfer->active) {
+                continue;
+            }
+            nsync_destination_finalize_copy_transfer(
+                root_fd, transfer, opts, local_errors, meta_stats,
+                done_actions, done_copy_files, done_copy_bytes);
+            completed++;
+            made_progress = 1;
+        }
+
+        /* real transfers: done once the answer and the END frame are in and no
+         * frame from that source is still being received */
+        for (int k = 0; k < source_count; k++) {
+            int s = sources[k];
+            if (src_active[s] < 0) {
+                continue;
+            }
+            nsync_destination_transfer_t* transfer = &transfers[src_active[s]];
+            if (!transfer->response_received ||
                 !transfer->end_received ||
-                nsync_copy_recv_slots_busy_for_source(recv_slots, recv_slot_count, transfer->src_rank))
+                src_frames_busy[s] > 0)
             {
                 continue;
             }
@@ -5769,9 +6967,7 @@ static void nsync_destination_execute_copy_actions(
             nsync_destination_finalize_copy_transfer(
                 root_fd, transfer, opts, local_errors, meta_stats,
                 done_actions, done_copy_files, done_copy_bytes);
-            if (transfer->src_rank >= 0 && transfer->src_rank < world_size && per_source_active[transfer->src_rank] > 0) {
-                per_source_active[transfer->src_rank]--;
-            }
+            src_active[s] = -1;
             completed++;
             made_progress = 1;
         }
@@ -5786,7 +6982,10 @@ static void nsync_destination_execute_copy_actions(
                 MPI_Wait(&slot->req, MPI_STATUS_IGNORE);
                 slot->busy = 0;
                 slot->req = MPI_REQUEST_NULL;
-                nsync_destination_handle_copy_frame(transfers, copy_actions->size, slot, opts, local_errors);
+                nsync_destination_handle_copy_frame(transfers, n, slot, opts, local_errors);
+                if (slot->src_rank >= 0 && slot->src_rank < world_size) {
+                    src_frames_busy[slot->src_rank]--;
+                }
                 slot->bytes = 0;
                 slot->src_rank = -1;
                 waited = 1;
@@ -5803,7 +7002,7 @@ static void nsync_destination_execute_copy_actions(
     for (uint64_t i = 0; i < recv_slot_count; i++) {
         nsync_copy_recv_slot_free(&recv_slots[i]);
     }
-    for (uint64_t i = 0; i < copy_actions->size; i++) {
+    for (uint64_t i = 0; i < n; i++) {
         if (transfers[i].active) {
             nsync_destination_finalize_copy_transfer(
                 root_fd, &transfers[i], opts, local_errors, meta_stats,
@@ -5812,9 +7011,15 @@ static void nsync_destination_execute_copy_actions(
     }
 
     free(recv_slots);
+    free(src_frames_busy);
     free(transfers);
-    free(per_source_active);
-    free(launched);
+    free(ready);
+    free(src_list);
+    free(sources);
+    free(src_active);
+    free(src_next);
+    free(src_off);
+    free(src_count);
 }
 
 static void nsync_deferred_dir_remove_add(
@@ -5881,10 +7086,44 @@ static void nsync_deferred_dir_meta_add(
     }
 }
 
+/* One REMOVE; returns 1 when the entry is gone (or was already). Only --delete
+ * removes a directory together with what is in it. Without it every REMOVE
+ * comes from a type change (dst-only entries are only skipped), so a directory
+ * that still holds entries the source does not have is left alone and
+ * reported, and its replacement is not created (blocked). The planned type
+ * guards the entry: anything else now at that name changed after the scan --
+ * e.g. the type-change pre-pass already turned a stale symlink into the very
+ * directory earlier batches are filling -- and is left alone. */
+static int nsync_destination_remove(
+    int root_fd,
+    const nsync_action_record_t* action,
+    const nsync_options_t* opts,
+    nsync_action_vec_t* deferred_dir_removes,
+    nsync_blocked_set_t* blocked,
+    int* local_errors)
+{
+    mode_t expect = (mode_t)action->mode & S_IFMT;
+    nsync_rm_result_t rm = nsync_remove_typed_at(root_fd, action->relpath, expect, opts->delete);
+    if (rm != NSYNC_RM_FAILED) {
+        return 1;
+    }
+    int err = errno;
+    if (opts->delete && opts->batch_files > 0 && S_ISDIR(expect) && nsync_errno_not_empty(err)) {
+        /* --delete: entries created concurrently; retried after the batches */
+        nsync_deferred_dir_remove_add(deferred_dir_removes, action, local_errors);
+        return 0;
+    }
+    (*local_errors)++;
+    nsync_fail_note(nsync_errno_not_empty(err) ? NSYNC_FAIL_REPLACE : NSYNC_FAIL_REMOVE, action->relpath, err);
+    nsync_blocked_add(blocked, action->relpath);
+    return 0;
+}
+
 static void nsync_destination_execute_actions(
     const char* dst_root,
     nsync_action_vec_t* dst_actions,
     const nsync_options_t* opts,
+    MPI_Comm dst_comm,
     nsync_action_vec_t* deferred_dir_removes,
     nsync_action_vec_t* deferred_dir_meta_updates,
     int* local_errors,
@@ -5893,7 +7132,16 @@ static void nsync_destination_execute_actions(
     uint64_t* done_copy_files,
     uint64_t* done_copy_bytes)
 {
+    /* Rank barrier: every destination rank finishes its type-change REMOVEs
+     * before any rank creates anything. A type change's REMOVE and the creates
+     * below it can run on different ranks (children hash to their own owner; a
+     * large COPY may be rebalanced), and without the barrier a child could meet
+     * the stale entry. Every destination rank reaches it -- also with no
+     * actions -- and no copy request is sent before it, so source ranks (waiting
+     * only for requests) are never part of it. dst-only REMOVEs (--delete) sort
+     * last and do not hold the creates up. */
     if (dst_actions->size == 0) {
+        MPI_Barrier(dst_comm);
         return;
     }
 
@@ -5914,43 +7162,55 @@ static void nsync_destination_execute_actions(
     uint64_t local_done_actions = 0;
     uint64_t local_done_copy_files = 0;
     uint64_t local_done_copy_bytes = 0;
+    nsync_blocked_set_t blocked = { NULL, 0, 0, 0 };
 
+    /* order (nsync_action_exec_sort): type-change REMOVEs, barrier, creates and
+     * metadata, dst-only REMOVEs (--delete), then the COPY transfers */
+    int removes_done = 0;
     for (uint64_t i = 0; i < dst_actions->size; i++) {
         const nsync_action_record_t* action = &dst_actions->records[i];
+        if (!removes_done && !nsync_remove_is_type_change(action)) {
+            MPI_Barrier(dst_comm);
+            removes_done = 1;
+        }
         if (strcmp(action->relpath, ".") == 0 &&
             (action->type == NSYNC_ACTION_REMOVE || action->type == NSYNC_ACTION_MKDIR))
         {
             continue;
         }
+        if ((action->type == NSYNC_ACTION_MKDIR || action->type == NSYNC_ACTION_SYMLINK_UPDATE) &&
+            nsync_blocked_contains(&blocked, action->relpath))
+        {
+            continue;   /* the stale entry could not be removed (reported once) */
+        }
+        if (action->type != NSYNC_ACTION_COPY) {
+            int dst_only = (action->type == NSYNC_ACTION_REMOVE && !nsync_remove_is_type_change(action));
+            if (dst_only ? nsync_batch_stop_delete_now() : nsync_batch_stop_now()) {
+                nsync_batch_stop.not_attempted++;
+                continue;
+            }
+        }
 
         int action_completed = 0;
         switch (action->type) {
         case NSYNC_ACTION_REMOVE:
-            if (nsync_remove_at(root_fd, action->relpath) != 0) {
-                mode_t mode = (mode_t)action->mode;
-                if (opts->batch_files > 0 && S_ISDIR(mode) && errno == ENOTEMPTY) {
-                    nsync_deferred_dir_remove_add(deferred_dir_removes, action, local_errors);
-                } else {
-                    (*local_errors)++;
-                }
-            } else {
-                action_completed = 1;
-            }
+            action_completed = nsync_destination_remove(
+                root_fd, action, opts, deferred_dir_removes, &blocked, local_errors);
             break;
         case NSYNC_ACTION_MKDIR: {
+            /* Always create with owner rwx: children must be writable whatever
+             * the source mode (e.g. a 0555 source directory on a non-root run,
+             * or a --chmod D0500 override). The deferred dir-meta finalize stamps
+             * the real mode after all children exist. */
             mode_t mode = (mode_t)(action->mode & 07777u);
             if (mode == 0) {
                 mode = (mode_t)0777;
             }
-            if (opts->chmod_set) {
-                /* Create directories with a permissive working mode so children
-                 * can be written even when --chmod requests a restrictive dir
-                 * mode (e.g. D0500). The deferred dir-meta finalize stamps the
-                 * real override mode after all children exist. */
-                mode |= (mode_t)0700;
-            }
+            mode |= (mode_t)0700;
             if (nsync_mkdir_at(root_fd, action->relpath, mode) != 0) {
+                int err = errno;
                 (*local_errors)++;
+                nsync_fail_note(NSYNC_FAIL_MKDIR, action->relpath, err);
             } else {
                 nsync_deferred_dir_meta_add(deferred_dir_meta_updates, action, local_errors);
                 action_completed = 1;
@@ -5988,6 +7248,10 @@ static void nsync_destination_execute_actions(
         }
     }
 
+    if (!removes_done) {
+        MPI_Barrier(dst_comm);   /* only type-change REMOVEs on this rank */
+    }
+
     if (copy_actions.size > 1) {
         qsort(copy_actions.records, (size_t)copy_actions.size, sizeof(*copy_actions.records),
             nsync_action_ptr_copy_size_desc_sort);
@@ -5998,12 +7262,14 @@ static void nsync_destination_execute_actions(
         root_fd,
         &copy_actions,
         opts,
+        &blocked,
         local_errors,
         meta_stats,
         &local_done_actions,
         &local_done_copy_files,
         &local_done_copy_bytes);
     nsync_action_ptr_vec_free(&copy_actions);
+    nsync_blocked_free(&blocked);
 
     if (done_actions != NULL) {
         (*done_actions) += local_done_actions;
@@ -6051,8 +7317,8 @@ static void nsync_execute_actions_phase4(
     } else if (role_info->role == NSYNC_ROLE_DST) {
         nsync_trace_local(opts, "phase4-dst-exec", dst_exec_actions->size, 0);
         nsync_destination_execute_actions(
-            dst_root, dst_exec_actions, opts, deferred_dir_removes, deferred_dir_meta_updates, local_errors, meta_stats,
-            completed_actions, completed_copy_files, completed_copy_bytes);
+            dst_root, dst_exec_actions, opts, role_info->dst_comm, deferred_dir_removes, deferred_dir_meta_updates,
+            local_errors, meta_stats, completed_actions, completed_copy_files, completed_copy_bytes);
     }
 }
 
@@ -6090,8 +7356,11 @@ static void nsync_finalize_deferred_dir_removes(
             continue;
         }
 
-        if (nsync_remove_at(root_fd, action->relpath) != 0) {
+        /* only --delete defers directory removes, so recursion is intended here */
+        if (nsync_remove_typed_at(root_fd, action->relpath, S_IFDIR, 1) == NSYNC_RM_FAILED) {
+            int err = errno;
             (*local_errors)++;
+            nsync_fail_note(NSYNC_FAIL_REMOVE, action->relpath, err);
         }
     }
 
@@ -6303,7 +7572,7 @@ static void nsync_action_counts_init(nsync_action_counts_t* counts)
     memset(counts, 0, sizeof(*counts));
 }
 
-static void nsync_action_counts_to_array(const nsync_action_counts_t* counts, uint64_t out[6])
+static void nsync_action_counts_to_array(const nsync_action_counts_t* counts, uint64_t out[NSYNC_ACTION_COUNTS_N])
 {
     out[0] = counts->copy;
     out[1] = counts->remove;
@@ -6311,9 +7580,12 @@ static void nsync_action_counts_to_array(const nsync_action_counts_t* counts, ui
     out[3] = counts->symlink_update;
     out[4] = counts->meta_update;
     out[5] = counts->skipped_only_dst;
+    out[6] = counts->type_to_dir;
+    out[7] = counts->type_from_dir;
+    out[8] = counts->skipped_special;
 }
 
-static void nsync_action_counts_from_array(const uint64_t in[6], nsync_action_counts_t* counts)
+static void nsync_action_counts_from_array(const uint64_t in[NSYNC_ACTION_COUNTS_N], nsync_action_counts_t* counts)
 {
     counts->copy = in[0];
     counts->remove = in[1];
@@ -6321,6 +7593,9 @@ static void nsync_action_counts_from_array(const uint64_t in[6], nsync_action_co
     counts->symlink_update = in[3];
     counts->meta_update = in[4];
     counts->skipped_only_dst = in[5];
+    counts->type_to_dir = in[6];
+    counts->type_from_dir = in[7];
+    counts->skipped_special = in[8];
 }
 
 static void nsync_action_counts_add(nsync_action_counts_t* dst, const nsync_action_counts_t* src)
@@ -6331,6 +7606,9 @@ static void nsync_action_counts_add(nsync_action_counts_t* dst, const nsync_acti
     dst->symlink_update += src->symlink_update;
     dst->meta_update += src->meta_update;
     dst->skipped_only_dst += src->skipped_only_dst;
+    dst->type_to_dir += src->type_to_dir;
+    dst->type_from_dir += src->type_from_dir;
+    dst->skipped_special += src->skipped_special;
 }
 
 static uint64_t nsync_action_counts_total_actions(const nsync_action_counts_t* counts)
@@ -6638,6 +7916,33 @@ static int nsync_large_copy_pick_min_loaded(const int* world_ranks, int count, c
     return best;
 }
 
+/* A large COPY may move to the least-loaded ranks -- unless it replaces an
+ * entry of another type: the planner emits that REMOVE right before the COPY
+ * (same relpath, same DSTO owner), and keeping the pair on one destination rank
+ * keeps "REMOVE failed => COPY not attempted" a local decision (one failed item,
+ * one error). Both callers below must use this same predicate: one sizes the
+ * buffer, the other fills it. */
+static int nsync_large_copy_movable(
+    const nsync_action_vec_t* planned_actions,
+    uint64_t i,
+    uint64_t threshold,
+    const nsync_role_info_t* role_info)
+{
+    const nsync_action_record_t* action = &planned_actions->records[i];
+    if (action->type != NSYNC_ACTION_COPY || action->size < threshold ||
+        !(role_info->src_count > 1 || role_info->dst_count > 1))
+    {
+        return 0;
+    }
+    if (i > 0) {
+        const nsync_action_record_t* prev = &planned_actions->records[i - 1];
+        if (prev->type == NSYNC_ACTION_REMOVE && strcmp(prev->relpath, action->relpath) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int nsync_rebalance_large_copy_owners(
     nsync_action_vec_t* planned_actions,
     const nsync_role_info_t* role_info)
@@ -6679,8 +7984,7 @@ static int nsync_rebalance_large_copy_owners(
             continue;
         }
 
-        int large_file = (action->size >= threshold) &&
-            (role_info->src_count > 1 || role_info->dst_count > 1);
+        int large_file = nsync_large_copy_movable(planned_actions, i, threshold, role_info);
         if (large_file) {
             size_t record_bytes = nsync_large_copy_owner_record_pack_size(action, i);
             if (SIZE_MAX - local_large_bytes < record_bytes) {
@@ -6727,10 +8031,7 @@ static int nsync_rebalance_large_copy_owners(
             char* ptr = packed;
             for (uint64_t i = 0; i < planned_actions->size; i++) {
                 nsync_action_record_t* action = &planned_actions->records[i];
-                if (action->type == NSYNC_ACTION_COPY &&
-                    action->size >= threshold &&
-                    (role_info->src_count > 1 || role_info->dst_count > 1))
-                {
+                if (nsync_large_copy_movable(planned_actions, i, threshold, role_info)) {
                     ptr += nsync_large_copy_owner_record_pack(ptr, action, i);
                 }
             }
@@ -7120,6 +8421,19 @@ static int nsync_plan_create_action(
         src_rec->mtime, src_rec->mtime_nsec, src_rec->atime, src_rec->atime_nsec, src_rec->link_target);
 }
 
+static void nsync_special_skip_log(const char* relpath)
+{
+    static uint64_t logged = 0;
+    if (logged >= NSYNC_FAIL_IMMEDIATE) {
+        return;
+    }
+    logged++;
+    char shown[NSYNC_FAIL_RECORD_BYTES];
+    nsync_escape_path(relpath, shown, sizeof(shown) - 128);
+    MFU_LOG(MFU_LOG_WARN, "Skipping `%s`: a FIFO, socket or device in the source is not copied%s", shown,
+            (logged == NSYNC_FAIL_IMMEDIATE) ? " (further ones on this rank are only counted)" : "");
+}
+
 static int nsync_plan_planner_records(
     nsync_meta_vec_t* planner,
     const nsync_options_t* opts,
@@ -7152,6 +8466,16 @@ static int nsync_plan_planner_records(
             i++;
         }
 
+        if (src_rec != NULL && src_rec->type == MFU_TYPE_UNKNOWN) {
+            /* A FIFO, socket or device in the source is not copied (only regular
+             * files are read), and whatever the destination has at that name is
+             * left as it is -- also with --delete: the source does have an entry
+             * there. Like rsync without --specials, this is not a failure. */
+            action_counts->skipped_special++;
+            nsync_special_skip_log(relpath);
+            continue;
+        }
+
         int src_owner_world = nsync_owner_from_group(
             role_info->src_world_ranks, role_info->src_count, relpath, NSYNC_HASH_DOMAIN_SRC);
         int dst_owner_world = nsync_owner_from_group(
@@ -7163,10 +8487,17 @@ static int nsync_plan_planner_records(
 
             if (src_rec->type != dst_rec->type) {
                 changed = 1;
+                if (strcmp(relpath, ".") == 0) {
+                    /* the root itself is never replaced (its REMOVE/MKDIR are skipped) */
+                } else if (src_rec->type == MFU_TYPE_DIR) {
+                    action_counts->type_to_dir++;
+                } else if (dst_rec->type == MFU_TYPE_DIR) {
+                    action_counts->type_from_dir++;
+                }
 
                 if (nsync_plan_emit_action(
                         planned_actions, action_counts, NSYNC_ACTION_REMOVE,
-                        relpath, -1, dst_owner_world, 0, dst_rec->mode,
+                        relpath, -1, dst_owner_world, NSYNC_REMOVE_TYPE_CHANGE, dst_rec->mode,
                         dst_rec->uid, dst_rec->gid, dst_rec->mtime, dst_rec->mtime_nsec, dst_rec->atime, dst_rec->atime_nsec, NULL) != 0)
                 {
                     return -1;
@@ -7274,6 +8605,328 @@ static int nsync_plan_planner_records(
     return 0;
 }
 
+/* ---- type-change pre-pass (more than one batch) ----
+ *
+ * A destination entry that is not a directory where the source has a directory
+ * (a stale symlink, a file, a fifo...) must become a directory before any child
+ * is created below it. The planner replaces it (REMOVE + MKDIR) in the batch of
+ * that path, but every child lands in the batch of its own path: children in
+ * earlier batches would meet the stale entry, fail closed (O_NOFOLLOW) and stop
+ * the run. So every such entry is replaced here, once, before the first batch:
+ *
+ *  - source ranks stream their source-directory relpaths (collected while the
+ *    spool was repartitioned) to the destination rank that owns each path;
+ *  - the owner checks it with one fstatat from the destination root (nothing to
+ *    do for a missing path or a directory -- almost every path); only an entry
+ *    that looks like a non-directory is re-checked through the O_NOFOLLOW walk
+ *    and replaced (unlink + mkdir 0700), and the source directory's metadata
+ *    (sent along with the path) is queued as deferred directory metadata --
+ *    so a run that stops before the path's own batch leaves a directory with
+ *    the source owner/mode/times, not a root 0700 stub. The path's own MKDIR,
+ *    when its batch runs, finds the directory and queues the same metadata;
+ *  - a replacement that fails is logged at once but counted only if the path's
+ *    batch never runs: when it does, that batch's REMOVE meets the same entry
+ *    and reports it (one failed item = one error). ENOSPC/EDQUOT/EROFS is
+ *    counted at once: it stops the first batch before anything is attempted;
+ *  - an entry below a non-directory ancestor is skipped: that ancestor is a
+ *    source directory too and its owner replaces it, after which the path is
+ *    simply missing. So the order between ranks does not matter;
+ *  - all ranks then wait at a barrier: no batch starts before every
+ *    replacement is done.
+ *
+ * Later, the stale REMOVE planned in the path's batch finds a directory and
+ * leaves it alone (typed remove). Never runs for --dryrun. Collective over
+ * MPI_COMM_WORLD; returns the failures counted at once (global; this rank's in
+ * *local_counted). */
+enum { NSYNC_PREPASS_ROUND_PATHS = 262144 };
+
+/* What the pre-pass did on this rank, by batch: after an early stop, the work
+ * that belongs to batches that never ran is reported (see main). A replaced
+ * entry needs only its batch; a failed one keeps its path (up to the failure
+ * record cap) for the failed-item list. */
+typedef struct {
+    uint64_t batch_id;
+    char* relpath;   /* failures only */
+    int err;         /* 0 = replaced */
+    int counted;     /* already noted as a failed item */
+} nsync_prepass_note_t;
+
+static struct {
+    nsync_prepass_note_t* notes;
+    uint64_t size;
+    uint64_t capacity;
+    uint64_t paths_kept;
+} nsync_prepass_notes = { NULL, 0, 0, 0 };
+
+static void nsync_prepass_note_add(uint64_t batch_id, const char* relpath, int err, int counted)
+{
+    if (nsync_prepass_notes.size == nsync_prepass_notes.capacity) {
+        uint64_t grow = (nsync_prepass_notes.capacity == 0) ? 64 : nsync_prepass_notes.capacity * 2;
+        nsync_prepass_note_t* bigger = (nsync_prepass_note_t*)realloc(
+            nsync_prepass_notes.notes, (size_t)grow * sizeof(*bigger));
+        if (bigger == NULL) {
+            MFU_ABORT(-1, "nsync: out of memory for type-change pre-pass notes");
+        }
+        nsync_prepass_notes.notes = bigger;
+        nsync_prepass_notes.capacity = grow;
+    }
+    nsync_prepass_note_t* note = &nsync_prepass_notes.notes[nsync_prepass_notes.size++];
+    note->batch_id = batch_id;
+    note->err = err;
+    note->counted = counted;
+    note->relpath = NULL;
+    if (err != 0 && nsync_prepass_notes.paths_kept < nsync_fail_log.cap) {
+        note->relpath = MFU_STRDUP(relpath);
+        nsync_prepass_notes.paths_kept++;
+    }
+}
+
+static void nsync_prepass_notes_free(void)
+{
+    for (uint64_t i = 0; i < nsync_prepass_notes.size; i++) {
+        mfu_free(&nsync_prepass_notes.notes[i].relpath);
+    }
+    free(nsync_prepass_notes.notes);
+    nsync_prepass_notes.notes = NULL;
+    nsync_prepass_notes.size = 0;
+    nsync_prepass_notes.capacity = 0;
+    nsync_prepass_notes.paths_kept = 0;
+}
+
+static int nsync_prepass_replace_one(int root_fd, const char* relpath, const nsync_options_t* opts, int* replaced)
+{
+    struct stat st;
+    *replaced = 0;
+    /* cheap filter: may pass through a symlinked ancestor, but only reads */
+    if (fstatat(root_fd, relpath, &st, AT_SYMLINK_NOFOLLOW) != 0 || S_ISDIR(st.st_mode)) {
+        return 0;
+    }
+
+    char* base = NULL;
+    int parent = nsync_open_parent_at(root_fd, relpath, 0, 0, &base);
+    if (parent < 0) {
+        return 0;   /* an ancestor is not a directory: replaced by its own owner */
+    }
+    int err = 0;
+    if (fstatat(parent, base, &st, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISDIR(st.st_mode) &&
+        !(opts->ignore_symlinks && S_ISLNK(st.st_mode)))
+    {
+        if (unlinkat(parent, base, 0) != 0 && errno != ENOENT) {
+            err = errno;
+        } else if (mkdirat(parent, base, (mode_t)0700) != 0 && errno != EEXIST) {
+            err = errno;
+        } else {
+            *replaced = 1;
+        }
+    }
+    close(parent);
+    mfu_free(&base);
+    return err;
+}
+
+static uint64_t nsync_type_change_prepass(
+    const nsync_options_t* opts,
+    const nsync_role_info_t* role_info,
+    const char* dst_path,
+    const nsync_batch_spool_t* spool,
+    uint64_t batch_count,
+    nsync_action_vec_t* deferred_dir_meta_updates,
+    uint64_t* local_counted)
+{
+    int rank = 0;
+    int ranks = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+    double start = MPI_Wtime();
+
+    nsync_scan_role_ctx_t ctx;
+    ctx.side = role_info->role;
+    ctx.root = NULL;
+    ctx.root_fd = -1;
+    ctx.comm = MPI_COMM_WORLD;
+    ctx.comm_rank = rank;
+    ctx.comm_size = ranks;
+
+    uint64_t stats[5] = {0, 0, 0, 0, 0};   /* sent, checked, replaced, failed, counted at once */
+
+    /* per source rank and round, so one destination rank receives at most
+     * ~NSYNC_PREPASS_ROUND_PATHS paths / 32 MiB per round whatever the role map */
+    int src_ranks = (role_info->src_count > 0) ? role_info->src_count : 1;
+    uint64_t round_paths = (uint64_t)NSYNC_PREPASS_ROUND_PATHS / (uint64_t)src_ranks;
+    uint64_t round_bytes = (32ULL << 20) / (uint64_t)src_ranks;
+    if (round_paths < 1024) {
+        round_paths = 1024;
+    }
+    if (round_bytes < (1ULL << 20)) {
+        round_bytes = 1ULL << 20;
+    }
+
+    FILE* in_fp = NULL;
+    if (role_info->role == NSYNC_ROLE_SRC && spool->dirs_path != NULL && spool->dirs_written > 0) {
+        in_fp = fopen(spool->dirs_path, "re");
+        if (in_fp != NULL) {
+            setvbuf(in_fp, NULL, _IOFBF, 1 << 20);
+        } else {
+            /* without the list nothing is replaced: the batches then fail closed
+             * on the stale entries (and report them) */
+            int err = errno;
+            stats[3]++;
+            MFU_LOG(MFU_LOG_WARN, "Type-change pre-pass: cannot read the source directory list: %s", strerror(err));
+        }
+    }
+    int root_fd = -1;
+    if (role_info->role == NSYNC_ROLE_DST) {
+        root_fd = nsync_open_dst_root(dst_path);   /* missing root: nothing to replace */
+    }
+
+    nsync_dir_task_vec_t* send_tasks = (nsync_dir_task_vec_t*)MFU_MALLOC((size_t)ranks * sizeof(nsync_dir_task_vec_t));
+    for (int r = 0; r < ranks; r++) {
+        nsync_dir_task_vec_init(&send_tasks[r]);
+    }
+
+    while (1) {
+        int local_more = 0;
+        if (in_fp != NULL) {
+            for (uint64_t n = 0, bytes = 0; n < round_paths && bytes < round_bytes; n++) {
+                uint32_t len = 0;
+                char* path = NULL;
+                if (fread(&len, sizeof(len), 1, in_fp) != 1 || len == 0 || len > (uint32_t)PATH_MAX) {
+                    fclose(in_fp);
+                    in_fp = NULL;
+                    break;
+                }
+                /* path, NUL, packed metadata: one task with a binary tail */
+                path = (char*)MFU_MALLOC((size_t)len + 1 + NSYNC_PREPASS_META_BYTES);
+                if (fread(path, 1, (size_t)len, in_fp) != (size_t)len ||
+                    fread(path + len + 1, 1, NSYNC_PREPASS_META_BYTES, in_fp) != NSYNC_PREPASS_META_BYTES)
+                {
+                    mfu_free(&path);
+                    fclose(in_fp);
+                    in_fp = NULL;
+                    break;
+                }
+                bytes += (uint64_t)len + 8 + NSYNC_PREPASS_META_BYTES;
+                path[len] = '\0';
+                /* the destination rank that scanned parent(path) holds path's filter bit */
+                char* slash = strrchr(path, '/');
+                int owner = -1;
+                if (slash == NULL) {
+                    owner = role_info->dst_world_ranks[nsync_owner_index_in_group(".", role_info->dst_count)];
+                } else {
+                    *slash = '\0';
+                    owner = role_info->dst_world_ranks[nsync_owner_index_in_group(path, role_info->dst_count)];
+                    *slash = '/';
+                }
+                if (owner < 0 || owner >= ranks || nsync_dir_task_vec_push_take(&send_tasks[owner], path) != 0) {
+                    mfu_free(&path);
+                    continue;
+                }
+                stats[0]++;
+            }
+            local_more = (in_fp != NULL) ? 1 : 0;
+        }
+
+        nsync_dir_task_vec_t recv_tasks;
+        nsync_dir_task_vec_init(&recv_tasks);
+        int xrc = nsync_dir_task_exchange(&ctx, send_tasks, &recv_tasks, NSYNC_PREPASS_META_BYTES);
+        for (int r = 0; r < ranks; r++) {
+            nsync_dir_task_vec_free(&send_tasks[r]);
+            nsync_dir_task_vec_init(&send_tasks[r]);
+        }
+        if (xrc != 0) {   /* same rc on every rank */
+            nsync_dir_task_vec_free(&recv_tasks);
+            stats[3]++;
+            if (rank == opts->log_rank) {
+                MFU_LOG(MFU_LOG_WARN, "Type-change pre-pass: exchanging source directories failed; stopped");
+            }
+            break;
+        }
+
+        if (root_fd >= 0) {
+            for (uint64_t i = 0; i < recv_tasks.size; i++) {
+                const char* path = recv_tasks.paths[i];
+                if (!nsync_bloom_maybe(path)) {
+                    continue;   /* this rank saw no non-directory at that path */
+                }
+                int replaced = 0;
+                int err = nsync_prepass_replace_one(root_fd, path, opts, &replaced);
+                stats[1]++;
+                size_t path_len = strlen(path);
+                uint64_t batch_id = nsync_batch_id_from_relpath_len(path, path_len, batch_count);
+                if (err != 0) {
+                    stats[3]++;
+                    if (err == ENOSPC || err == EDQUOT || err == EROFS) {
+                        /* the first batch stops at once (nsync_fatal_errno), before
+                         * this path's REMOVE could report it: count it now */
+                        nsync_fail_note(NSYNC_FAIL_TYPE, path, err);
+                        stats[4]++;
+                        nsync_prepass_note_add(batch_id, path, err, 1);
+                    } else {
+                        nsync_prepass_note_add(batch_id, path, err, 0);
+                        if (stats[3] <= NSYNC_FAIL_IMMEDIATE) {
+                            char shown[NSYNC_FAIL_RECORD_BYTES];
+                            nsync_escape_path(path, shown, sizeof(shown) - 128);
+                            MFU_LOG(MFU_LOG_WARN, "Type-change pre-pass: cannot replace `%s`: %s (errno %d)",
+                                    shown, strerror(err), err);
+                        }
+                    }
+                } else if (replaced) {
+                    stats[2]++;
+                    nsync_prepass_note_add(batch_id, NULL, 0, 0);
+                    /* stamp it like the MKDIR of its batch would (deferred, deepest first) */
+                    const char* meta = path + path_len + 1;
+                    nsync_action_record_t action;
+                    memset(&action, 0, sizeof(action));
+                    action.type = NSYNC_ACTION_MKDIR;
+                    action.relpath = (char*)path;
+                    action.src_owner_world = -1;
+                    action.dst_owner_world = rank;
+                    mfu_unpack_uint64(&meta, &action.mode);
+                    mfu_unpack_uint64(&meta, &action.uid);
+                    mfu_unpack_uint64(&meta, &action.gid);
+                    mfu_unpack_uint64(&meta, &action.size);
+                    mfu_unpack_uint64(&meta, &action.mtime);
+                    mfu_unpack_uint64(&meta, &action.mtime_nsec);
+                    mfu_unpack_uint64(&meta, &action.atime);
+                    mfu_unpack_uint64(&meta, &action.atime_nsec);
+                    action.size = 0;
+                    int meta_errors = 0;
+                    nsync_deferred_dir_meta_add(deferred_dir_meta_updates, &action, &meta_errors);
+                }
+            }
+        }
+        nsync_dir_task_vec_free(&recv_tasks);
+
+        int any_more = 0;
+        MPI_Allreduce(&local_more, &any_more, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        if (!any_more) {
+            break;
+        }
+    }
+
+    if (in_fp != NULL) {
+        fclose(in_fp);
+    }
+    if (root_fd >= 0) {
+        close(root_fd);
+    }
+    mfu_free(&send_tasks);
+
+    /* nothing below the first batch may start before every replacement is done */
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    uint64_t global_stats[5] = {0, 0, 0, 0, 0};
+    MPI_Allreduce(stats, global_stats, 5, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    if (rank == opts->log_rank && !opts->quiet) {
+        MFU_LOG(MFU_LOG_INFO,
+            "Type-change pre-pass: source directories %" PRIu64 ", probed %" PRIu64 ", replaced %" PRIu64
+            ", failed %" PRIu64 " (%.3f s)",
+            global_stats[0], global_stats[1], global_stats[2], global_stats[3], MPI_Wtime() - start);
+    }
+    *local_counted += stats[4];
+    return global_stats[4];
+}
+
 int main(int argc, char** argv)
 {
     int rc = 0;
@@ -7300,6 +8953,7 @@ int main(int argc, char** argv)
         .quiet = 0,
         .log_rank = 0,
         .imbalance_threshold = 3.0,
+        .max_errors = NSYNC_DEFAULT_MAX_ERRORS,
     };
 
     opts.log_rank = nsync_select_log_rank();
@@ -7327,6 +8981,7 @@ int main(int argc, char** argv)
         {"trace", 0, 0, 1002},
         {"chown", 1, 0, 1005},
         {"chmod", 1, 0, 1006},
+        {"max-errors", 1, 0, 1007},
         {"quiet", 0, 0, 'q'},
         {"help", 0, 0, 'h'},
         {0, 0, 0, 0},
@@ -7364,7 +9019,9 @@ int main(int argc, char** argv)
             }
             break;
         case 'b':
-            if (mfu_abtoull(optarg, &bytes) != MFU_SUCCESS || bytes == 0) {
+            /* 0 means one batch (no spool), the same as leaving the option out --
+             * dsync takes 0 the same way, and DMS passes 0 to turn batching off. */
+            if (mfu_abtoull(optarg, &bytes) != MFU_SUCCESS) {
                 if (rank == opts.log_rank) {
                     MFU_LOG(MFU_LOG_ERR, "Failed to parse --batch-files: %s", optarg);
                 }
@@ -7409,6 +9066,20 @@ int main(int argc, char** argv)
                 usage = 1;
             }
             break;
+        case 1007: {
+            errno = 0;
+            char* end = NULL;
+            unsigned long long value = strtoull(optarg, &end, 10);
+            if (errno != 0 || end == optarg || *end != '\0' || strchr(optarg, '-') != NULL) {
+                if (rank == opts.log_rank) {
+                    MFU_LOG(MFU_LOG_ERR, "Invalid --max-errors: %s (expected a non-negative integer)", optarg);
+                }
+                usage = 1;
+            } else {
+                opts.max_errors = (uint64_t)value;
+            }
+            break;
+        }
         case 1003: {
             errno = 0;
             char* end = NULL;
@@ -7481,6 +9152,8 @@ int main(int argc, char** argv)
                 opts.chmod_set && opts.chmod_file_set ? "set" : "keep");
     }
 
+    nsync_fail_log_configure(opts.max_errors);
+
     nsync_role_info_t role_info;
     nsync_role_info_init(&role_info);
 
@@ -7498,10 +9171,13 @@ int main(int argc, char** argv)
     uint64_t batch_count = 1;
     uint64_t global_src_items = 0;
     uint64_t global_dst_items = 0;
+    uint64_t global_src_dirs = 0;      /* spool mode: source directories (pre-pass input) */
+    uint64_t global_dst_nondirs = 0;   /* spool mode: destination non-directories */
     int use_batch_spool = 0;
     int local_scan_errors_total = 0;
     if (opts.batch_files > 0) {
         int batch_scan_errors = 0;
+        batch_spool.collect_type_change = !opts.dryrun;
         if (nsync_batch_spool_scan_prepare(
                 &opts, &role_info, src_path, dst_path,
                 &batch_spool, &batch_count,
@@ -7532,14 +9208,18 @@ int main(int argc, char** argv)
             }
         }
 
-        uint64_t local_spool_arr[4] = {
+        uint64_t local_spool_arr[6] = {
             batch_spool.raw_records_written,
             batch_spool.raw_bytes_written,
             batch_spool.records_written,
-            batch_spool.bytes_written
+            batch_spool.bytes_written,
+            batch_spool.dirs_written,
+            batch_spool.dst_nondirs
         };
-        uint64_t global_spool_arr[4] = {0, 0, 0, 0};
-        MPI_Allreduce(local_spool_arr, global_spool_arr, 4, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+        uint64_t global_spool_arr[6] = {0, 0, 0, 0, 0, 0};
+        MPI_Allreduce(local_spool_arr, global_spool_arr, 6, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+        global_src_dirs = global_spool_arr[4];
+        global_dst_nondirs = global_spool_arr[5];
 
         if (rank == opts.log_rank && !opts.quiet) {
             MFU_LOG(MFU_LOG_INFO,
@@ -7570,6 +9250,50 @@ int main(int argc, char** argv)
     nsync_action_vec_init(&deferred_dir_meta_updates);
 
     uint64_t local_exec_errors_total = 0;
+
+    /* --max-errors: failed items so far. Built only from global sums, so every
+     * rank takes the same stop decision at the same batch boundary. Spool-mode
+     * scan errors happened before the loop and count too. */
+    uint64_t global_failures = 0;
+    {
+        uint64_t local_pre_failures = (uint64_t)local_scan_errors_total;
+        MPI_Allreduce(&local_pre_failures, &global_failures, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    }
+    /* the part of global_failures that are failed actions (not scan errors):
+     * what the in-batch share is taken from (see nsync_batch_stop) */
+    uint64_t global_exec_failures = 0;
+    uint64_t batches_run = batch_count;
+    int stopped_early = 0;
+
+    /* Like dsync: a source entry that could not be read is unknown, not gone.
+     * With --delete its destination copy would be removed, so a run with source
+     * scan errors does not delete anything (spool mode: the scan is done). */
+    if (use_batch_spool && opts.delete) {
+        uint64_t local_src_scan = (role_info.role == NSYNC_ROLE_SRC) ? (uint64_t)local_scan_errors_total : 0;
+        uint64_t global_src_scan = 0;
+        MPI_Allreduce(&local_src_scan, &global_src_scan, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+        if (global_src_scan > 0) {
+            opts.delete = 0;
+            if (rank == opts.log_rank) {
+                MFU_LOG(MFU_LOG_WARN, "Source scan had %" PRIu64 " error(s): --delete is off for this run", global_src_scan);
+            }
+        }
+    }
+
+    /* More than one batch: replace stale non-directories that must become
+     * directories before any batch runs (see nsync_type_change_prepass). One
+     * batch needs no pre-pass: the rank barrier in the destination executor
+     * already orders every REMOVE before every create. */
+    if (use_batch_spool && !opts.dryrun && batch_count > 1 && global_src_dirs > 0 && global_dst_nondirs > 0) {
+        uint64_t local_counted = 0;
+        uint64_t counted = nsync_type_change_prepass(
+            &opts, &role_info, dst_path, &batch_spool, batch_count, &deferred_dir_meta_updates, &local_counted);
+        local_exec_errors_total += local_counted;
+        global_failures += counted;
+        global_exec_failures += counted;
+    }
+    nsync_bloom_free();   /* only the pre-pass reads it */
+
     nsync_progress_state_t progress_state;
     nsync_progress_state_init(&progress_state);
     if (rank == opts.log_rank && !opts.quiet) {
@@ -7638,6 +9362,19 @@ int main(int argc, char** argv)
                 &opts, &role_info, src_path, dst_path, &local_meta, &batch_scan_errors, filter_ptr, NULL, 0, NULL, NULL);
             local_scan_errors_total += batch_scan_errors;
 
+            /* source scan errors turn --delete off (see the spool-mode note) */
+            if (opts.delete) {
+                uint64_t local_src_scan = (role_info.role == NSYNC_ROLE_SRC) ? (uint64_t)batch_scan_errors : 0;
+                uint64_t global_src_scan = 0;
+                MPI_Allreduce(&local_src_scan, &global_src_scan, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+                if (global_src_scan > 0) {
+                    opts.delete = 0;
+                    if (rank == opts.log_rank) {
+                        MFU_LOG(MFU_LOG_WARN, "Source scan had %" PRIu64 " error(s): --delete is off for this run", global_src_scan);
+                    }
+                }
+            }
+
             int local_has_meta = (local_meta.size > 0) ? 1 : 0;
             MPI_Allreduce(&local_has_meta, &global_has_meta, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
         }
@@ -7645,13 +9382,18 @@ int main(int argc, char** argv)
         nsync_trace_local(&opts, "main-post-scan", local_meta.size, (uint64_t)batch_scan_errors);
         if (!global_has_meta) {
             uint64_t local_batch_errors = (uint64_t)batch_scan_errors;
-            uint64_t local_batch_summary[4] = {
-                local_batch_errors, local_batch_actions, local_batch_copy_files, local_batch_copy_bytes
+            uint64_t local_batch_summary[6] = {
+                local_batch_errors, local_batch_actions, local_batch_copy_files, local_batch_copy_bytes,
+                (nsync_fatal_errno != 0) ? 1ULL : 0ULL, (uint64_t)batch_scan_errors
             };
-            uint64_t global_batch_summary[4] = {0, 0, 0, 0};
-            MPI_Allreduce(local_batch_summary, global_batch_summary, 4, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+            uint64_t global_batch_summary[6] = {0, 0, 0, 0, 0, 0};
+            MPI_Allreduce(local_batch_summary, global_batch_summary, 6, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
             uint64_t global_batch_errors = global_batch_summary[0];
-            if (!opts.dryrun && global_batch_errors > 0) {
+            global_failures += global_batch_errors;
+            global_exec_failures += global_batch_errors - global_batch_summary[5];
+            if (!opts.dryrun && batch_id + 1 < batch_count &&
+                ((opts.max_errors > 0 && global_failures >= opts.max_errors) || global_batch_summary[4] > 0))
+            {
                 stop_after_batch_error = 1;
             }
             nsync_progress_batch_update(
@@ -7664,10 +9406,21 @@ int main(int argc, char** argv)
             nsync_meta_vec_free(&local_meta);
             if (stop_after_batch_error) {
                 if (rank == opts.log_rank) {
-                    MFU_LOG(MFU_LOG_WARN,
-                        "Stopping after batch %" PRIu64 "/%" PRIu64 " due to errors",
-                        batch_id + 1, batch_count);
+                    if (global_batch_summary[4] > 0) {
+                        MFU_LOG(MFU_LOG_WARN,
+                            "Stopping after batch %" PRIu64 "/%" PRIu64
+                            ": the destination is full or read-only (ENOSPC/EDQUOT/EROFS)",
+                            batch_id + 1, batch_count);
+                    } else {
+                        MFU_LOG(MFU_LOG_WARN,
+                            "Stopping after batch %" PRIu64 "/%" PRIu64 ": %" PRIu64
+                            " failed item(s) (scan %" PRIu64 ", other %" PRIu64 ") reached --max-errors %" PRIu64,
+                            batch_id + 1, batch_count, global_failures, global_failures - global_exec_failures,
+                            global_exec_failures, opts.max_errors);
+                    }
                 }
+                batches_run = batch_id + 1;
+                stopped_early = 1;
                 break;
             }
             continue;
@@ -7775,6 +9528,18 @@ int main(int argc, char** argv)
                 goto cleanup;
             }
 
+            /* this rank's share of what is left of --max-errors (see nsync_batch_stop) */
+            uint64_t batch_budget = UINT64_MAX;
+            if (opts.max_errors > 0) {
+                uint64_t left = (global_exec_failures < opts.max_errors) ? opts.max_errors - global_exec_failures : 0;
+                uint64_t shares = (role_info.dst_count > 0) ? (uint64_t)role_info.dst_count : 1;
+                batch_budget = left / shares;
+                if (batch_budget == 0 && left > 0) {
+                    batch_budget = 1;
+                }
+            }
+            nsync_batch_stop_begin(batch_budget);
+
             nsync_execute_actions_phase4(
                 &opts,
                 &role_info,
@@ -7804,13 +9569,18 @@ int main(int argc, char** argv)
         }
 
         uint64_t local_batch_errors = (uint64_t)batch_scan_errors + (uint64_t)local_exec_errors_batch;
-        uint64_t local_batch_summary[4] = {
-            local_batch_errors, local_progress_actions, local_progress_copy_files, local_progress_copy_bytes
+        uint64_t local_batch_summary[6] = {
+            local_batch_errors, local_progress_actions, local_progress_copy_files, local_progress_copy_bytes,
+            (nsync_fatal_errno != 0) ? 1ULL : 0ULL, (uint64_t)batch_scan_errors
         };
-        uint64_t global_batch_summary[4] = {0, 0, 0, 0};
-        MPI_Allreduce(local_batch_summary, global_batch_summary, 4, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+        uint64_t global_batch_summary[6] = {0, 0, 0, 0, 0, 0};
+        MPI_Allreduce(local_batch_summary, global_batch_summary, 6, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
         uint64_t global_batch_errors = global_batch_summary[0];
-        if (!opts.dryrun && global_batch_errors > 0) {
+        global_failures += global_batch_errors;
+        global_exec_failures += global_batch_errors - global_batch_summary[5];
+        if (!opts.dryrun && batch_id + 1 < batch_count &&
+            ((opts.max_errors > 0 && global_failures >= opts.max_errors) || global_batch_summary[4] > 0))
+        {
             stop_after_batch_error = 1;
         }
 
@@ -7825,10 +9595,21 @@ int main(int argc, char** argv)
         nsync_meta_vec_free(&local_meta);
         if (stop_after_batch_error) {
             if (rank == opts.log_rank) {
-                MFU_LOG(MFU_LOG_WARN,
-                    "Stopping after batch %" PRIu64 "/%" PRIu64 " due to errors",
-                    batch_id + 1, batch_count);
+                if (global_batch_summary[4] > 0) {
+                    MFU_LOG(MFU_LOG_WARN,
+                        "Stopping after batch %" PRIu64 "/%" PRIu64
+                        ": the destination is full or read-only (ENOSPC/EDQUOT/EROFS)",
+                        batch_id + 1, batch_count);
+                } else {
+                    MFU_LOG(MFU_LOG_WARN,
+                        "Stopping after batch %" PRIu64 "/%" PRIu64 ": %" PRIu64
+                        " failed item(s) (scan %" PRIu64 ", other %" PRIu64 ") reached --max-errors %" PRIu64,
+                        batch_id + 1, batch_count, global_failures, global_failures - global_exec_failures,
+                        global_exec_failures, opts.max_errors);
+                }
             }
+            batches_run = batch_id + 1;
+            stopped_early = 1;
             break;
         }
     }
@@ -7837,6 +9618,38 @@ int main(int argc, char** argv)
         nsync_batch_spool_cleanup(&batch_spool);
         use_batch_spool = 0;
     }
+
+    /* Pre-pass work in batches that did not run (stopped early): a stale entry
+     * it replaced is now an empty directory with the source metadata (queued
+     * above with the deferred directory metadata); one it could not replace is
+     * reported here -- had its batch run, that batch's REMOVE would have. */
+    if (stopped_early) {
+        uint64_t local_unrun[2] = {0, 0};   /* replaced, failed */
+        for (uint64_t i = 0; i < nsync_prepass_notes.size; i++) {
+            const nsync_prepass_note_t* note = &nsync_prepass_notes.notes[i];
+            if (note->batch_id < batches_run) {
+                continue;
+            }
+            if (note->err != 0) {
+                if (!note->counted) {
+                    nsync_fail_note(NSYNC_FAIL_TYPE, (note->relpath != NULL) ? note->relpath : "?", note->err);
+                    local_exec_errors_total++;
+                }
+                local_unrun[1]++;
+            } else {
+                local_unrun[0]++;
+            }
+        }
+        uint64_t global_unrun[2] = {0, 0};
+        MPI_Allreduce(local_unrun, global_unrun, 2, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+        if (rank == opts.log_rank && global_unrun[0] > 0) {
+            MFU_LOG(MFU_LOG_WARN,
+                "Type-change pre-pass: %" PRIu64 " stale entr%s in batches that did not run were already"
+                " replaced by (empty) directories with the source metadata",
+                global_unrun[0], (global_unrun[0] == 1) ? "y" : "ies");
+        }
+    }
+    nsync_prepass_notes_free();
 
     if (!opts.dryrun && opts.batch_files > 0 && opts.delete && role_info.role == NSYNC_ROLE_DST) {
         int local_finalize_errors = 0;
@@ -7861,14 +9674,14 @@ int main(int argc, char** argv)
     MPI_Allreduce(local_compare_arr, global_compare_arr, 4, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
     nsync_compare_counts_from_array(global_compare_arr, &global_counts);
 
-    uint64_t local_action_arr[6];
-    uint64_t global_action_arr[6];
+    uint64_t local_action_arr[NSYNC_ACTION_COUNTS_N];
+    uint64_t global_action_arr[NSYNC_ACTION_COUNTS_N];
     nsync_action_counts_to_array(&local_action_counts_total, local_action_arr);
     nsync_trace_local(
         &opts, "main-pre-action-allreduce",
         local_action_arr[0] + local_action_arr[1] + local_action_arr[2],
         local_action_arr[3] + local_action_arr[4] + local_action_arr[5]);
-    MPI_Allreduce(local_action_arr, global_action_arr, 6, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(local_action_arr, global_action_arr, NSYNC_ACTION_COUNTS_N, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
     nsync_action_counts_from_array(global_action_arr, &global_action_counts);
 
     int global_scan_errors = 0;
@@ -7894,6 +9707,13 @@ int main(int argc, char** argv)
     MPI_Allreduce(local_meta_apply_arr, global_meta_apply_arr, 6, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
     nsync_meta_apply_stats_from_array(global_meta_apply_arr, &global_meta_apply_stats);
 
+    uint64_t global_not_attempted = 0;
+    MPI_Allreduce(&nsync_batch_stop.not_attempted, &global_not_attempted, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+
+    /* failed-item list: collective, printed by the log rank before the summary
+     * block (so the parsed summary lines are the last of their kind) */
+    nsync_fail_report(&opts);
+
     if (rank == opts.log_rank) {
         const char* role_mode = opts.role_mode == NSYNC_ROLE_MODE_AUTO ? "auto" : "map";
         MFU_LOG(MFU_LOG_INFO, "nsync Phase 5 planner%s complete", opts.dryrun ? " dryrun" : "+execute");
@@ -7901,8 +9721,9 @@ int main(int argc, char** argv)
         MFU_LOG(MFU_LOG_INFO, "Requested target: %s", dst_path);
         MFU_LOG(MFU_LOG_INFO,
             "Options: dryrun=%d batch-files=%" PRIu64
-            " delete=%d contents=%d role-mode=%s imbalance-threshold=%.2f",
-            opts.dryrun, opts.batch_files, opts.delete, opts.contents, role_mode, opts.imbalance_threshold);
+            " delete=%d contents=%d role-mode=%s imbalance-threshold=%.2f max-errors=%" PRIu64,
+            opts.dryrun, opts.batch_files, opts.delete, opts.contents, role_mode, opts.imbalance_threshold,
+            opts.max_errors);
         if (opts.role_map != NULL) {
             MFU_LOG(MFU_LOG_INFO, "Role map: %s", opts.role_map);
         }
@@ -7928,6 +9749,35 @@ int main(int argc, char** argv)
             global_action_counts.meta_update,
             global_action_counts.remove,
             global_action_counts.skipped_only_dst);
+
+        /* kept off the "Planned actions" line: callers sum every count there */
+        if (global_action_counts.type_to_dir > 0 || global_action_counts.type_from_dir > 0) {
+            MFU_LOG(MFU_LOG_INFO,
+                "Type changes: to-directory %" PRIu64 ", from-directory %" PRIu64,
+                global_action_counts.type_to_dir, global_action_counts.type_from_dir);
+            if (global_action_counts.type_from_dir > 0 && !opts.delete) {
+                MFU_LOG(MFU_LOG_WARN,
+                    "A directory that is replaced by a non-directory must be empty unless --delete is given; "
+                    "non-empty ones are left alone and reported as failed");
+            }
+        }
+        if (global_action_counts.skipped_special > 0) {
+            MFU_LOG(MFU_LOG_WARN,
+                "Skipped %" PRIu64 " special file(s) in the source (FIFO, socket or device): not copied,"
+                " the destination entry at that name is left as it is",
+                global_action_counts.skipped_special);
+        }
+        if (global_not_attempted > 0) {
+            MFU_LOG(MFU_LOG_WARN,
+                "Not attempted after a stop: %" PRIu64 " action(s) of the batch in progress"
+                " (--max-errors reached or the destination is full or read-only)",
+                global_not_attempted);
+        }
+        if (stopped_early) {
+            MFU_LOG(MFU_LOG_WARN,
+                "Planned and diff counts above cover batches 1-%" PRIu64 " of %" PRIu64 " only (stopped early)",
+                batches_run, batch_count);
+        }
 
         uint64_t metadata_ignored =
             global_meta_apply_stats.chown_ignored +
@@ -7969,6 +9819,9 @@ int main(int argc, char** argv)
                 MFU_LOG(MFU_LOG_ERR,
                     "Execution completed with errors: scan=%d exec=%" PRIu64,
                     global_scan_errors, global_exec_errors);
+            } else if (stopped_early || global_not_attempted > 0) {
+                MFU_LOG(MFU_LOG_ERR,
+                    "Execution stopped early: %" PRIu64 " action(s) not attempted", global_not_attempted);
             } else {
                 MFU_LOG(MFU_LOG_INFO, "Execution completed successfully");
             }
@@ -7979,7 +9832,8 @@ int main(int argc, char** argv)
     nsync_action_vec_free(&deferred_dir_meta_updates);
     nsync_role_info_free(&role_info);
 
-    if (global_scan_errors > 0 || global_exec_errors > 0) {
+    /* planned work left undone is never success, whatever stopped it */
+    if (global_scan_errors > 0 || global_exec_errors > 0 || stopped_early || global_not_attempted > 0) {
         rc = 1;
     }
 
