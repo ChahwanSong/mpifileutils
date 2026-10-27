@@ -1,6 +1,6 @@
 # nsync / dsync regression harness
 
-Local tests for the nsync and dsync changes on this branch (119 checks pass). They run in a
+Local tests for the nsync and dsync changes on this branch (117 checks pass). They run in a
 development container with the same toolchain as the DMS job image's build stage. No CMakeLists.txt here:
 the build does not pick this directory up.
 
