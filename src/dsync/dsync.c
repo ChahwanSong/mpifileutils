@@ -1535,6 +1535,105 @@ static void dsync_only_dst(strmap* src_map,
     }
 }
 
+/* Copy a path for a log line with control bytes and '\\' as \xHH, so a file
+ * name cannot start a fake log line; clipped results end with "...". */
+static void dsync_escape_path(const char* in, char* out, size_t out_size)
+{
+    size_t o = 0;
+    const unsigned char* p = (const unsigned char*) (in != NULL ? in : "");
+    if (out_size == 0) {
+        return;
+    }
+    for (; *p != '\0'; p++) {
+        int esc = (*p < 0x20 || *p == 0x7f || *p == '\\');
+        size_t need = esc ? 4 : 1;
+        if (o + need + 4 > out_size) {
+            if (o + 4 <= out_size) {
+                memcpy(out + o, "...", 3);
+                o += 3;
+            }
+            break;
+        }
+        if (esc) {
+            static const char hex[] = "0123456789abcdef";
+            out[o++] = '\\';
+            out[o++] = 'x';
+            out[o++] = hex[*p >> 4];
+            out[o++] = hex[*p & 0xf];
+        } else {
+            out[o++] = (char) *p;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Relative key of a list item: its name below prefix_len bytes of root path. */
+static const char* dsync_rel_key(mfu_flist list, uint64_t idx, size_t prefix_len)
+{
+    const char* name = mfu_flist_file_get_name(list, idx);
+    return (strlen(name) >= prefix_len) ? name + prefix_len : name;
+}
+
+/* Is key blocked itself (rank-local map), or below a blocked source directory
+ * (global map)? Proper ancestors only, and never the root key "": what a
+ * blocked root would mean is the open question of a symlinked destination
+ * root, not decided here. */
+static int dsync_key_blocked(const char* key, strmap* blocked, strmap* blocked_dirs,
+                             uint64_t blocked_dirs_total, char* buf, size_t buf_size)
+{
+    if (strmap_get(blocked, key) != NULL) {
+        return 1;
+    }
+    if (blocked_dirs_total == 0) {
+        return 0;
+    }
+    size_t len = strlen(key);
+    if (len + 1 > buf_size) {
+        return 0;
+    }
+    memcpy(buf, key, len + 1);
+    for (size_t p = len; p > 0; p--) {
+        if (buf[p] == '/') {
+            buf[p] = '\0';
+            if (strmap_get(blocked_dirs, buf) != NULL) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Keep the items of list that are not blocked (see dsync_key_blocked). Returns
+ * MFU_FLIST_NULL when nothing is dropped on this rank (use list as is), else a
+ * new subset the caller frees; *dropped counts what was left out. */
+static mfu_flist dsync_filter_blocked(mfu_flist list, size_t prefix_len, strmap* blocked,
+                                      strmap* blocked_dirs, uint64_t blocked_dirs_total, uint64_t* dropped)
+{
+    char buf[PATH_MAX + 1];
+    uint64_t n = mfu_flist_size(list);
+    uint64_t drop = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        if (dsync_key_blocked(dsync_rel_key(list, i, prefix_len), blocked, blocked_dirs,
+                              blocked_dirs_total, buf, sizeof(buf)))
+        {
+            drop++;
+        }
+    }
+    *dropped = drop;
+    if (drop == 0) {
+        return MFU_FLIST_NULL;
+    }
+    mfu_flist kept = mfu_flist_subset(list);
+    for (uint64_t i = 0; i < n; i++) {
+        if (!dsync_key_blocked(dsync_rel_key(list, i, prefix_len), blocked, blocked_dirs,
+                               blocked_dirs_total, buf, sizeof(buf)))
+        {
+            mfu_flist_file_copy(list, i, kept);
+        }
+    }
+    return kept;
+}
+
 static int dsync_sync_files(
     strmap* src_map,
     strmap* dst_map,
@@ -1543,6 +1642,7 @@ static int dsync_sync_files(
     const mfu_param_path* link_path,
     mfu_flist dst_list,
     mfu_flist dst_remove_list,
+    mfu_flist dst_retype_list,
     mfu_flist link_dst_list,
     mfu_flist src_cp_list,
     mfu_copy_opts_t* copy_opts,
@@ -1588,40 +1688,173 @@ static int dsync_sync_files(
         mfu_flist_unlink(dst_remove_list, 0, mfu_dst_file);
     }
 
+    /* A type change only works if the stale destination entry is really gone:
+     * without --delete a non-empty directory cannot be removed (its children are
+     * not in the remove list), and mfu_flist_unlink neither reports that nor
+     * counts it -- its "Removed N items" counts attempts. Copying the source item
+     * then fails, and the copy's metadata pass would still stamp the source
+     * file's mode/owner/times onto the surviving directory (e.g. 0644: nobody
+     * but root can enter it any more). So check every type-changed entry, keep
+     * the source item of a survivor out of the copy, and fail the run.
+     * Same relative path => same rank (dsync_map_fn), so the check is local; the
+     * Allreduce runs on every rank because remove_size is a global size. */
+    mfu_flist cp_list = src_cp_list;
+    mfu_flist cp_kept = MFU_FLIST_NULL;
+    mfu_flist ln_list = link_dst_list;
+    mfu_flist ln_kept = MFU_FLIST_NULL;
+    if (remove_size > 0) {
+        strmap* blocked = strmap_new();
+        size_t dst_prefix_len = strlen(dest_path->path);
+        uint64_t blocked_count = 0;
+        uint64_t n = mfu_flist_size(dst_retype_list);
+        for (uint64_t i = 0; i < n; i++) {
+            const char* dname = mfu_flist_file_get_name(dst_retype_list, i);
+            struct stat st;
+            int lst_rc = mfu_file_lstat(dname, &st, mfu_dst_file);
+            int err = errno;
+            if (lst_rc != 0 && err == ENOENT) {
+                continue;
+            }
+            char shown[1024];
+            dsync_escape_path(dname, shown, sizeof(shown));
+            if (lst_rc == 0) {
+                MFU_LOG(MFU_LOG_ERR, "Type change not applied: `%s' could not be removed (still a %s)%s; source item not copied or linked",
+                        shown, S_ISDIR(st.st_mode) ? "directory" : "non-directory",
+                        (S_ISDIR(st.st_mode) && !options.delete) ? ", a non-empty directory is replaced only with --delete" : "");
+            } else {
+                MFU_LOG(MFU_LOG_ERR, "Type change not applied: cannot verify removal of `%s' (errno=%d %s); source item not copied or linked",
+                        shown, err, strerror(err));
+            }
+            /* strmap_set, not strmap_setf: setf splits at the first '=' and file names may contain one */
+            strmap_set(blocked, dname + dst_prefix_len, "1");
+            blocked_count++;
+        }
+        uint64_t all_blocked = 0;
+        MPI_Allreduce(&blocked_count, &all_blocked, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+        if (all_blocked > 0) {
+            rc = -1;
+            if (rank == 0) {
+                MFU_LOG(MFU_LOG_ERR, "%llu destination item(s) changed type but could not be removed; left unchanged",
+                        (unsigned long long) all_blocked);
+            }
+            size_t src_prefix_len = strlen(src_path->path);
+
+            /* A survivor whose source is a directory: everything below it in
+             * the source would be created through the survivor -- through a
+             * symlink, outside the destination. Those keys hash to any rank,
+             * so the (normally few) blocked directory keys go to every rank.
+             * The source item of a blocked key is on this rank (same key, same
+             * rank), and a directory is always in the copy list. */
+            char* mine = NULL;
+            size_t mine_bytes = 0;
+            n = mfu_flist_size(src_cp_list);
+            for (uint64_t i = 0; i < n; i++) {
+                const char* key = dsync_rel_key(src_cp_list, i, src_prefix_len);
+                if (mfu_flist_file_get_type(src_cp_list, i) == MFU_TYPE_DIR && strmap_get(blocked, key) != NULL) {
+                    size_t len = strlen(key) + 1;
+                    mine = (char*)realloc(mine, mine_bytes + len);
+                    if (mine == NULL) {
+                        MFU_ABORT(-1, "dsync: out of memory for blocked directories");
+                    }
+                    memcpy(mine + mine_bytes, key, len);
+                    mine_bytes += len;
+                }
+            }
+            int ranks = 1;
+            MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+            int mine_count = (int)mine_bytes;
+            int* counts = (int*)MFU_MALLOC((size_t)ranks * sizeof(int));
+            int* displs = (int*)MFU_MALLOC((size_t)ranks * sizeof(int));
+            MPI_Allgather(&mine_count, 1, MPI_INT, counts, 1, MPI_INT, MPI_COMM_WORLD);
+            size_t all_bytes = 0;
+            for (int r = 0; r < ranks; r++) {
+                displs[r] = (int)all_bytes;
+                all_bytes += (size_t)counts[r];
+            }
+            char* all = (char*)MFU_MALLOC(all_bytes > 0 ? all_bytes : 1);
+            MPI_Allgatherv(mine != NULL ? mine : all, mine_count, MPI_CHAR, all, counts, displs, MPI_CHAR, MPI_COMM_WORLD);
+            strmap* blocked_dirs = strmap_new();
+            uint64_t blocked_dirs_total = 0;
+            for (size_t off = 0; off < all_bytes; ) {
+                strmap_set(blocked_dirs, all + off, "1");
+                blocked_dirs_total++;
+                off += strlen(all + off) + 1;
+            }
+            mfu_free(&all);
+            mfu_free(&counts);
+            mfu_free(&displs);
+            free(mine);
+
+            uint64_t dropped = 0;
+            cp_kept = dsync_filter_blocked(src_cp_list, src_prefix_len, blocked, blocked_dirs,
+                                           blocked_dirs_total, &dropped);
+            if (cp_kept != MFU_FLIST_NULL) {
+                cp_list = cp_kept;
+            }
+            /* --link-dest: a blocked item must not be hardlinked either -- the
+             * hardlink pass stamps the link-dest file's mode and times onto
+             * whatever is at the name, even when the link itself fails */
+            uint64_t ln_dropped = 0;
+            if (link_path != NULL) {
+                ln_kept = dsync_filter_blocked(link_dst_list, strlen(link_path->path), blocked, blocked_dirs,
+                                               blocked_dirs_total, &ln_dropped);
+                if (ln_kept != MFU_FLIST_NULL) {
+                    ln_list = ln_kept;
+                }
+            }
+            uint64_t below = dropped + ln_dropped;
+            uint64_t all_below = 0;
+            MPI_Allreduce(&below, &all_below, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+            if (rank == 0 && all_below > all_blocked) {
+                MFU_LOG(MFU_LOG_ERR, "%llu source item(s) at or below those destination items not copied or linked",
+                        (unsigned long long) all_below);
+            }
+            strmap_delete(&blocked_dirs);
+        }
+        strmap_delete(&blocked);
+    }
+
     /* summarize the src copy list for files
      * that need to be copied into dest directory */
-    mfu_flist_summarize(src_cp_list);
+    mfu_flist_summarize(cp_list);
 
     /* copy files from source to destination if needed */
-    uint64_t copy_size = mfu_flist_global_size(src_cp_list);
+    uint64_t copy_size = mfu_flist_global_size(cp_list);
     if (copy_size > 0) {
         if (rank == 0) {
             MFU_LOG(MFU_LOG_INFO, "Copying items to destination");
         }
-        tmp_rc = mfu_flist_copy(src_cp_list, 1, src_path, dest_path, copy_opts,
+        tmp_rc = mfu_flist_copy(cp_list, 1, src_path, dest_path, copy_opts,
                                 mfu_src_file, mfu_dst_file);
         if (tmp_rc < 0) {
             rc = -1;
         }
     }
+    if (cp_kept != MFU_FLIST_NULL) {
+        mfu_flist_free(&cp_kept);
+    }
 
     if (link_path) {
         /* summarize the link dst list for files 
          * that need to be copied into dest directory */ 
-        mfu_flist_summarize(link_dst_list); 
+        mfu_flist_summarize(ln_list); 
 
         /* link files from link dest to destination if needed */ 
-        uint64_t link_size = mfu_flist_global_size(link_dst_list);
+        uint64_t link_size = mfu_flist_global_size(ln_list);
         if (link_size > 0) {
             if (rank == 0) {
                 MFU_LOG(MFU_LOG_INFO, "Linking items in destination");
             }
-            tmp_rc = mfu_flist_hardlink(link_dst_list, link_path, dest_path,
+            tmp_rc = mfu_flist_hardlink(ln_list, link_path, dest_path,
                                         copy_opts, mfu_src_file, mfu_dst_file);
             if (tmp_rc < 0) {
                 rc = -1;
             }
         }
+    }
+
+    if (ln_kept != MFU_FLIST_NULL) {
+        mfu_flist_free(&ln_kept);
     }
 
     return rc;
@@ -1846,6 +2079,10 @@ static int dsync_strmap_compare(
      * for entries that need a refresh on metadata */
     strmap* metadata_refresh = strmap_new();
 
+    /* destination entries whose type differs from the source (checked after
+     * the removal step, see dsync_sync_files) -- rank-local, never summarized */
+    mfu_flist dst_retype_list = mfu_flist_subset(dst_list);
+
     /* iterate over each item in source map */
     const strmap_node* node;
     strmap_foreach(src_map, node) {
@@ -1924,10 +2161,16 @@ static int dsync_strmap_compare(
 
             /* if the types are different we need to make sure we delete the
              * file of the same name in the dst dir, and copy the type in
-             * the src dir to the dst directory */
+             * the src dir to the dst directory. The metadata refresh queued above
+             * for this item is dropped: the copy stamps the new item itself
+             * (dsync always copies with preserve), and if the stale entry cannot
+             * be removed the refresh would chmod/chown/utime that survivor --
+             * its full st_mode never equals the source's. */
+            strmap_unsetf(metadata_refresh, "%llu", (unsigned long long) src_index);
             if (!options.dry_run) {
                 mfu_flist_file_copy(src_list, src_index, src_cp_list);
                 mfu_flist_file_copy(dst_list, dst_index, dst_remove_list);
+                mfu_flist_file_copy(dst_list, dst_index, dst_retype_list);
             }
 
             if (!dsync_option_need_compare(DCMPF_CONTENT)) {
@@ -2123,7 +2366,7 @@ static int dsync_strmap_compare(
         /* sync the files that are in the source and destination directories */
         tmp_rc = dsync_sync_files(src_map, dst_map,
             src_path, dest_path, link_path, dst_list, dst_remove_list,
-            link_dst_list, cp_list, copy_opts, mfu_src_file, mfu_dst_file);
+            dst_retype_list, link_dst_list, cp_list, copy_opts, mfu_src_file, mfu_dst_file);
         if (tmp_rc < 0) {
             rc = -1;
         }
@@ -2165,6 +2408,7 @@ static int dsync_strmap_compare(
 
     /* free lists used for removing and copying files */
     mfu_flist_free(&dst_remove_list);
+    mfu_flist_free(&dst_retype_list);
     mfu_flist_free(&src_cp_list);
 
     /* free the compare flists */
@@ -3662,7 +3906,34 @@ int main(int argc, char **argv)
     if (rank == 0) {
         MFU_LOG(MFU_LOG_INFO, "Walking destination path");
     }
-    (void) mfu_flist_walk_param_paths(1, destpath, walk_opts, flist_tmp_dst, mfu_dst_file);
+    /* A destination that does not exist yet is the normal case for a new sync,
+     * not an error: the walk would only log "Failed to stat" (an ERROR line) and
+     * return an empty list. Rank 0 checks once and every rank takes the same
+     * branch. The empty list gets the shape a walk gives it (detail + summary,
+     * both collective), and the usual "Walked N items" line is still printed so
+     * the output keeps one such line per walked path. The root is created by the
+     * copy as before (destpath's stat fields say it is missing). */
+    int dst_absent = 0;
+    if (rank == 0) {
+        struct stat dst_st;
+        if (mfu_file_lstat(destpath->path, &dst_st, mfu_dst_file) != 0 && errno == ENOENT) {
+            dst_absent = 1;
+        }
+    }
+    MPI_Bcast(&dst_absent, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (dst_absent) {
+        mfu_flist_set_detail(flist_tmp_dst, 1);
+        mfu_flist_summarize(flist_tmp_dst);
+        if (rank == 0) {
+            MFU_LOG(MFU_LOG_INFO, "Destination does not exist yet; it will be created");
+        }
+        /* same condition and format as the walk's own summary line */
+        if (mfu_debug_level >= MFU_LOG_VERBOSE && rank == 0) {
+            MFU_LOG(MFU_LOG_INFO, "Walked %lu items in %.3lf seconds (%.3lf items/sec)", 0UL, 0.0, 0.0);
+        }
+    } else {
+        (void) mfu_flist_walk_param_paths(1, destpath, walk_opts, flist_tmp_dst, mfu_dst_file);
+    }
 
     /* walk link-dest path if we have one */
     if (options.link_dest != NULL) {
