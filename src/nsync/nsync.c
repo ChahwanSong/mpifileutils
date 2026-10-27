@@ -2290,6 +2290,41 @@ typedef struct {
 
 static int nsync_openat2_off = 0;   /* the kernel has no openat2: walk instead */
 static int nsync_openat2_ok = 0;    /* openat2 has worked here at least once */
+/* Actions that took effect on this rank, by kind (the "Completed actions"
+ * line): the planned counts say what the run meant to do, these what it did --
+ * a failed, blocked or not-attempted action is in the first and not here. A
+ * COPY counts once its data is in place (a metadata failure after that is a
+ * failed item of its own); a directory META_UPDATE once its deferred stamp
+ * worked. */
+static struct {
+    uint64_t copy;
+    uint64_t copy_bytes;
+    uint64_t mkdir;
+    uint64_t symlink_update;
+    uint64_t meta_update;
+    uint64_t remove;
+} nsync_done;
+
+static void nsync_done_note(int type)
+{
+    switch (type) {
+    case NSYNC_ACTION_REMOVE:
+        nsync_done.remove++;
+        break;
+    case NSYNC_ACTION_MKDIR:
+        nsync_done.mkdir++;
+        break;
+    case NSYNC_ACTION_SYMLINK_UPDATE:
+        nsync_done.symlink_update++;
+        break;
+    case NSYNC_ACTION_META_UPDATE:
+        nsync_done.meta_update++;
+        break;
+    default:
+        break;
+    }
+}
+
 static uint64_t nsync_noatime_fallbacks = 0;   /* --open-noatime refused (not the owner): read without */
 
 /* no empty, "." or ".." component (what the component walk accepts) */
@@ -6548,6 +6583,8 @@ static void nsync_destination_finalize_copy_transfer(
         if (done_copy_bytes != NULL) {
             (*done_copy_bytes) += transfer->copied_bytes;
         }
+        nsync_done.copy++;
+        nsync_done.copy_bytes += transfer->copied_bytes;
     } else if (transfer->action != NULL) {
         /* one failed item = one error, wherever it failed (source open/read
          * failures arrive here as the RESP status or the END|ERROR errno) */
@@ -7080,7 +7117,9 @@ static void nsync_deferred_dir_meta_add(
 
     nsync_action_record_t entry;
     memset(&entry, 0, sizeof(entry));
-    entry.type = NSYNC_ACTION_META_UPDATE;
+    /* the stamp is the same either way; the type says what to count when it
+     * works (a MKDIR was counted when the directory was created) */
+    entry.type = (action->type == NSYNC_ACTION_META_UPDATE) ? NSYNC_ACTION_META_UPDATE : NSYNC_ACTION_MKDIR;
     entry.relpath = MFU_STRDUP(action->relpath);
     entry.link_target = (action->link_target != NULL) ? MFU_STRDUP(action->link_target) : NULL;
     entry.src_owner_world = action->src_owner_world;
@@ -7259,6 +7298,7 @@ static void nsync_destination_execute_actions(
 
         if (action_completed) {
             local_done_actions++;
+            nsync_done_note(action->type);
         }
     }
 
@@ -7375,6 +7415,8 @@ static void nsync_finalize_deferred_dir_removes(
             int err = errno;
             (*local_errors)++;
             nsync_fail_note(NSYNC_FAIL_REMOVE, action->relpath, err);
+        } else {
+            nsync_done.remove++;
         }
     }
 
@@ -7432,7 +7474,11 @@ static void nsync_finalize_deferred_dir_meta_updates(
             if (nsync_relpath_depth(action->relpath) != depth) {
                 break;
             }
+            int errors_before = *local_errors;
             nsync_apply_metadata_at(root_fd, action->relpath, action, 0, opts, local_errors, meta_stats);
+            if (action->type == NSYNC_ACTION_META_UPDATE && *local_errors == errors_before) {
+                nsync_done.meta_update++;
+            }
             idx++;
         }
         if (dst_comm != MPI_COMM_NULL) {
@@ -9728,6 +9774,12 @@ int main(int argc, char** argv)
     MPI_Allreduce(&nsync_batch_stop.not_attempted, &global_not_attempted, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
     uint64_t global_noatime_fallbacks = 0;
     MPI_Allreduce(&nsync_noatime_fallbacks, &global_noatime_fallbacks, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+    uint64_t local_done[6] = {
+        nsync_done.copy, nsync_done.mkdir, nsync_done.symlink_update,
+        nsync_done.meta_update, nsync_done.remove, nsync_done.copy_bytes
+    };
+    uint64_t global_done[6] = {0, 0, 0, 0, 0, 0};
+    MPI_Allreduce(local_done, global_done, 6, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
 
     /* failed-item list: collective, printed by the log rank before the summary
      * block (so the parsed summary lines are the last of their kind) */
@@ -9769,6 +9821,17 @@ int main(int argc, char** argv)
             global_action_counts.meta_update,
             global_action_counts.remove,
             global_action_counts.skipped_only_dst);
+
+        /* what took effect, same kinds and order as "Planned actions" (a stopped
+         * run plans only the batches it reached, see the stopped-early line) */
+        if (!opts.dryrun) {
+            MFU_LOG(MFU_LOG_INFO,
+                "Completed actions: copy=%" PRIu64 " mkdir=%" PRIu64
+                " symlink-update=%" PRIu64 " meta-update=%" PRIu64
+                " remove=%" PRIu64 " copied-bytes=%" PRIu64,
+                global_done[0], global_done[1], global_done[2],
+                global_done[3], global_done[4], global_done[5]);
+        }
 
         /* kept off the "Planned actions" line: callers sum every count there */
         if (global_action_counts.type_to_dir > 0 || global_action_counts.type_from_dir > 0) {

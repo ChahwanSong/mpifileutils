@@ -525,3 +525,20 @@ mpirun -np 2 nsync --role-mode map --role-map 0:src,1:dst \
   close 전에 fd로 소유자 → 모드 → 시각 순으로 적용한다 — root 실행이 쓰는 동안 root 소유 setuid 파일이 생기는 틈이 없다.
 - 소유자를 줄 수 없으면(비 root의 chown EPERM 등) set-ID 비트를 뺀다(cp -p와 같음): 실제 소유자·그룹이 의도와 다르면
   S_ISUID/S_ISGID 없이 `chmod`한다. 디렉터리는 S_ISGID(그룹 상속)를 유지한다.
+
+### 13.7 실행 결과 수와 종료 코드 (2026-10-27)
+
+- `Planned actions:`는 **하려던** 작업, `Completed actions: copy=… mkdir=… symlink-update=… meta-update=… remove=…
+  copied-bytes=…`(실행만, `--dryrun`에는 없다)는 **실제로 된** 작업이다. 같은 종류·같은 순서라 줄끼리 빼면 된 것과 안 된 것이
+  나온다. 실패한 항목, 막힌 대체(§13.3), 정지 뒤 시도하지 않은 작업은 앞 줄에만 있다. `COPY`는 데이터가 자리에 들어가면 1건
+  (그 뒤 메타데이터만 실패하면 실패 목록의 `meta` 1건이 따로 있다), 디렉터리 `META_UPDATE`는 지연 적용이 성공했을 때 1건,
+  `REMOVE`는 그 이름이 더는 계획한 항목이 아닐 때(이미 없거나, 그 사이 다른 것으로 바뀌어 그대로 둔 경우 포함) 1건이다.
+  조기 정지 실행은 두 줄 모두 돈 배치만 센다(`… cover batches 1-k of n only`).
+- `drm`과 `dsync --delete`(공용 `mfu_flist_unlink`): `Removed N items`는 **지운** 수다(이전에는 시도 수 — 권한·비지 않은
+  디렉터리로 남은 항목도 셌다). 하나라도 남으면 오류 수준으로 `Remove failed for F of T items`를 찍고 rc가 0이 아니다
+  (이전에는 남은 항목이 있어도 rc 0). 이미 없는 항목(ENOENT)은 지운 것으로 센다.
+- `dsync`가 destination 부모에 쓸 수 없어 아무것도 하지 않고 끝날 때도 rc 1이다(이전에는 오류만 찍고 rc 0).
+- `dsync`는 source의 FIFO·소켓·장치를 만들지 않는다(원래부터). 이제 그 항목의 메타데이터 적용도 건너뛰고(이전에는 만들지 않은
+  이름에 lchown·chmod·utime을 시도해 ENOENT 오류 3줄) 대신 `Skipped N special file(s) in the source (FIFO, socket or device):
+  not copied` 경고 한 줄을 찍는다 — nsync와 같은 문구.
+- `--quiet`(세 도구 공통)는 로그 수준을 NONE으로 내려 위 요약 줄과 실패 목록·오류 줄까지 모두 지운다 — 남는 것은 rc뿐이다.

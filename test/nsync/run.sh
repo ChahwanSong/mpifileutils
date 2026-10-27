@@ -351,4 +351,46 @@ if want T37; then
   [ "$(treesum $B/src)" = "$(treesum $B/dst)" ] && ! grep -q "Failed to open input file" $LOG && ok T37-dsync-not-owner-still-copies || { ko T37-dsync-not-owner-still-copies "rc=$RC"; grep -m3 -E "ERROR" $LOG; }
 fi
 
+# ---------- dsync --contents --open-noatime: 남의 파일 비교도 O_NOATIME 없이 다시 연다(mfu_compare_contents) ----------
+if want T38; then B=$(fresh T38); mkdir -p $B/src $B/dst; for i in 1 2 3; do echo "new $i" > $B/src/f$i; echo "old $i" > $B/dst/f$i; done
+  chmod 755 $B $B/src; chmod 644 $B/src/*; chown tuser $B $B/dst $B/dst/*
+  LOG=$W/last.log; runuser -u tuser -- env HOME=/tmp timeout 300 mpirun -np 2 $BIN/dsync --contents --open-noatime $B/src $B/dst >$LOG 2>&1; RC=$?
+  [ "$(cat $B/dst/f2)" = "new 2" ] && ! grep -q "Failed to open source file\|Failed to open destination file" $LOG \
+    && ok T38-dsync-contents-noatime-not-owner || { ko T38-dsync-contents-noatime-not-owner "rc=$RC dst=$(cat $B/dst/f2)"; grep -m3 ERROR $LOG; }
+fi
+
+# ---------- drm·dsync --delete: 지우지 못한 항목이 있으면 실패, "Removed N" 은 지운 수 ----------
+dr_user() { local u=$1; shift; LOG=$W/last.log; runuser -u "$u" -- env HOME=/tmp timeout ${TMO:-300} mpirun -np 2 "$BIN/drm" "$@" >"$LOG" 2>&1; RC=$?; }
+if want T39; then B=$(fresh T39); mkdir -p $B/t/mine $B/t/root; for i in 1 2 3; do echo m$i > $B/t/mine/m$i; echo r$i > $B/t/root/r$i; done
+  chown -R tuser:tuser $B/t; chown root:root $B/t/root; chmod 755 $B $B/t/root
+  dr_user tuser $B/t
+  # 9 항목(t, mine, root, m1-3, r1-3): mine·m1-3 은 지워지고(4), root 아래 r1-3 은 unlink 거부(3), root·t 는 비지 않아 rmdir 실패(2)
+  [ $RC != 0 ] && [ ! -e $B/t/mine ] && [ "$(nfiles $B/t/root)" = 3 ] && grep -q "Removed 4 items in" $LOG && grep -q "Remove failed for 5 of 9 items" $LOG \
+    && ok T39-drm-partial-fails || { ko T39-drm-partial-fails "rc=$RC"; grep -E "Removed|Remove failed" $LOG; }
+  B=$(fresh T39b); mkdir -p $B/t/a; echo x > $B/t/a/x; dr_user root $B/t
+  [ $RC = 0 ] && [ ! -e $B/t ] && grep -q "Removed 3 items in" $LOG && ! grep -q "Remove failed" $LOG && ok T39-drm-all-removed || { ko T39-drm-all-removed "rc=$RC"; logtail 4; }
+fi
+if want T40; then B=$(fresh T40); mkdir -p $B/src $B/dst/extra; echo k > $B/src/k; echo e > $B/dst/extra/e; chown -R tuser $B; chown root $B/dst/extra; chmod 755 $B $B/dst/extra
+  LOG=$W/last.log; runuser -u tuser -- env HOME=/tmp timeout 300 mpirun -np 2 $BIN/dsync --delete $B/src $B/dst >$LOG 2>&1; RC=$?
+  [ $RC != 0 ] && [ -f $B/dst/k ] && [ -f $B/dst/extra/e ] && grep -q "Remove failed for 2 of 2 items" $LOG && ok T40-dsync-delete-leftover-fails || { ko T40-dsync-delete-leftover-fails "rc=$RC"; grep -E "Removed|Remove failed|ERROR" $LOG | head -5; }
+fi
+
+if want T42; then B=$(fresh T42); mkdir -p $B/p/src; echo a > $B/p/src/a; chown -R tuser $B/p/src; chmod 755 $B $B/p
+  LOG=$W/last.log; runuser -u tuser -- env HOME=/tmp timeout 300 mpirun -np 2 $BIN/dsync $B/p/src $B/p/dst >$LOG 2>&1; RC=$?
+  [ $RC != 0 ] && [ ! -e $B/p/dst ] && grep -q "Destination parent directory is not writable" $LOG && ok T42-dsync-parent-not-writable-fails || { ko T42-dsync-parent-not-writable-fails "rc=$RC"; logtail 4; }
+fi
+if want T43; then B=$(fresh T43); mkdir -p $B/src $B/dst; echo a > $B/src/a; mkfifo $B/src/fifo; ds 2 $B/src $B/dst
+  [ $RC = 0 ] && [ -f $B/dst/a ] && [ ! -e $B/dst/fifo ] && grep -q "Skipped 1 special file(s) in the source" $LOG && ! grep -q "Failed to change" $LOG \
+    && ok T43-dsync-special-skipped-quietly || { ko T43-dsync-special-skipped-quietly "rc=$RC"; grep -E "Skipped|ERROR" $LOG | head -4; }
+fi
+# ---------- nsync "Completed actions": 계획이 아니라 실제로 된 수 ----------
+if want T41; then B=$(fresh T41); mkdir -p $B/src/d $B/dst/gone; for i in 1 2 3; do echo s$i > $B/src/d/f$i; done; ln -s f1 $B/src/d/l; echo old > $B/dst/gone/o
+  ns $R21 --delete $B/src $B/dst
+  [ $RC = 0 ] && grep -q "Completed actions: copy=3 mkdir=1 symlink-update=1 meta-update=[0-9]* remove=2 copied-bytes=9$" $LOG && ok T41-completed-all || { ko T41-completed-all "rc=$RC"; grep -E "Planned|Completed" $LOG; }
+  ns $R21 --dryrun $B/src $B/dst2
+  ! grep -q "Completed actions" $LOG && ok T41-dryrun-no-completed || { ko T41-dryrun-no-completed "rc=$RC"; }
+  B=$(fresh T41c); mk_fail $B; ns_user tuser $R21 --batch-files 1 $B/src $B/dst
+  [ $RC != 0 ] && grep -q "Planned actions: copy=150 " $LOG && grep -q "Completed actions: copy=100 " $LOG && ok T41-completed-excludes-failed || { ko T41-completed-excludes-failed "rc=$RC"; grep -E "Planned|Completed" $LOG; }
+fi
+
 echo "==== PASS=$PASS FAIL=$FAIL ${FAILED[*]}"
